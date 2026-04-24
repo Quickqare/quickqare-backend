@@ -392,8 +392,6 @@ function getPartnerSkillMatchLevel(partner, requestContext) {
   return 0;
 }
 
-const FAIRNESS_LOOKBACK_HOURS = 12;
-
 function calculateDistanceMeters(origin, destination) {
   if (
     !Array.isArray(origin?.coordinates) ||
