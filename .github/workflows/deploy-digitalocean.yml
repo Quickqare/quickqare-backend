@@ -1,0 +1,23 @@
+name: Deploy Backend to DigitalOcean (Docker)
+
+on:
+  push:
+    branches: ["main"]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DO_HOST }}
+          username: ${{ secrets.DO_USER }}
+          key: ${{ secrets.DO_SSH_KEY }}
+          script: |
+            set -e
+            APP_DIR="${{ secrets.DO_APP_DIR }}"
+            cd "${APP_DIR:-/var/www/quickqare-backend}"
+            git pull origin main
+            docker compose up -d --build
+            docker image prune -f

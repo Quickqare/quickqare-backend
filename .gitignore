@@ -1,0 +1,9 @@
+# Node modules
+node_modules/
+
+# Environment variables
+.env
+
+# Firebase service account (VERY IMPORTANT)
+config/firebase-service-account.json
+config/firebase-service-account.*.json

@@ -1,0 +1,125 @@
+openapi: 3.0.3
+info:
+  title: QuickQare Admin API
+  version: 1.0.0
+servers:
+  - url: /api/v1/admin
+paths:
+  /auth/login:
+    post:
+      summary: Admin login (password step)
+  /auth/verify-2fa:
+    post:
+      summary: Verify admin 2FA challenge
+  /auth/refresh:
+    post:
+      summary: Refresh admin tokens
+  /auth/logout:
+    post:
+      summary: Logout admin sessions
+  /auth/me:
+    get:
+      summary: Get admin profile + permissions
+  /dashboard/kpis:
+    get:
+      summary: Dashboard KPI summary
+  /dashboard/revenue-trend:
+    get:
+      summary: Revenue trend series
+  /dashboard/bookings-trend:
+    get:
+      summary: Bookings trend series
+  /customers:
+    get:
+      summary: List customers
+  /customers/{id}:
+    get:
+      summary: Get customer details
+  /customers/{id}/status:
+    patch:
+      summary: Block/unblock customer
+  /partners:
+    get:
+      summary: List partners
+  /partners/{id}:
+    get:
+      summary: Get partner details
+  /partners/{id}/approval:
+    patch:
+      summary: Approve/reject partner
+  /partners/{id}/status:
+    patch:
+      summary: Update partner status
+  /partners/{id}/commission:
+    patch:
+      summary: Update partner commission
+  /services:
+    get:
+      summary: List services
+    post:
+      summary: Create service
+  /services/{id}:
+    patch:
+      summary: Update service
+  /services/{id}/status:
+    patch:
+      summary: Enable/disable service
+  /bookings:
+    get:
+      summary: List bookings
+  /bookings/{id}:
+    get:
+      summary: Get booking detail
+  /bookings/{id}/assign:
+    post:
+      summary: Assign/reassign booking
+  /bookings/{id}/cancel:
+    post:
+      summary: Cancel booking
+  /bookings/{id}/refund:
+    post:
+      summary: Request booking refund
+  /payments/overview:
+    get:
+      summary: Payments summary
+  /payments/transactions:
+    get:
+      summary: List payment transactions
+  /payments/payouts:
+    post:
+      summary: Create manual payout batch
+  /disputes:
+    get:
+      summary: List disputes
+  /disputes/{id}:
+    get:
+      summary: Get dispute detail
+  /disputes/{id}/resolve:
+    post:
+      summary: Resolve dispute
+  /coupons:
+    get:
+      summary: List coupons
+    post:
+      summary: Create coupon
+  /coupons/{id}:
+    patch:
+      summary: Update coupon
+  /coupons/{id}/usage:
+    get:
+      summary: Coupon usage details
+  /analytics/revenue-by-city:
+    get:
+      summary: Revenue by city (pincode proxy)
+  /analytics/service-mix:
+    get:
+      summary: Service category mix
+  /analytics/peak-hours:
+    get:
+      summary: Peak booking hours
+  /roles:
+    get:
+      summary: Fixed v1 roles and permissions
+  /permissions:
+    get:
+      summary: Permission keys
