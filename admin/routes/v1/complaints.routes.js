@@ -5,10 +5,10 @@ const {
   getComplaintDetailsAdmin,
   updateComplaintStatus,
   addComplaintResolution,
-} = require("../../controllers/adminComplaint.controller");
-const authenticateAdmin = require("../middleware/authenticateAdmin");
-const authorize = require("../middleware/authorize");
-const { PERMISSIONS } = require("../constants/permissions");
+} = require("../../../controllers/adminComplaint.controller");
+const authenticateAdmin = require("../../middleware/authenticateAdmin");
+const authorize = require("../../middleware/authorize");
+const { PERMISSIONS } = require("../../constants/permissions");
 
 /**
  * Get all complaints

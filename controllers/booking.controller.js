@@ -643,6 +643,7 @@ exports.completeBooking = async (req, res) => {
     const { processReferralReward } = require("../utils/referral");
     await processReferralReward(booking.user, booking._id);
 
+    /* =====================
        NOTIFY USER
     ===================== */
     if (global.io) {

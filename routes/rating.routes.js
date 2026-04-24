@@ -1,9 +1,9 @@
 const express = require("express");
 const router = express.Router();
 const { submitRating, getPendingRating } = require("../controllers/rating.controller");
-const auth = require("../middlewares/auth"); // Assuming standard auth middleware
+const userAuth = require("../middlewares/userAuth");
 
-router.get("/pending", auth, getPendingRating);
-router.post("/", auth, submitRating);
+router.get("/pending", userAuth, getPendingRating);
+router.post("/", userAuth, submitRating);
 
 module.exports = router;

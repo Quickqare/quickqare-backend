@@ -1,7 +1,7 @@
 const Rating = require("../models/Rating");
 const Booking = require("../models/Booking");
 const Partner = require("../models/Partner");
-const Service = require("../models/Service");
+const Service = require("../models/service.model");
 
 exports.submitRating = async (req, res) => {
   try {

@@ -1,10 +1,9 @@
 const express = require("express");
 const router = express.Router();
-const { success, error } = require("../../utils/response");
-const ReferralSettings = require("../../models/ReferralSettings");
-const Referral = require("../../models/Referral");
-const UserWallet = require("../../models/UserWallet");
-const UserWalletTransaction = require("../../models/UserWalletTransaction");
+const ReferralSettings = require("../../../models/ReferralSettings");
+const Referral = require("../../../models/Referral");
+const UserWallet = require("../../../models/UserWallet");
+const UserWalletTransaction = require("../../../models/UserWalletTransaction");
 
 // Get referral settings
 router.get("/referral-settings", async (req, res) => {
@@ -13,9 +12,9 @@ router.get("/referral-settings", async (req, res) => {
     if (!settings) {
       settings = await ReferralSettings.create({});
     }
-    return success(res, settings, { requestId: req.requestId });
+    return res.json({ success: true, data: settings });
   } catch (err) {
-    return error(res, err.message, { requestId: req.requestId });
+    return res.status(500).json({ success: false, message: err.message });
   }
 });
 
@@ -32,9 +31,9 @@ router.put("/referral-settings", async (req, res) => {
       await settings.save();
     }
 
-    return success(res, settings, { requestId: req.requestId });
+    return res.json({ success: true, data: settings });
   } catch (err) {
-    return error(res, err.message, { requestId: req.requestId });
+    return res.status(500).json({ success: false, message: err.message });
   }
 });
 
@@ -58,17 +57,20 @@ router.get("/referrals", async (req, res) => {
 
     const total = await Referral.countDocuments(query);
 
-    return success(res, {
-      referrals,
-      pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
-        total,
-        pages: Math.ceil(total / limit),
+    return res.json({
+      success: true,
+      data: {
+        referrals,
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          total,
+          pages: Math.ceil(total / limit),
+        },
       },
-    }, { requestId: req.requestId });
+    });
   } catch (err) {
-    return error(res, err.message, { requestId: req.requestId });
+    return res.status(500).json({ success: false, message: err.message });
   }
 });
 
@@ -105,9 +107,9 @@ router.get("/referral-stats", async (req, res) => {
       if (stat._id === "INVALID") result.invalidReferrals = stat.count;
     });
 
-    return success(res, result, { requestId: req.requestId });
+    return res.json({ success: true, data: result });
   } catch (err) {
-    return error(res, err.message, { requestId: req.requestId });
+    return res.status(500).json({ success: false, message: err.message });
   }
 });
 
@@ -124,17 +126,20 @@ router.get("/user-wallets", async (req, res) => {
 
     const total = await UserWallet.countDocuments();
 
-    return success(res, {
-      wallets,
-      pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
-        total,
-        pages: Math.ceil(total / limit),
+    return res.json({
+      success: true,
+      data: {
+        wallets,
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          total,
+          pages: Math.ceil(total / limit),
+        },
       },
-    }, { requestId: req.requestId });
+    });
   } catch (err) {
-    return error(res, err.message, { requestId: req.requestId });
+    return res.status(500).json({ success: false, message: err.message });
   }
 });
 
@@ -155,17 +160,20 @@ router.get("/user-wallet-transactions", async (req, res) => {
 
     const total = await UserWalletTransaction.countDocuments(query);
 
-    return success(res, {
-      transactions,
-      pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
-        total,
-        pages: Math.ceil(total / limit),
+    return res.json({
+      success: true,
+      data: {
+        transactions,
+        pagination: {
+          page: parseInt(page),
+          limit: parseInt(limit),
+          total,
+          pages: Math.ceil(total / limit),
+        },
       },
-    }, { requestId: req.requestId });
+    });
   } catch (err) {
-    return error(res, err.message, { requestId: req.requestId });
+    return res.status(500).json({ success: false, message: err.message });
   }
 });
 

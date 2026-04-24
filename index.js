@@ -110,16 +110,16 @@ app.use("/api/partner/auth", require("./routes/partnerAuth.routes"));
 app.use("/api/partner", require("./routes/partner.routes"));
 app.use("/api/coupons", require("./routes/coupon.routes"));
 app.use("/api/coupon", require("./routes/coupon.routes"));
-  app.use("/api/payment", require("./routes/payment.routes"));
-  app.use("/api/services", require("./routes/service.routes"));
-  app.use("/api/maps", require("./routes/maps.routes"));
-  app.use("/api/partner/profile", require("./routes/partnerProfile.routes"));
-  app.use("/api/zones", require("./routes/zone.routes"));
-  app.use("/api/upload", require("./routes/uploadRoutes"));
-  app.use("/api/banners", require("./routes/banner.routes"));
-  app.use("/api/policies", require("./routes/policy.routes"));
-  app.use("/api/ratings", require("./routes/rating.routes"));
-  // app.use("/api/v1/admin", require("./admin/routes/v1"));
+app.use("/api/payment", require("./routes/payment.routes"));
+app.use("/api/services", require("./routes/service.routes"));
+app.use("/api/maps", require("./routes/maps.routes"));
+app.use("/api/partner/profile", require("./routes/partnerProfile.routes"));
+app.use("/api/zones", require("./routes/zone.routes"));
+app.use("/api/upload", require("./routes/uploadRoutes"));
+app.use("/api/banners", require("./routes/banner.routes"));
+app.use("/api/policies", require("./routes/policy.routes"));
+app.use("/api/ratings", require("./routes/rating.routes"));
+app.use("/api/v1/admin", require("./admin/routes/v1"));
 
 /* ======================
    ERROR HANDLER
