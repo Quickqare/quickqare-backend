@@ -1,8 +1,10 @@
 const AdminUser = require("../admin/models/AdminUser");
 const { ADMIN_ROLES } = require("../admin/constants/permissions");
+const IS_PRODUCTION = String(process.env.NODE_ENV || "").toLowerCase() === "production";
 
 async function ensureBootstrapAdmin() {
   const enabled =
+    !IS_PRODUCTION &&
     String(process.env.ADMIN_BOOTSTRAP_ENABLED || "").toLowerCase() === "true";
 
   if (!enabled) {

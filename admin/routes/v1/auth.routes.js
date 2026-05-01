@@ -45,7 +45,12 @@ router.post("/login", audit("admin.auth.login"), async (req, res) => {
       });
     }
 
-    const generatedCode = process.env.ADMIN_2FA_TEST_CODE || String(Math.floor(100000 + Math.random() * 900000));
+    const randomCode = String(Math.floor(100000 + Math.random() * 900000));
+    // ADMIN_2FA_TEST_CODE is only honoured outside production so CI/dev can skip SMS.
+    const generatedCode =
+      process.env.NODE_ENV !== "production" && process.env.ADMIN_2FA_TEST_CODE
+        ? process.env.ADMIN_2FA_TEST_CODE
+        : randomCode;
     const twoFaCodeHash = await bcrypt.hash(generatedCode, 10);
 
     const challengeExpiresAt = new Date(Date.now() + CHALLENGE_TTL_SECONDS * 1000);
@@ -63,8 +68,10 @@ router.post("/login", audit("admin.auth.login"), async (req, res) => {
       sessionId: String(session._id),
     });
 
-    // Replace with email/SMS/Authenticator channel in production.
-    console.log(`[admin-2fa] ${email} code: ${generatedCode}`);
+    // TODO: Send via email/SMS/authenticator. Dev-only fallback below.
+    if (process.env.NODE_ENV !== "production") {
+      console.log(`[admin-2fa-dev] code ready for ${email}`);
+    }
 
     const payload = {
       twoFaRequired: true,

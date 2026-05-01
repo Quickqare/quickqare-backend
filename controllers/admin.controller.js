@@ -3,7 +3,7 @@ const Partner = require("../models/Partner");
 const PartnerWallet = require("../models/PartnerWallet");
 const WalletTransaction = require("../models/WalletTransaction");
 const Withdrawal = require("../models/Withdrawal");
-const { syncPartnerOperationalState } = require("../services/scheduling.service");
+const { syncPartnerOperationalState } = require("../services/scheduling_service");
 
 const roundAmount = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
 

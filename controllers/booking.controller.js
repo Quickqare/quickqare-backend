@@ -11,7 +11,7 @@ const {
   buildDateTime,
   findEligiblePartnersForBooking,
   syncPartnerOperationalState,
-} = require("../services/scheduling.service");
+} = require("../services/scheduling_service");
 const { calculatePricing } = require("../utils/pricing");
 const { validateCouponForAmount } = require("../services/coupon.service");
 
@@ -441,17 +441,34 @@ exports.afterPaymentSuccess = async (req, res) => {
     if (!booking) return res.status(404).json({ message: "Booking not found" });
 
     booking.payment.status = "PAID";
-    booking.status = "PENDING_ASSIGNMENT";
     booking.lockedUntil = null; // Convert lock to permanent capacity
-    await booking.save();
 
-    // 🚀 QUEUE ASSIGNMENT (Simulating batch dispatch)
-    await assignBooking(booking._id);
+    const scheduledStart = booking.scheduledStartAt 
+      ? new Date(booking.scheduledStartAt) 
+      : buildDateTime(booking.scheduledDate, booking.scheduledTime);
 
-    res.json({
-      success: true,
-      message: "Payment verified. Searching for partner.",
-    });
+    const timeToServiceMs = scheduledStart.getTime() - Date.now();
+    const hoursToService = timeToServiceMs / (1000 * 60 * 60);
+
+    if (hoursToService > 24) {
+      booking.status = "QUEUED";
+      await booking.save();
+      res.json({
+        success: true,
+        message: "Payment verified. Booking queued for partner assignment closer to the service date.",
+      });
+    } else {
+      booking.status = "PENDING_ASSIGNMENT";
+      await booking.save();
+
+      // 🚀 QUEUE ASSIGNMENT (Simulating batch dispatch)
+      await assignBooking(booking._id);
+
+      res.json({
+        success: true,
+        message: "Payment verified. Searching for partner.",
+      });
+    }
   } catch (err) {
     res.status(500).json({ message: err.message });
   }

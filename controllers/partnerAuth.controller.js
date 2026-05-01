@@ -11,6 +11,7 @@ const {
 } = require("../services/msg91Otp.service");
 
 const PARTNER_TOKEN_TTL = String(process.env.PARTNER_JWT_TTL || "90d");
+const IS_PRODUCTION = String(process.env.NODE_ENV || "").toLowerCase() === "production";
 
 /* =====================================================
    REGISTER PARTNER (UPDATED FOR PRODUCTION)
@@ -273,8 +274,9 @@ exports.exchangePartnerMsg91AccessToken = async (req, res) => {
     }
 
     const skipServerVerify =
+      !IS_PRODUCTION &&
       String(process.env.MSG91_SKIP_ACCESS_TOKEN_VERIFY || "").toLowerCase() ===
-      "true";
+        "true";
 
     if (!skipServerVerify) {
       await verifyMsg91AccessToken(accessToken);
@@ -347,8 +349,9 @@ exports.resetPartnerPasswordWithMsg91 = async (req, res) => {
     }
 
     const skipServerVerify =
+      !IS_PRODUCTION &&
       String(process.env.MSG91_SKIP_ACCESS_TOKEN_VERIFY || "").toLowerCase() ===
-      "true";
+        "true";
 
     if (!skipServerVerify) {
       await verifyMsg91AccessToken(accessToken);

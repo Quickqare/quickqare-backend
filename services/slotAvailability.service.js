@@ -1,16 +1,2 @@
-const { getAvailableSlotsForRequest } = require("./scheduling.service");
+module.exports = require("./slotAvailability_service");
 
-async function getAvailableSlots(date, serviceId, serviceCategory, options = {}) {
-  return getAvailableSlotsForRequest({
-    date,
-    serviceId,
-    serviceCategory,
-    services: Array.isArray(options.services) ? options.services : [],
-    pincode: options.pincode || "",
-    location: options.location || null,
-  });
-}
-
-module.exports = {
-  getAvailableSlots,
-};

@@ -233,6 +233,7 @@ const bookingSchema = new mongoose.Schema(
       enum: [
         "PENDING_PAYMENT",
         "PENDING_ASSIGNMENT",
+        "QUEUED",
         "SEARCHING",
         "ASSIGNED",
         "CONFIRMED",
@@ -251,6 +252,13 @@ const bookingSchema = new mongoose.Schema(
       enum: ["user", "partner"],
       default: null,
     },
+
+    standbyPartners: [
+      {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Partner",
+      },
+    ],
 
     lockedUntil: {
       type: Date,
@@ -336,6 +344,53 @@ const bookingSchema = new mongoose.Schema(
     isPaidToPartner: {
       type: Boolean,
       default: false,
+    },
+
+    /* ======================
+       PARTNER ESTIMATE (ITEMIZED CART)
+       Partner submits extra items on-site;
+       customer approves before additional charges apply.
+    ====================== */
+    estimateItems: [
+      {
+        serviceId: {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: "Service",
+        },
+        name: String,
+        price: Number,
+        quantity: {
+          type: Number,
+          default: 1,
+        },
+        lineTotal: Number,
+      },
+    ],
+
+    estimateTotal: {
+      type: Number,
+      default: 0,
+    },
+
+    estimateStatus: {
+      type: String,
+      enum: ["none", "pending", "approved", "rejected"],
+      default: "none",
+    },
+
+    estimateSubmittedAt: {
+      type: Date,
+      default: null,
+    },
+
+    estimateApprovedAt: {
+      type: Date,
+      default: null,
+    },
+
+    estimateRejectedAt: {
+      type: Date,
+      default: null,
     },
   },
   { timestamps: true }

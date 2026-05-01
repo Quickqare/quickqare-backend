@@ -4,7 +4,7 @@ const Service = require("../models/service.model");
 const SubCategory = require("../models/SubCategory");
 const Zone = require("../models/zone.model");
 const { reverseGeocode } = require("../services/geocode.service");
-const { syncPartnerOperationalState } = require("../services/scheduling.service");
+const { syncPartnerOperationalState } = require("../services/scheduling_service");
 const { emitBookingUpdate } = require("../socket/emitters");
 const { completeBooking } = require("./booking.controller");
 
@@ -447,6 +447,133 @@ exports.getPartnerAppSettings = async (_req, res) => {
       success: false,
       message: "Server error",
     });
+  }
+};
+
+/**
+ * =====================================================
+ * GET PARTS CATALOG
+ * Returns all active services with admin-set prices.
+ * Partner uses this to build an itemized estimate.
+ * =====================================================
+ */
+exports.getPartsCatalog = async (req, res) => {
+  try {
+    const services = await Service.find({ isActive: true })
+      .select("_id name price description imageUrl category subCategory duration")
+      .populate("category", "name")
+      .populate("subCategory", "name")
+      .sort({ name: 1 })
+      .lean();
+
+    return res.json({
+      success: true,
+      count: services.length,
+      services,
+    });
+  } catch (err) {
+    console.error("getPartsCatalog error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
+/**
+ * =====================================================
+ * SUBMIT ITEMIZED ESTIMATE
+ * Partner sends a list of {serviceId, quantity} items.
+ * Prices are fetched from DB (admin-set), frozen into
+ * the booking, and the customer is notified via socket.
+ * =====================================================
+ */
+exports.submitEstimate = async (req, res) => {
+  try {
+    const partnerId = req.partner._id;
+    const { bookingId, items } = req.body;
+
+    if (!bookingId || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "bookingId and a non-empty items array are required",
+      });
+    }
+
+    const booking = await Booking.findOne({
+      _id: bookingId,
+      $or: [{ partner: partnerId }, { additionalPartners: partnerId }],
+      status: { $in: ["CONFIRMED", "PARTNER_ACCEPTED", "ON_THE_WAY", "IN_PROGRESS"] },
+    });
+
+    if (!booking) {
+      return res.status(404).json({
+        success: false,
+        message: "Booking not found or not accessible for this partner",
+      });
+    }
+
+    // Fetch live prices from DB so admin changes are always respected
+    const serviceIds = items.map((i) => i.serviceId).filter(Boolean);
+    const catalogServices = await Service.find({
+      _id: { $in: serviceIds },
+      isActive: true,
+    }).lean();
+    const serviceMap = Object.fromEntries(
+      catalogServices.map((s) => [s._id.toString(), s])
+    );
+
+    const estimateItems = [];
+    let estimateTotal = 0;
+
+    for (const item of items) {
+      const service = serviceMap[String(item.serviceId)];
+      if (!service) continue;
+      const qty = Math.max(1, Math.floor(Number(item.quantity) || 1));
+      const lineTotal = Math.round(service.price * qty * 100) / 100;
+      estimateItems.push({
+        serviceId: service._id,
+        name: service.name,
+        price: service.price,
+        quantity: qty,
+        lineTotal,
+      });
+      estimateTotal += lineTotal;
+    }
+
+    if (estimateItems.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "None of the provided service IDs are active",
+      });
+    }
+
+    estimateTotal = Math.round(estimateTotal * 100) / 100;
+
+    booking.estimateItems = estimateItems;
+    booking.estimateTotal = estimateTotal;
+    booking.estimateStatus = "pending";
+    booking.estimateSubmittedAt = new Date();
+    booking.estimateApprovedAt = null;
+    booking.estimateRejectedAt = null;
+    await booking.save();
+
+    // Notify customer in real time so they can approve/reject
+    if (global.io) {
+      global.io.to(`user_${booking.user}`).emit("estimate_submitted", {
+        bookingId: booking._id.toString(),
+        estimateItems,
+        estimateTotal,
+        submittedAt: booking.estimateSubmittedAt,
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: "Estimate sent to customer for approval",
+      estimateItems,
+      estimateTotal,
+    });
+  } catch (err) {
+    console.error("submitEstimate error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
   }
 };
 

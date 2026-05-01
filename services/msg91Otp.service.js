@@ -33,6 +33,12 @@ async function sendOtp(phone) {
   const { authKey, templateId } = getRequiredConfig();
   const mobile = toInternationalPhone(phone);
 
+  if (!templateId) {
+    const error = new Error("MSG91_TEMPLATE_ID is missing");
+    error.statusCode = 500;
+    throw error;
+  }
+
   if (!mobile) {
     const error = new Error("Valid phone number required");
     error.statusCode = 400;
@@ -53,7 +59,11 @@ async function sendOtp(phone) {
   const data = await response.json().catch(() => ({}));
 
   if (!response.ok || data?.type === "error") {
-    const error = new Error(data?.message || "MSG91 failed to send OTP");
+    const error = new Error(
+      data?.message ||
+        data?.error ||
+        `MSG91 failed to send OTP (HTTP ${response.status || "unknown"})`
+    );
     error.statusCode = response.status || 502;
     throw error;
   }

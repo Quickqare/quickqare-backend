@@ -3,6 +3,7 @@ const crypto = require("crypto");
 const Booking = require("../models/Booking");
 const { assignBooking } = require("../services/assignmentEngine");
 const { recordCouponRedemption } = require("../services/coupon.service");
+const { buildDateTime } = require("../services/scheduling_service");
 
 /* =====================================================
    CREATE RAZORPAY ORDER
@@ -156,8 +157,6 @@ exports.verifyPayment = async (req, res) => {
     booking.payment.razorpay_signature = razorpay_signature;
     booking.payment.status = "PAID";
 
-    booking.status = "SEARCHING";
-    await booking.save();
 
     if (booking.couponId && booking.couponCode) {
       await recordCouponRedemption({
@@ -168,15 +167,35 @@ exports.verifyPayment = async (req, res) => {
       });
     }
 
-    /* =====================
-       AUTO ASSIGN PARTNER
-    ===================== */
-    await assignBooking(booking._id);
+    const scheduledStart = booking.scheduledStartAt 
+      ? new Date(booking.scheduledStartAt) 
+      : buildDateTime(booking.scheduledDate, booking.scheduledTime);
 
-    return res.json({
-      success: true,
-      message: "Payment verified. Searching for partner.",
-    });
+    const timeToServiceMs = scheduledStart.getTime() - Date.now();
+    const hoursToService = timeToServiceMs / (1000 * 60 * 60);
+
+    if (hoursToService > 24) {
+      booking.status = "QUEUED";
+      await booking.save();
+      
+      return res.json({
+        success: true,
+        message: "Payment verified. Booking queued for partner assignment closer to the service date.",
+      });
+    } else {
+      booking.status = "PENDING_ASSIGNMENT";
+      await booking.save();
+
+      /* =====================
+         AUTO ASSIGN PARTNER
+      ===================== */
+      await assignBooking(booking._id);
+
+      return res.json({
+        success: true,
+        message: "Payment verified. Searching for partner.",
+      });
+    }
   } catch (error) {
     console.error("Payment verification error:", error);
     return res.status(500).json({

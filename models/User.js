@@ -30,12 +30,14 @@ const userSchema = new mongoose.Schema(
       index: true,
     },
 
-    // 🔐 OTP-only authentication
+    // 🔐 OTP-only authentication — never returned in default queries
     otp: {
       type: String,
+      select: false,
     },
     otpExpiresAt: {
       type: Date,
+      select: false,
     },
 
     fcmToken: {

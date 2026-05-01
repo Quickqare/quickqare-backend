@@ -14,9 +14,10 @@ module.exports = async function authenticateAdmin(req, res, next) {
     }
 
     const token = authHeader.slice(7);
-    const accessSecret = process.env.ADMIN_JWT_ACCESS_SECRET || process.env.JWT_SECRET;
+    const accessSecret = process.env.ADMIN_JWT_ACCESS_SECRET;
     if (!accessSecret) {
-      return fail(res, 500, "ADMIN_SECRET_MISSING", "Admin auth secret not configured", null, {
+      // Startup misconfiguration — never fall back to the user JWT secret.
+      return fail(res, 500, "ADMIN_SECRET_MISSING", "ADMIN_JWT_ACCESS_SECRET is not configured", null, {
         requestId: req.requestId,
       });
     }

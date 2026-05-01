@@ -4,14 +4,16 @@ const Booking = require("../../../models/Booking");
 const PartnerWallet = require("../../../models/PartnerWallet");
 const WalletTransaction = require("../../../models/WalletTransaction");
 const Withdrawal = require("../../../models/Withdrawal");
+const Partner = require("../../../models/Partner");
 const authenticateAdmin = require("../../middleware/authenticateAdmin");
 const authorize = require("../../middleware/authorize");
 const audit = require("../../middleware/audit");
 const Refund = require("../../models/Refund");
 const PayoutBatch = require("../../models/PayoutBatch");
 const { PERMISSIONS } = require("../../constants/permissions");
-const { getPagination } = require("../../utils/common");
+const { getPagination, asSingleString } = require("../../utils/common");
 const { success, fail } = require("../../utils/response");
+const { debitWallet } = require("../../../controllers/partnerWallet.controller");
 
 const router = express.Router();
 
@@ -112,6 +114,129 @@ router.post(
       return success(res, batch, { requestId: req.requestId });
     } catch (error) {
       return fail(res, 500, "PAYOUT_BATCH_FAILED", "Unable to create payout batch", error.message, {
+        requestId: req.requestId,
+      });
+    }
+  }
+);
+
+/* =====================================================
+   LIST WITHDRAWAL REQUESTS
+   GET /api/v1/admin/payments/withdrawals
+===================================================== */
+router.get(
+  "/withdrawals",
+  authorize(PERMISSIONS.PAYMENTS_PAYOUT),
+  async (req, res) => {
+    try {
+      const { page, pageSize, skip, limit } = getPagination(req);
+      const status = asSingleString(req.query.status);
+      const filter = status ? { status } : {};
+
+      const [rows, total] = await Promise.all([
+        Withdrawal.find(filter)
+          .populate("partnerId", "name phone")
+          .sort({ createdAt: -1 })
+          .skip(skip)
+          .limit(limit)
+          .lean(),
+        Withdrawal.countDocuments(filter),
+      ]);
+
+      return success(res, rows, {
+        requestId: req.requestId,
+        pagination: { page, pageSize, total },
+      });
+    } catch (error) {
+      return fail(res, 500, "WITHDRAWALS_LIST_FAILED", "Unable to fetch withdrawals", error.message, {
+        requestId: req.requestId,
+      });
+    }
+  }
+);
+
+/* =====================================================
+   APPROVE WITHDRAWAL
+   PATCH /api/v1/admin/payments/withdrawals/:id/approve
+===================================================== */
+router.patch(
+  "/withdrawals/:id/approve",
+  authorize(PERMISSIONS.PAYMENTS_PAYOUT),
+  audit("admin.payments.withdrawal.approve"),
+  async (req, res) => {
+    try {
+      const id = asSingleString(req.params.id);
+      if (!id || !mongoose.Types.ObjectId.isValid(id)) {
+        return fail(res, 400, "INVALID_ID", "Invalid withdrawal id", null, { requestId: req.requestId });
+      }
+
+      const referenceId = String(req.body.referenceId || "").trim();
+
+      const withdrawal = await Withdrawal.findById(id);
+      if (!withdrawal) {
+        return fail(res, 404, "NOT_FOUND", "Withdrawal not found", null, { requestId: req.requestId });
+      }
+      if (withdrawal.status !== "PENDING") {
+        return fail(res, 400, "ALREADY_PROCESSED", "Withdrawal already processed", null, { requestId: req.requestId });
+      }
+
+      // Debit wallet — throws if insufficient balance
+      await debitWallet({
+        partnerId: withdrawal.partnerId,
+        amount: withdrawal.amount,
+        reason: "withdrawal",
+        description: `Withdrawal approved by admin. Ref: ${referenceId || "N/A"}`,
+      });
+
+      withdrawal.status = "APPROVED";
+      withdrawal.referenceId = referenceId || null;
+      withdrawal.processedBy = req.adminUser.id;
+      withdrawal.processedAt = new Date();
+      await withdrawal.save();
+
+      return success(res, withdrawal, { requestId: req.requestId });
+    } catch (error) {
+      return fail(res, 500, "WITHDRAWAL_APPROVE_FAILED", error.message || "Unable to approve withdrawal", error.message, {
+        requestId: req.requestId,
+      });
+    }
+  }
+);
+
+/* =====================================================
+   REJECT WITHDRAWAL
+   PATCH /api/v1/admin/payments/withdrawals/:id/reject
+===================================================== */
+router.patch(
+  "/withdrawals/:id/reject",
+  authorize(PERMISSIONS.PAYMENTS_PAYOUT),
+  audit("admin.payments.withdrawal.reject"),
+  async (req, res) => {
+    try {
+      const id = asSingleString(req.params.id);
+      if (!id || !mongoose.Types.ObjectId.isValid(id)) {
+        return fail(res, 400, "INVALID_ID", "Invalid withdrawal id", null, { requestId: req.requestId });
+      }
+
+      const reason = String(req.body.reason || "").trim();
+
+      const withdrawal = await Withdrawal.findById(id);
+      if (!withdrawal) {
+        return fail(res, 404, "NOT_FOUND", "Withdrawal not found", null, { requestId: req.requestId });
+      }
+      if (withdrawal.status !== "PENDING") {
+        return fail(res, 400, "ALREADY_PROCESSED", "Withdrawal already processed", null, { requestId: req.requestId });
+      }
+
+      withdrawal.status = "REJECTED";
+      withdrawal.reason = reason;
+      withdrawal.processedBy = req.adminUser.id;
+      withdrawal.processedAt = new Date();
+      await withdrawal.save();
+
+      return success(res, withdrawal, { requestId: req.requestId });
+    } catch (error) {
+      return fail(res, 500, "WITHDRAWAL_REJECT_FAILED", "Unable to reject withdrawal", error.message, {
         requestId: req.requestId,
       });
     }

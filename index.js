@@ -13,6 +13,7 @@ const path = require("path");
 const { setSocketIO } = require("./socket/emitters");
 const { assignBooking } = require("./services/assignmentEngine");
 const { ensureBootstrapAdmin } = require("./services/adminBootstrap.service");
+const { initCronJobs } = require("./services/cron.service");
 
 const Booking = require("./models/Booking");
 const Partner = require("./models/Partner");
@@ -92,6 +93,7 @@ mongoose
     } catch (error) {
       console.error("[admin-bootstrap] failed:", error);
     }
+    initCronJobs();
   })
   .catch((err) => {
     console.error("MongoDB connection error:", err);
@@ -119,6 +121,7 @@ app.use("/api/upload", require("./routes/uploadRoutes"));
 app.use("/api/banners", require("./routes/banner.routes"));
 app.use("/api/policies", require("./routes/policy.routes"));
 app.use("/api/ratings", require("./routes/rating.routes"));
+app.use("/api/app-config", require("./routes/appConfig.routes"));
 app.use("/api/v1/admin", require("./admin/routes/v1"));
 
 /* ======================
@@ -141,24 +144,44 @@ const io = require("socket.io")(server, {
 global.io = io;
 setSocketIO(io);
 
+// Optional JWT auth on handshake — clients that send a token get
+// socket.verifiedPartnerId / socket.verifiedUserId attached.
+// Clients without a token still connect (backward compat).
+const jwt = require("jsonwebtoken");
+io.use((socket, next) => {
+  const token = socket.handshake.auth?.token;
+  if (!token) return next();
+  try {
+    const partnerSecret = process.env.PARTNER_JWT_SECRET || process.env.JWT_SECRET;
+    const userSecret = process.env.JWT_SECRET;
+    let payload;
+    try { payload = jwt.verify(token, partnerSecret); } catch (_) {
+      try { payload = jwt.verify(token, userSecret); } catch (__) { return next(); }
+    }
+    if (payload?.partnerId) socket.verifiedPartnerId = String(payload.partnerId);
+    if (payload?.userId || payload?.sub) socket.verifiedUserId = String(payload?.userId || payload?.sub);
+  } catch (_) { /* non-fatal — allow unauthenticated */ }
+  next();
+});
+
 io.on("connection", (socket) => {
-  console.log("🔌 Client connected:", socket.id);
 
   /* ======================
      USER ROOM
   ====================== */
   socket.on("joinUserRoom", (userId) => {
+    if (socket.verifiedUserId && socket.verifiedUserId !== String(userId)) return;
     socket.join(`user_${userId}`);
-    console.log(`👤 User ${userId} joined`);
   });
 
   /* ======================
      PARTNER ROOM
   ====================== */
   socket.on("joinPartnerRoom", (partnerId) => {
+    // If the handshake token was verified, only allow joining the correct room.
+    if (socket.verifiedPartnerId && socket.verifiedPartnerId !== String(partnerId)) return;
     socket.join(`partner_${partnerId}`);
-    socket.partnerId = partnerId;
-    console.log(`👷 Partner ${partnerId} joined`);
+    socket.partnerId = String(partnerId);
   });
 
   /* ======================
@@ -174,8 +197,16 @@ io.on("connection", (socket) => {
 
       if (booking.status !== "ASSIGNED") return;
 
+      // Verify this partner is actually assigned to this booking —
+      // prevents a spoofed partnerId from accepting someone else's job.
+      const pid = String(socket.partnerId);
+      const isAssigned =
+        booking.partner?.toString() === pid ||
+        (booking.additionalPartners || []).some((p) => p.toString() === pid);
+      if (!isAssigned) return;
+
       booking.status = "PARTNER_ACCEPTED";
-      booking.partner = socket.partnerId;
+      // partner field already set by assignment engine — do not overwrite
       await booking.save();
 
       // increase partner load
@@ -215,6 +246,13 @@ io.on("connection", (socket) => {
       if (!booking) return;
 
       if (booking.status !== "ASSIGNED") return;
+
+      // Verify this partner is actually assigned before allowing rejection.
+      const pid = String(socket.partnerId);
+      const isAssigned =
+        booking.partner?.toString() === pid ||
+        (booking.additionalPartners || []).some((p) => p.toString() === pid);
+      if (!isAssigned) return;
 
       booking.status = "SEARCHING";
       booking.partner = null;

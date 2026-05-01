@@ -3,6 +3,7 @@ const ComplaintTimeline = require("../models/ComplaintTimeline");
 const Booking = require("../models/Booking");
 const User = require("../models/User");
 const { emitComplaintStatusUpdate } = require("../socket/emitters");
+const { sendPushNotification } = require("../services/pushNotification.service");
 
 /**
  * Get all complaints for admin
@@ -162,8 +163,13 @@ const updateComplaintStatus = async (req, res) => {
 
     // Send push notification to user
     if (complaint.userId.fcmToken) {
-      // TODO: Implement Firebase push notification
       console.log(`Sending notification to user ${complaint.userId._id}: Complaint status updated to ${status}`);
+      await sendPushNotification(
+        complaint.userId.fcmToken,
+        "Complaint Update",
+        `Your complaint status has been updated to ${status}`,
+        { type: "COMPLAINT_UPDATE", complaintId: String(complaint._id) }
+      );
     }
 
     // Emit socket event
@@ -225,6 +231,12 @@ const addComplaintResolution = async (req, res) => {
     // Send push notification
     if (complaint.userId.fcmToken) {
       console.log(`Sending resolution notification to user ${complaint.userId._id}`);
+      await sendPushNotification(
+        complaint.userId.fcmToken,
+        "Complaint Resolved",
+        "A resolution has been added to your complaint. Tap to view details.",
+        { type: "COMPLAINT_RESOLUTION", complaintId: String(complaint._id) }
+      );
     }
 
     res.json({

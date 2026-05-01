@@ -12,6 +12,7 @@ const {
 } = require("../utils/referral");
 
 const USER_TOKEN_TTL = String(process.env.USER_JWT_TTL || "90d");
+const IS_PRODUCTION = String(process.env.NODE_ENV || "").toLowerCase() === "production";
 
 // SEND OTP
 exports.sendOtp = async (req, res) => {
@@ -114,8 +115,9 @@ exports.exchangeMsg91AccessToken = async (req, res) => {
     }
 
     const skipServerVerify =
+      !IS_PRODUCTION &&
       String(process.env.MSG91_SKIP_ACCESS_TOKEN_VERIFY || "").toLowerCase() ===
-      "true";
+        "true";
 
     if (!skipServerVerify) {
       await verifyMsg91AccessToken(accessToken);

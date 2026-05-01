@@ -1,6 +1,7 @@
 const crypto = require("crypto");
 const Booking = require("../models/Booking");
 const { assignBooking } = require("../services/assignmentEngine");
+const { buildDateTime } = require("../services/scheduling_service");
 
 /* =====================================================
    VERIFY RAZORPAY PAYMENT → AUTO ASSIGN PARTNER
@@ -91,20 +92,37 @@ exports.verifyRazorpayPayment = async (req, res) => {
     booking.payment.razorpay_signature = razorpay_signature;
     booking.payment.status = "PAID";
 
-    booking.status = "SEARCHING";
+    const scheduledStart = booking.scheduledStartAt 
+      ? new Date(booking.scheduledStartAt) 
+      : buildDateTime(booking.scheduledDate, booking.scheduledTime);
 
-    await booking.save();
+    const timeToServiceMs = scheduledStart.getTime() - Date.now();
+    const hoursToService = timeToServiceMs / (1000 * 60 * 60);
 
-    /* =====================
-       AUTO ASSIGN PARTNER
-    ===================== */
-    await assignBooking(booking._id);
+    if (hoursToService > 24) {
+      booking.status = "QUEUED";
+      await booking.save();
+      
+      return res.json({
+        success: true,
+        message: "Payment verified. Booking queued for partner assignment closer to the service date.",
+        bookingId: booking._id,
+      });
+    } else {
+      booking.status = "PENDING_ASSIGNMENT";
+      await booking.save();
 
-    return res.json({
-      success: true,
-      message: "Payment verified & searching for partner",
-      bookingId: booking._id,
-    });
+      /* =====================
+         AUTO ASSIGN PARTNER
+      ===================== */
+      await assignBooking(booking._id);
+
+      return res.json({
+        success: true,
+        message: "Payment verified & searching for partner",
+        bookingId: booking._id,
+      });
+    }
   } catch (error) {
     console.error("Payment verification error:", error);
 

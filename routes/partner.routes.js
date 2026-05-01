@@ -3,6 +3,7 @@ const router = express.Router();
 
 const partnerAuth = require("../middlewares/partnerAuth");
 const partnerController = require("../controllers/partner.controller");
+const walletController = require("../controllers/partnerWallet.controller");
 
 /* =====================================================
    PARTNER JOB LIFECYCLE ROUTES (PRODUCTION READY)
@@ -59,6 +60,34 @@ router.get(
 
 /**
  * ======================================
+ * GET PARTS CATALOG
+ * GET /api/partner/parts-catalog
+ * Returns all active services with admin-set prices
+ * for the partner to build an itemized estimate.
+ * ======================================
+ */
+router.get(
+  "/parts-catalog",
+  partnerAuth,
+  partnerController.getPartsCatalog
+);
+
+/**
+ * ======================================
+ * SUBMIT ITEMIZED ESTIMATE
+ * POST /api/partner/booking/estimate
+ * Body: { bookingId, items: [{serviceId, quantity}] }
+ * Prices are resolved from DB (admin-set).
+ * ======================================
+ */
+router.post(
+  "/booking/estimate",
+  partnerAuth,
+  partnerController.submitEstimate
+);
+
+/**
+ * ======================================
  * ACCEPT BOOKING
  * ASSIGNED → PARTNER_ACCEPTED
  * ======================================
@@ -108,5 +137,12 @@ router.post(
   partnerAuth,
   partnerController.markCompleted
 );
+
+/* =====================================================
+   WALLET ROUTES
+===================================================== */
+router.get("/wallet", partnerAuth, walletController.getWallet);
+router.get("/wallet/history", partnerAuth, walletController.getWalletHistory);
+router.post("/wallet/withdraw", partnerAuth, walletController.requestWithdrawal);
 
 module.exports = router;

@@ -116,7 +116,29 @@ const getProfileEditHistory = async (req, res) => {
   }
 };
 
+/**
+ * Update user FCM token for push notifications
+ */
+const updateFcmToken = async (req, res) => {
+  try {
+    const { fcmToken } = req.body;
+    const userId = req.user.id;
+
+    if (!fcmToken) {
+      return res.status(400).json({ success: false, message: "FCM token is required" });
+    }
+
+    await User.findByIdAndUpdate(userId, { fcmToken });
+
+    res.json({ success: true, message: "FCM token updated successfully" });
+  } catch (error) {
+    console.error("Update FCM token error:", error);
+    res.status(500).json({ success: false, message: "Failed to update FCM token" });
+  }
+};
+
 module.exports = {
   updateProfile,
   getProfileEditHistory,
+  updateFcmToken,
 };
