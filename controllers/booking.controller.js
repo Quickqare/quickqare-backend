@@ -5,7 +5,7 @@ const mongoose = require("mongoose");
 const Zone = require("../models/zone.model");
 const Category = require("../models/Category");
 const { creditWallet } = require("./partnerWallet.controller");
-const { getAvailableSlots } = require("../services/slotAvailability.service");
+const { getAvailableSlots } = require("../services/slotAvailability_service");
 const { assignBooking, reassignBooking } = require("../services/assignmentEngine");
 const {
   buildDateTime,
