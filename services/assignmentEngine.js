@@ -170,8 +170,17 @@ ASSIGN BOOKING
 */
 async function assignBooking(bookingId) {
   try {
-    const booking = await Booking.findById(bookingId);
-    if (!booking || booking.partner) return null;
+    // Use an atomic update to lock the booking and prevent race conditions
+    // (e.g. double assignments if two requests hit this simultaneously)
+    const booking = await Booking.findOneAndUpdate(
+      { _id: bookingId, partner: null, status: { $nin: ["ASSIGNING_LOCK", "COMPLETED", "CANCELLED"] } },
+      { $set: { status: "ASSIGNING_LOCK" } },
+      { new: true }
+    );
+
+    if (!booking) {
+      return null;
+    }
 
     const acBooking = isACBooking(booking);
 
@@ -276,17 +285,15 @@ async function assignBooking(bookingId) {
       });
       await booking.save();
 
-      // Enqueue ACK-timeout job for auto-accepted bookings (prevents silent no-shows)
-      // The ackTimeout.service watches for partners who don't tap "Acknowledge"
+      // Enqueue ACK-timeout job for ALL bookings (prevents silent no-shows and stuck manual assignments).
+      // The ackTimeout.service watches for partners who don't tap "Acknowledge" or "Accept"
       // within 2 minutes and triggers reassignBooking automatically.
-      if (autoAccepted) {
-        try {
-          const { scheduleAckTimeout } = require("./ackTimeout.service");
-          await scheduleAckTimeout(booking._id, primaryPartner._id);
-        } catch (timeoutErr) {
-          // Non-fatal — log and continue. The ops team will catch unacknowledged jobs.
-          console.error("ACK timeout schedule error:", timeoutErr.message);
-        }
+      try {
+        const { scheduleAckTimeout } = require("./ackTimeout.service");
+        await scheduleAckTimeout(booking._id, primaryPartner._id);
+      } catch (timeoutErr) {
+        // Non-fatal — log and continue. The ops team will catch unacknowledged jobs.
+        console.error("ACK timeout schedule error:", timeoutErr.message);
       }
 
       // Update all assigned partners' state
@@ -413,6 +420,10 @@ async function assignBooking(bookingId) {
     return null;
   } catch (error) {
     console.error("Assignment error:", error);
+    // Release the lock if the assignment process crashed
+    try {
+      await Booking.updateOne({ _id: bookingId, status: "ASSIGNING_LOCK" }, { status: "PENDING_ASSIGNMENT" });
+    } catch (e) {}
     return null;
   }
 }

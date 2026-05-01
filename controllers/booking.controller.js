@@ -410,7 +410,7 @@ exports.createBooking = async (req, res) => {
       estimatedDurationMinutes,
       location,
 
-      lockedUntil: new Date(Date.now() + 5 * 60 * 1000), // 5 min lock
+      lockedUntil: new Date(Date.now() + 15 * 60 * 1000), // 15 min — covers UPI/net-banking delays
       lockedCapacityMinutes: estimatedDurationMinutes,
 
       payment: { status: "PENDING" },
@@ -682,8 +682,10 @@ exports.completeBooking = async (req, res) => {
 
 /* =======================
    PARTNER CANCELS BOOKING
-   (MAX 2 PER WEEK + REASSIGN)
+   (MAX 5 PER ROLLING WEEK + AUTO-SUSPEND AT LIMIT)
 ======================= */
+const PARTNER_WEEKLY_CANCEL_LIMIT = 5;
+
 exports.cancelBooking = async (req, res) => {
   try {
     const { bookingId } = req.params;
@@ -703,23 +705,30 @@ exports.cancelBooking = async (req, res) => {
     }
 
     /* =====================
-       RESET WEEKLY LIMIT
+       ROLLING 7-DAY CANCEL WINDOW
     ===================== */
     const now = new Date();
-    const diffDays = (now - partner.lastCancelReset) / (1000 * 60 * 60 * 24);
+    const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    const diffDays = (now - new Date(partner.lastCancelReset || 0)) / (1000 * 60 * 60 * 24);
 
     if (diffDays >= 7) {
       partner.weeklyCancelCount = 0;
       partner.lastCancelReset = now;
     }
 
-    if (partner.weeklyCancelCount >= 2) {
+    if (partner.weeklyCancelCount >= PARTNER_WEEKLY_CANCEL_LIMIT) {
       return res.status(400).json({
-        message: "Weekly cancel limit reached (2 per week)",
+        message: `Weekly cancel limit reached (${PARTNER_WEEKLY_CANCEL_LIMIT} per week). Account suspended.`,
       });
     }
 
     partner.weeklyCancelCount += 1;
+
+    // Auto-suspend at the weekly limit — admin must manually unblock
+    if (partner.weeklyCancelCount >= PARTNER_WEEKLY_CANCEL_LIMIT) {
+      partner.isBlocked = true;
+      console.warn(`[AUTO-SUSPEND] Partner ${partner._id} (${partner.name}) suspended after ${partner.weeklyCancelCount} weekly cancellations`);
+    }
 
     /* =====================
        FREE SLOT + LOAD

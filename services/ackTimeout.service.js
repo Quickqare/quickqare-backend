@@ -57,7 +57,7 @@ async function handleAckTimeout(bookingId, partnerId) {
     );
 
     const { reassignBooking } = require("./assignmentEngine");
-    await reassignBooking(bookingId, partnerId);
+    await reassignBooking(bookingId, partnerId, "TIMEOUT");
   } catch (err) {
     console.error("ACK timeout handler error:", err);
   }

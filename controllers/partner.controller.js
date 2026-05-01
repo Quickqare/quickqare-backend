@@ -1,6 +1,7 @@
 const Booking = require("../models/Booking");
 const Partner = require("../models/Partner");
 const Service = require("../models/service.model");
+const CatalogItem = require("../models/CatalogItem");
 const SubCategory = require("../models/SubCategory");
 const Zone = require("../models/zone.model");
 const { reverseGeocode } = require("../services/geocode.service");
@@ -459,18 +460,20 @@ exports.getPartnerAppSettings = async (_req, res) => {
  */
 exports.getPartsCatalog = async (req, res) => {
   try {
-    const services = await Service.find({ isActive: true })
-      .select("_id name price description imageUrl category subCategory duration")
-      .populate("category", "name")
-      .populate("subCategory", "name")
-      .sort({ name: 1 })
+    const items = await CatalogItem.find({ isActive: true })
+      .select("_id name priceInr description")
+      .sort({ sortOrder: 1, name: 1 })
       .lean();
 
-    return res.json({
-      success: true,
-      count: services.length,
-      services,
-    });
+    // Map priceInr → price so the partner app receives a consistent shape
+    const services = items.map((i) => ({
+      _id: i._id,
+      name: i.name,
+      price: i.priceInr,
+      description: i.description,
+    }));
+
+    return res.json({ success: true, count: services.length, services });
   } catch (err) {
     console.error("getPartsCatalog error:", err);
     return res.status(500).json({ success: false, message: "Server error" });
@@ -510,28 +513,28 @@ exports.submitEstimate = async (req, res) => {
       });
     }
 
-    // Fetch live prices from DB so admin changes are always respected
-    const serviceIds = items.map((i) => i.serviceId).filter(Boolean);
-    const catalogServices = await Service.find({
-      _id: { $in: serviceIds },
+    // Fetch live prices from CatalogItem (admin-set) so price changes are always respected
+    const itemIds = items.map((i) => i.serviceId).filter(Boolean);
+    const catalogItems = await CatalogItem.find({
+      _id: { $in: itemIds },
       isActive: true,
     }).lean();
-    const serviceMap = Object.fromEntries(
-      catalogServices.map((s) => [s._id.toString(), s])
+    const catalogMap = Object.fromEntries(
+      catalogItems.map((c) => [c._id.toString(), c])
     );
 
     const estimateItems = [];
     let estimateTotal = 0;
 
     for (const item of items) {
-      const service = serviceMap[String(item.serviceId)];
-      if (!service) continue;
+      const catalogItem = catalogMap[String(item.serviceId)];
+      if (!catalogItem) continue;
       const qty = Math.max(1, Math.floor(Number(item.quantity) || 1));
-      const lineTotal = Math.round(service.price * qty * 100) / 100;
+      const lineTotal = Math.round(catalogItem.priceInr * qty * 100) / 100;
       estimateItems.push({
-        serviceId: service._id,
-        name: service.name,
-        price: service.price,
+        serviceId: catalogItem._id,
+        name: catalogItem.name,
+        price: catalogItem.priceInr,
         quantity: qty,
         lineTotal,
       });

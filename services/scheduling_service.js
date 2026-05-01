@@ -10,6 +10,9 @@ CONSTANTS
 */
 const WORKDAY_START_HOUR = 9;
 const WORKDAY_END_HOUR = 20;
+// Late-day jobs (e.g. 150-min AC gas refill starting at 18:00) finish past 20:00.
+// Allow end time up to 21:00 so the slot is not suppressed.
+const WORKDAY_END_GRACE_HOUR = 21;
 const SLOT_GAP_MINUTES = 60;
 const DEFAULT_SERVICE_DURATION_MINUTES = 60;
 const DEFAULT_TRAVEL_BUFFER_MINUTES = 30;
@@ -297,25 +300,14 @@ WORKDAY GUARD
 =====================================================
 */
 function isInsideWorkday(startAt, endAt) {
-  const workdayStart = new Date(
-    startAt.getFullYear(),
-    startAt.getMonth(),
-    startAt.getDate(),
-    WORKDAY_START_HOUR,
-    0,
-    0,
-    0
-  );
-  const workdayEnd = new Date(
-    startAt.getFullYear(),
-    startAt.getMonth(),
-    startAt.getDate(),
-    WORKDAY_END_HOUR,
-    0,
-    0,
-    0
-  );
-  return startAt >= workdayStart && endAt <= workdayEnd;
+  const y = startAt.getFullYear();
+  const mo = startAt.getMonth();
+  const d = startAt.getDate();
+  const workdayStart = new Date(y, mo, d, WORKDAY_START_HOUR, 0, 0, 0);
+  const workdayEnd   = new Date(y, mo, d, WORKDAY_END_HOUR, 0, 0, 0);
+  // End time may overflow by up to 1 hour for long late-day jobs
+  const workdayGrace = new Date(y, mo, d, WORKDAY_END_GRACE_HOUR, 0, 0, 0);
+  return startAt >= workdayStart && startAt < workdayEnd && endAt <= workdayGrace;
 }
 
 /*
@@ -656,10 +648,16 @@ function calculatePartnerScore({
   earningsToday = 1,
   isAC = false,
 }) {
+  // For partners who have never been assigned, use hours elapsed since workday
+  // start today as the idle baseline. Giving them a fixed 24-hour idle score
+  // unfairly boosts new or returning partners above those who worked this morning.
   const idleTimeHours = partner.lastAssignedAt
-    ? (Date.now() - new Date(partner.lastAssignedAt).getTime()) /
-      (1000 * 60 * 60)
-    : 24;
+    ? (Date.now() - new Date(partner.lastAssignedAt).getTime()) / (1000 * 60 * 60)
+    : (() => {
+        const workdayStartToday = new Date();
+        workdayStartToday.setHours(WORKDAY_START_HOUR, 0, 0, 0);
+        return Math.max((Date.now() - workdayStartToday.getTime()) / (1000 * 60 * 60), 0);
+      })();
   const idleScore = Math.min(idleTimeHours / FAIRNESS_LOOKBACK_HOURS, 1) * 100;
 
   const distanceScore =
@@ -895,24 +893,18 @@ async function getAvailableSlotsForRequest({
   const now = new Date();
   const isToday = normalizeDateKey(date) === normalizeDateKey(now);
 
-  // AC bookings use a tighter capacity buffer (0.70 vs 0.80) because
-  // AC jobs have higher task variability — gas top-ups often run over.
-  const CAPACITY_BUFFER = requestContext.isAC ? 0.70 : 0.80;
-  const MAX_CAPACITY = requestContext.isAC
-    ? AC_MAX_CAPACITY_MINUTES
-    : GENERAL_MAX_CAPACITY_MINUTES;
-
+  // Count ALL approved partners in the zone (not filtered by isOnline/isAvailable).
+  // Online status can flip to false the moment a partner is assigned a booking, which
+  // would collapse totalCapacity to 0 and block every remaining slot for that day —
+  // even slots that don't overlap with the booked one.
   const activePartnersInZone = await Partner.countDocuments({
     $or: [{ serviceAreas: pincode }, { currentPincode: pincode }],
-    isAvailable: true,
-    isOnline: true,
-    // For AC Level 2/3, only count technicians towards capacity
+    approvalStatus: "APPROVED",
+    isBlocked: { $ne: true },
     ...(requestContext.isAC && requestContext.requiredSkillTier >= 2
       ? { skillTier: { $gte: requestContext.requiredSkillTier } }
       : {}),
   });
-
-  const totalCapacity = activePartnersInZone * MAX_CAPACITY * CAPACITY_BUFFER;
 
   const existingBookings = await Booking.find({
     pincode,
@@ -933,15 +925,9 @@ async function getAvailableSlotsForRequest({
       },
       { status: "PENDING_PAYMENT", lockedUntil: { $gt: new Date() } },
     ],
-  });
-
-  const usedCapacity = existingBookings.reduce(
-    (sum, b) =>
-      sum + (b.lockedCapacityMinutes || b.estimatedDurationMinutes || 60),
-    0
+  }).select(
+    "scheduledStartAt scheduledTime scheduledDate estimatedDurationMinutes lockedCapacityMinutes serviceCategory"
   );
-
-  const remainingCapacity = totalCapacity - usedCapacity;
 
   const slotResults = [];
   const dayStart = buildDateTime(
@@ -963,7 +949,21 @@ async function getAvailableSlotsForRequest({
 
     if (isToday && slotStart.getTime() <= now.getTime()) continue;
     if (!isInsideWorkday(slotStart, slotEnd)) continue;
-    if (remainingCapacity < durationMinutes) continue; // Zone is at capacity
+
+    // Per-slot capacity check: count bookings that actually overlap THIS time window.
+    // A daily-aggregate check would block afternoon slots because of a morning booking
+    // (the two don't share capacity — a partner free at 2 PM can take a new job).
+    if (activePartnersInZone > 0) {
+      const overlappingCount = existingBookings.filter((b) => {
+        const bStart = b.scheduledStartAt
+          ? new Date(b.scheduledStartAt)
+          : buildDateTime(b.scheduledDate, b.scheduledTime || "09:00");
+        const bDur = b.lockedCapacityMinutes || b.estimatedDurationMinutes || 60;
+        const bEnd = addMinutes(bStart, bDur);
+        return bStart < slotEnd && bEnd > slotStart;
+      }).length;
+      if (overlappingCount >= activePartnersInZone) continue; // Every partner is busy in this window
+    }
 
     const rankedPartners = await findEligiblePartnersForBooking(
       {
