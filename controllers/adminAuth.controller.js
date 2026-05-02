@@ -1,12 +1,21 @@
 const jwt = require("jsonwebtoken");
-
-const ADMIN_EMAIL = "admin@quickqare.com";
-const ADMIN_PASSWORD = "admin123"; // later store in DB
+const bcrypt = require("bcrypt");
 
 exports.loginAdmin = async (req, res) => {
   const { email, password } = req.body;
 
-  if (email !== ADMIN_EMAIL || password !== ADMIN_PASSWORD) {
+  const adminEmail = process.env.ADMIN_EMAIL;
+  const adminPasswordHash = process.env.ADMIN_PASSWORD_HASH;
+
+  if (!adminEmail || !adminPasswordHash) {
+    console.error("[admin] ADMIN_EMAIL or ADMIN_PASSWORD_HASH env vars not configured");
+    return res.status(503).json({ message: "Admin auth not configured" });
+  }
+
+  const emailMatch = email === adminEmail;
+  const passwordMatch = await bcrypt.compare(password, adminPasswordHash);
+
+  if (!emailMatch || !passwordMatch) {
     return res.status(401).json({ message: "Invalid admin credentials" });
   }
 
@@ -16,8 +25,5 @@ exports.loginAdmin = async (req, res) => {
     { expiresIn: "1d" }
   );
 
-  res.json({
-    success: true,
-    token,
-  });
+  res.json({ success: true, token });
 };

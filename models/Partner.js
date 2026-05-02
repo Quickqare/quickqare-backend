@@ -192,6 +192,25 @@ const partnerSchema = new mongoose.Schema(
       default: Date.now,
     },
 
+    // Set when partner is auto-suspended (>= 5 weekly cancellations or admin action).
+    // Assignment engine excludes partners where suspendedUntil > now.
+    suspendedUntil: {
+      type: Date,
+      default: null,
+    },
+
+    // Quality counters — increment on no-show / late-accept events.
+    // Used by ops dashboard for proactive partner review.
+    noShowCount: {
+      type: Number,
+      default: 0,
+    },
+
+    lateAcceptanceCount: {
+      type: Number,
+      default: 0,
+    },
+
     /* =====================
        AVAILABILITY CALENDAR
     ===================== */
@@ -264,6 +283,13 @@ const partnerSchema = new mongoose.Schema(
    GEO INDEX
 ===================== */
 partnerSchema.index({ location: "2dsphere" });
+
+/* =====================
+   ELIGIBILITY QUERY INDEXES
+   Covers findEligiblePartnersForBooking compound filters
+===================== */
+partnerSchema.index({ isBlocked: 1, approvalStatus: 1, isOnline: 1 });
+partnerSchema.index({ isBlocked: 1, approvalStatus: 1, serviceAreas: 1 });
 
 /* =====================
    AUTO CREATE WALLET

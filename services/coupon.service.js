@@ -162,18 +162,32 @@ const recordCouponRedemption = async ({
   const existing = await CouponRedemption.findOne({ bookingId }).lean();
   if (existing) return existing;
 
-  const redemption = await CouponRedemption.create({
+  // Atomically increment usedCount only if still within the usage limit — prevents concurrent over-redemption
+  const updated = await Coupon.findOneAndUpdate(
+    {
+      _id: couponId,
+      $or: [
+        { usageLimit: { $exists: false } },
+        { usageLimit: null },
+        { $expr: { $lt: ["$usedCount", "$usageLimit"] } },
+      ],
+    },
+    { $inc: { usedCount: 1 } },
+    { new: true }
+  );
+
+  if (!updated) {
+    const err = new Error("Coupon usage limit reached");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  return await CouponRedemption.create({
     couponId,
     bookingId,
     customerId,
     discountAmountInr: Number(discountAmountInr || 0),
   });
-
-  await Coupon.findByIdAndUpdate(couponId, {
-    $inc: { usedCount: 1 },
-  });
-
-  return redemption;
 };
 
 module.exports = {

@@ -5,9 +5,10 @@ const {
   verifyOtp,
   exchangeMsg91AccessToken,
 } = require("../controllers/userOtp.controller");
+const { authLimiter } = require("../middlewares/rateLimiter");
 
-router.post("/send-otp", sendOtp);
-router.post("/verify-otp", verifyOtp);
-router.post("/msg91/exchange", exchangeMsg91AccessToken);
+router.post("/send-otp", authLimiter, sendOtp);
+router.post("/verify-otp", authLimiter, verifyOtp);
+router.post("/msg91/exchange", authLimiter, exchangeMsg91AccessToken);
 
 module.exports = router;

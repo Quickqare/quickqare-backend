@@ -67,6 +67,11 @@ exports.verifyRazorpayPayment = async (req, res) => {
     /* =====================
        VERIFY SIGNATURE
     ===================== */
+    if (!process.env.RAZORPAY_KEY_SECRET) {
+      console.error("[payment] RAZORPAY_KEY_SECRET is not configured");
+      return res.status(500).json({ success: false, message: "Payment gateway not configured" });
+    }
+
     const body = `${razorpay_order_id}|${razorpay_payment_id}`;
 
     const expectedSignature = crypto
@@ -84,14 +89,6 @@ exports.verifyRazorpayPayment = async (req, res) => {
       });
     }
 
-    /* =====================
-       MARK PAYMENT SUCCESS
-    ===================== */
-    booking.payment.razorpay_payment_id = razorpay_payment_id;
-    booking.payment.razorpay_order_id = razorpay_order_id;
-    booking.payment.razorpay_signature = razorpay_signature;
-    booking.payment.status = "PAID";
-
     const scheduledStart = booking.scheduledStartAt 
       ? new Date(booking.scheduledStartAt) 
       : buildDateTime(booking.scheduledDate, booking.scheduledTime);
@@ -99,19 +96,38 @@ exports.verifyRazorpayPayment = async (req, res) => {
     const timeToServiceMs = scheduledStart.getTime() - Date.now();
     const hoursToService = timeToServiceMs / (1000 * 60 * 60);
 
+    const newStatus = hoursToService > 24 ? "QUEUED" : "PENDING_ASSIGNMENT";
+
+    // ATOMIC UPDATE: Prevent duplicate webhook & client requests from running assignment twice
+    const updatedBooking = await Booking.findOneAndUpdate(
+      { _id: bookingId, "payment.status": { $ne: "PAID" } },
+      {
+        $set: {
+          status: newStatus,
+          "payment.razorpay_payment_id": razorpay_payment_id,
+          "payment.razorpay_order_id": razorpay_order_id,
+          "payment.razorpay_signature": razorpay_signature,
+          "payment.status": "PAID"
+        }
+      },
+      { new: true }
+    );
+
+    if (!updatedBooking) {
+      return res.json({
+        success: true,
+        message: "Payment already verified",
+        bookingId: booking._id,
+      });
+    }
+
     if (hoursToService > 24) {
-      booking.status = "QUEUED";
-      await booking.save();
-      
       return res.json({
         success: true,
         message: "Payment verified. Booking queued for partner assignment closer to the service date.",
         bookingId: booking._id,
       });
     } else {
-      booking.status = "PENDING_ASSIGNMENT";
-      await booking.save();
-
       /* =====================
          AUTO ASSIGN PARTNER
       ===================== */

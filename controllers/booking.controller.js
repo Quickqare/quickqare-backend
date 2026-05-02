@@ -1,3 +1,4 @@
+const crypto = require("crypto");
 const Booking = require("../models/Booking");
 const Partner = require("../models/Partner");
 const Service = require("../models/service.model");
@@ -14,6 +15,8 @@ const {
 } = require("../services/scheduling_service");
 const { calculatePricing } = require("../utils/pricing");
 const { validateCouponForAmount } = require("../services/coupon.service");
+
+const PAYMENT_LOCK_MINUTES = 15;
 
 const normalizeText = (value = "") =>
   String(value).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
@@ -410,7 +413,7 @@ exports.createBooking = async (req, res) => {
       estimatedDurationMinutes,
       location,
 
-      lockedUntil: new Date(Date.now() + 15 * 60 * 1000), // 15 min — covers UPI/net-banking delays
+      lockedUntil: new Date(Date.now() + PAYMENT_LOCK_MINUTES * 60 * 1000),
       lockedCapacityMinutes: estimatedDurationMinutes,
 
       payment: { status: "PENDING" },
@@ -518,30 +521,219 @@ exports.getAvailableSlots = async (req, res) => {
 
 /* =======================
    PARTNER STARTS TRAVEL
+   Guards: must be assigned partner; status must be PARTNER_ACCEPTED or CONFIRMED.
+   Side effects:
+     - generates 4-digit OTP (customer must read it out at door)
+     - estimates ETA from partner location → customer location
+     - notifies user via socket
 ======================= */
 exports.markOnTheWay = async (req, res) => {
-  const booking = await Booking.findById(req.params.bookingId);
-  booking.status = "ON_THE_WAY";
-  await booking.save();
+  try {
+    const { bookingId } = req.params;
+    const partnerId = req.partner?._id;
+    if (!partnerId) return res.status(401).json({ message: "Partner auth required" });
 
-  res.json({
-    success: true,
-    message: "Partner is on the way",
-  });
+    const booking = await Booking.findById(bookingId).populate(
+      "partner",
+      "location"
+    );
+    if (!booking) return res.status(404).json({ message: "Booking not found" });
+
+    // Authorization: must be assigned to this booking
+    const pid = String(partnerId);
+    const isAssigned =
+      booking.partner?._id?.toString() === pid ||
+      (booking.additionalPartners || []).some((p) => p.toString() === pid);
+    if (!isAssigned) {
+      return res.status(403).json({ message: "Not assigned to this booking" });
+    }
+
+    // Status guard
+    if (!["PARTNER_ACCEPTED", "CONFIRMED"].includes(booking.status)) {
+      return res.status(400).json({
+        message: `Cannot mark on-the-way from status ${booking.status}`,
+      });
+    }
+
+    // OTP — 4-digit, persisted hidden (select: false)
+    const otp = String(crypto.randomInt(1000, 10000));
+
+    // ETA — naive haversine + 3 min/km (Indian traffic baseline)
+    let etaMinutes = null;
+    let estimatedArrivalAt = null;
+    try {
+      const partnerCoords = booking.partner?.location?.coordinates;
+      const customerCoords = booking.location?.coordinates;
+      if (
+        Array.isArray(partnerCoords) &&
+        Array.isArray(customerCoords) &&
+        partnerCoords.length === 2 &&
+        customerCoords.length === 2
+      ) {
+        const [pLng, pLat] = partnerCoords.map(Number);
+        const [cLng, cLat] = customerCoords.map(Number);
+        const toRad = (v) => (v * Math.PI) / 180;
+        const R = 6371;
+        const dLat = toRad(cLat - pLat);
+        const dLng = toRad(cLng - pLng);
+        const a =
+          Math.sin(dLat / 2) ** 2 +
+          Math.cos(toRad(pLat)) *
+            Math.cos(toRad(cLat)) *
+            Math.sin(dLng / 2) ** 2;
+        const km = 2 * R * Math.asin(Math.sqrt(a));
+        etaMinutes = Math.max(5, Math.round(km * 3));
+        estimatedArrivalAt = new Date(Date.now() + etaMinutes * 60 * 1000);
+      }
+    } catch (e) {
+      // ETA is best-effort; partner can still proceed without it
+    }
+
+    booking.status = "ON_THE_WAY";
+    booking.serviceStartOtp = otp;
+    booking.estimatedArrivalAt = estimatedArrivalAt;
+    await booking.save();
+
+    // Notify user with OTP and ETA — they show OTP to partner at the door
+    if (global.io) {
+      global.io.to(`user_${booking.user}`).emit("booking_update", {
+        bookingId: booking._id.toString(),
+        status: "ON_THE_WAY",
+        serviceStartOtp: otp,
+        etaMinutes,
+        estimatedArrivalAt,
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "Partner marked on the way",
+      etaMinutes,
+      estimatedArrivalAt,
+    });
+  } catch (err) {
+    console.error("markOnTheWay error:", err);
+    res.status(500).json({ message: "Failed to update status" });
+  }
 };
 
 /* =======================
-   PARTNER STARTS SERVICE
+   PARTNER ARRIVED
+   Optional intermediate state — useful for SLA tracking.
+======================= */
+exports.markArrived = async (req, res) => {
+  try {
+    const { bookingId } = req.params;
+    const partnerId = req.partner?._id;
+    if (!partnerId) return res.status(401).json({ message: "Partner auth required" });
+
+    const booking = await Booking.findById(bookingId);
+    if (!booking) return res.status(404).json({ message: "Booking not found" });
+
+    const pid = String(partnerId);
+    const isAssigned =
+      booking.partner?.toString() === pid ||
+      (booking.additionalPartners || []).some((p) => p.toString() === pid);
+    if (!isAssigned) {
+      return res.status(403).json({ message: "Not assigned to this booking" });
+    }
+
+    if (booking.status !== "ON_THE_WAY") {
+      return res.status(400).json({
+        message: `Cannot mark arrived from status ${booking.status}`,
+      });
+    }
+
+    booking.status = "ARRIVED";
+    booking.arrivedAt = new Date();
+    await booking.save();
+
+    if (global.io) {
+      global.io.to(`user_${booking.user}`).emit("booking_update", {
+        bookingId: booking._id.toString(),
+        status: "ARRIVED",
+        arrivedAt: booking.arrivedAt,
+      });
+    }
+
+    res.json({ success: true, message: "Arrival recorded" });
+  } catch (err) {
+    console.error("markArrived error:", err);
+    res.status(500).json({ message: "Failed to update status" });
+  }
+};
+
+/* =======================
+   PARTNER STARTS SERVICE — REQUIRES OTP
+   Customer reads out their 4-digit OTP at the door.
+   Prevents partner from marking IN_PROGRESS without being on-site.
 ======================= */
 exports.startService = async (req, res) => {
-  const booking = await Booking.findById(req.params.bookingId);
-  booking.status = "IN_PROGRESS";
-  await booking.save();
+  try {
+    const { bookingId } = req.params;
+    const { otp } = req.body || {};
+    const partnerId = req.partner?._id;
 
-  res.json({
-    success: true,
-    message: "Service started",
-  });
+    if (!partnerId) return res.status(401).json({ message: "Partner auth required" });
+    if (!otp) return res.status(400).json({ message: "OTP required" });
+
+    const booking = await Booking.findById(bookingId).select("+serviceStartOtp");
+    if (!booking) return res.status(404).json({ message: "Booking not found" });
+
+    const pid = String(partnerId);
+    const isAssigned =
+      booking.partner?.toString() === pid ||
+      (booking.additionalPartners || []).some((p) => p.toString() === pid);
+    if (!isAssigned) {
+      return res.status(403).json({ message: "Not assigned to this booking" });
+    }
+
+    if (!["ON_THE_WAY", "ARRIVED"].includes(booking.status)) {
+      return res.status(400).json({
+        message: `Cannot start service from status ${booking.status}`,
+      });
+    }
+
+    const providedOtp = String(otp).trim();
+    const storedOtp   = booking.serviceStartOtp || "";
+    const otpValid =
+      storedOtp.length > 0 &&
+      providedOtp.length === storedOtp.length &&
+      crypto.timingSafeEqual(Buffer.from(providedOtp), Buffer.from(storedOtp));
+
+    if (!otpValid) {
+      return res.status(400).json({ message: "Invalid OTP" });
+    }
+
+    // ATOMIC UPDATE: Prevent race conditions
+    const updatedBooking = await Booking.findOneAndUpdate(
+      { _id: bookingId, status: booking.status },
+      {
+        $set: {
+          status: "IN_PROGRESS",
+          otpVerifiedAt: new Date(),
+          serviceStartOtp: null // burn the OTP after use
+        }
+      },
+      { new: true }
+    );
+
+    if (!updatedBooking) {
+      return res.status(409).json({ message: "Booking state changed. Please refresh." });
+    }
+
+    if (global.io) {
+      global.io.to(`user_${booking.user}`).emit("booking_update", {
+        bookingId: booking._id.toString(),
+        status: "IN_PROGRESS",
+      });
+    }
+
+    res.json({ success: true, message: "Service started" });
+  } catch (err) {
+    console.error("startService error:", err);
+    res.status(500).json({ message: "Failed to start service" });
+  }
 };
 
 /* =======================
@@ -550,21 +742,42 @@ exports.startService = async (req, res) => {
 exports.completeBooking = async (req, res) => {
   try {
     const { bookingId } = req.params;
-    const partnerId = req.partner?._id || req.body?.partnerId; // Identify who pressed complete
+    // Only use the authenticated partner identity — never trust req.body.partnerId
+    const partnerId = req.partner?._id;
+    if (!partnerId) return res.status(401).json({ message: "Partner auth required" });
 
     const booking = await Booking.findById(bookingId).populate("partner");
 
     if (!booking) return res.status(404).json({ message: "Booking not found" });
 
+    // Idempotency — partner taps "Complete" twice on flaky network.
+    if (booking.status === "COMPLETED") {
+      return res.json({
+        success: true,
+        alreadyCompleted: true,
+        message: "Booking already completed",
+        settlement: booking.partnerSettlement,
+      });
+    }
+
     if (booking.status !== "IN_PROGRESS") {
       return res.status(400).json({ message: "Booking not in progress" });
+    }
+
+    // Authorization — only an assigned partner can complete
+    const pid = String(partnerId);
+    const isAssigned =
+      booking.partner?._id?.toString() === pid ||
+      (booking.additionalPartners || []).some((p) => p.toString() === pid);
+    if (!isAssigned) {
+      return res.status(403).json({ message: "Not assigned to this booking" });
     }
 
     const partner = booking.partner;
     const settlement = await calculatePartnerSettlement(booking, partner);
 
     const teamAllocations = booking.get("teamAllocations") || [];
-    const additionalPartners = booking.get("additionalPartners") || [];
+    const additionalPartners = booking.additionalPartners || [];
 
     let currentPartnerShare = 0;
 
@@ -577,8 +790,16 @@ exports.completeBooking = async (req, res) => {
           return res.status(400).json({ success: false, message: "You have already completed your part." });
         }
 
-        allocation.status = "COMPLETED";
-        allocation.completedAt = new Date();
+        // ATOMIC ARRAY UPDATE: Prevent teammates completing exactly at the same time from overwriting each other
+        const arrayUpdate = await Booking.findOneAndUpdate(
+          { _id: bookingId, "teamAllocations.partnerId": partnerId },
+          { $set: { "teamAllocations.$.status": "COMPLETED", "teamAllocations.$.completedAt": new Date() } },
+          { new: true }
+        );
+
+        if (!arrayUpdate) {
+          return res.status(409).json({ success: false, message: "Booking state changed. Please refresh." });
+        }
 
         // Pay this individual immediately
         currentPartnerShare = roundAmount(settlement.partnerEarningAmount * allocation.payoutRatio);
@@ -594,9 +815,8 @@ exports.completeBooking = async (req, res) => {
         // Free their individual calendar
         await syncPartnerOperationalState(partnerId);
 
-        const pendingPartners = teamAllocations.filter(a => a.status !== "COMPLETED");
+        const pendingPartners = arrayUpdate.teamAllocations.filter(a => a.status !== "COMPLETED");
         if (pendingPartners.length > 0) {
-          await booking.save();
           return res.json({
             success: true,
             message: `Your task is complete! ₹${currentPartnerShare} credited to your wallet. Waiting for teammates.`,
@@ -608,6 +828,38 @@ exports.completeBooking = async (req, res) => {
 
     // --- FALLBACK (OLD BOOKINGS WITHOUT TEAM ALLOCATIONS) ---
     if (teamAllocations.length === 0) {
+      // ATOMIC UPDATE FIRST: Prevent paying out for a booking the user just cancelled.
+      // If this findOneAndUpdate returns null, the user beat us — return 409 without crediting wallets.
+      const updatedBooking = await Booking.findOneAndUpdate(
+        { _id: bookingId, status: "IN_PROGRESS" },
+        {
+          $set: {
+            status: "COMPLETED",
+            completedAt: new Date(),
+            isPaidToPartner: false,
+            requiresRating: true,
+            partnerSettlement: {
+              grossAmount: settlement.grossAmount,
+              commissionAmount: settlement.commissionAmount,
+              partnerEarningAmount: settlement.partnerEarningAmount,
+              status: "UNSETTLED",
+              settledAt: new Date(Date.now() + 48 * 60 * 60 * 1000),
+              paidOutAt: null,
+            },
+          },
+        },
+        { new: true }
+      );
+
+      if (!updatedBooking) {
+        return res.status(409).json({ message: "Booking state changed during completion. Please refresh." });
+      }
+
+      if (!booking.partner) {
+        console.error(`[completeBooking] Booking ${bookingId} has no partner reference — skipping wallet credit`);
+        return res.status(500).json({ message: "Partner reference missing on booking" });
+      }
+
       const totalPartnersCount = 1 + additionalPartners.length;
       const fallbackSplitAmount = roundAmount(settlement.partnerEarningAmount / totalPartnersCount);
 
@@ -629,7 +881,7 @@ exports.completeBooking = async (req, res) => {
       } else {
         currentPartnerShare = settlement.partnerEarningAmount;
       }
-      
+
       await creditWallet({
         partnerId: booking.partner._id,
         amount: currentPartnerShare,
@@ -639,30 +891,57 @@ exports.completeBooking = async (req, res) => {
         bucket: "pending",
       });
       await syncPartnerOperationalState(booking.partner._id);
+
+      /* =====================
+         PROCESS REFERRAL REWARD
+      ===================== */
+      const { processReferralReward } = require("../utils/referral");
+      await processReferralReward(booking.user, booking._id);
+
+      if (global.io) {
+        global.io.to(`user_${booking.user}`).emit("jobCompleted", {
+          bookingId: booking._id,
+          message: "Your service has been completed",
+        });
+      }
+
+      return res.json({
+        success: true,
+        message: `Booking completed! ₹${currentPartnerShare} credited to your wallet.`,
+        settlement,
+      });
     }
 
-    booking.status = "COMPLETED";
-    booking.completedAt = new Date();
-    booking.isPaidToPartner = false;
-    booking.partnerSettlement = {
-      grossAmount: settlement.grossAmount,
-      commissionAmount: settlement.commissionAmount,
-      partnerEarningAmount: settlement.partnerEarningAmount,
-      status: "UNSETTLED",
-      settledAt: new Date(Date.now() + 48 * 60 * 60 * 1000), // 48 hour delay
-      paidOutAt: null,
-    };
-    await booking.save();
+    // ATOMIC UPDATE for team-allocation path (all partners already paid individually above)
+    const updatedBooking = await Booking.findOneAndUpdate(
+      { _id: bookingId, status: "IN_PROGRESS" },
+      {
+        $set: {
+          status: "COMPLETED",
+          completedAt: new Date(),
+          isPaidToPartner: false,
+          requiresRating: true,
+          partnerSettlement: {
+            grossAmount: settlement.grossAmount,
+            commissionAmount: settlement.commissionAmount,
+            partnerEarningAmount: settlement.partnerEarningAmount,
+            status: "UNSETTLED",
+            settledAt: new Date(Date.now() + 48 * 60 * 60 * 1000),
+            paidOutAt: null,
+          },
+        },
+      },
+      { new: true }
+    );
 
-    /* =====================
-       PROCESS REFERRAL REWARD
-    ===================== */
+    if (!updatedBooking) {
+      return res.status(409).json({ message: "Booking state changed during completion. Please refresh." });
+    }
+
+    // Team-allocation path: referral + notify after all partners complete
     const { processReferralReward } = require("../utils/referral");
     await processReferralReward(booking.user, booking._id);
 
-    /* =====================
-       NOTIFY USER
-    ===================== */
     if (global.io) {
       global.io.to(`user_${booking.user}`).emit("jobCompleted", {
         bookingId: booking._id,
@@ -676,6 +955,7 @@ exports.completeBooking = async (req, res) => {
       settlement,
     });
   } catch (error) {
+    console.error("completeBooking error:", { bookingId: req.params?.bookingId, err: error.message });
     res.status(500).json({ message: error.message });
   }
 };
@@ -755,42 +1035,105 @@ exports.cancelBooking = async (req, res) => {
 /* =======================
    USER CANCELS BOOKING
 ======================= */
+/*
+ * USER CANCELS BOOKING — refund tiers based on time-to-service.
+ *   > 24 h before  → 100% refund
+ *   4 – 24 h       →  75% refund
+ *   1 – 4 h        →  50% refund
+ *   < 1 h          →  25% refund
+ *   already started / completed / cancelled → blocked
+ *
+ * Refunds are recorded as PENDING; back-office reconciliation pushes them to PROCESSED.
+ */
+function calculateRefund(totalAmount, hoursToService) {
+  if (hoursToService < 0) return { percent: 0, amount: 0 }; // service already past
+  if (hoursToService > 24) return { percent: 100, amount: totalAmount };
+  if (hoursToService > 4)  return { percent: 75,  amount: Math.round(totalAmount * 0.75) };
+  if (hoursToService > 1)  return { percent: 50,  amount: Math.round(totalAmount * 0.50) };
+  return { percent: 25, amount: Math.round(totalAmount * 0.25) };
+}
+
 exports.cancelBookingByUser = async (req, res) => {
   try {
     const { bookingId } = req.params;
+    const { reason = "" } = req.body || {};
 
     const booking = await Booking.findById(bookingId).populate("partner");
-
     if (!booking) return res.status(404).json({ message: "Booking not found" });
 
     if (booking.user.toString() !== req.user._id.toString()) {
       return res.status(403).json({ message: "Unauthorized cancellation" });
     }
 
-    if (["IN_PROGRESS", "COMPLETED"].includes(booking.status)) {
+    if (["IN_PROGRESS", "COMPLETED", "CANCELLED"].includes(booking.status)) {
       return res.status(400).json({
-        message: "Cannot cancel after service started",
+        message: `Cannot cancel from status ${booking.status}`,
       });
     }
 
-    booking.status = "CANCELLED";
-    booking.cancelledBy = "user";
-    await booking.save();
+    // Compute refund tier — only matters for PAID bookings; PENDING_PAYMENT returns 100%.
+    const scheduledStart = booking.scheduledStartAt
+      ? new Date(booking.scheduledStartAt)
+      : buildDateTime(booking.scheduledDate, booking.scheduledTime);
+    const hoursToService = (scheduledStart.getTime() - Date.now()) / (1000 * 60 * 60);
 
-    // free partner slot
+    let refund = { percent: 100, amount: 0 };
+    if (booking.payment?.status === "PAID") {
+      refund = calculateRefund(Number(booking.totalAmount || 0), hoursToService);
+    }
+
+    // ATOMIC STATE TRANSITION: Prevents race condition where partner completes 
+    // the job exactly as the user cancels it.
+    const updatedBooking = await Booking.findOneAndUpdate(
+      { _id: bookingId, status: booking.status }, // Optimistic lock: ensure status hasn't changed!
+      {
+        $set: {
+          status: "CANCELLED",
+          cancelledBy: "user",
+          cancelledAt: new Date(),
+          cancelReason: String(reason).trim().slice(0, 300),
+          refundAmount: refund.amount,
+          refundStatus: refund.amount > 0 ? "PENDING" : "NONE",
+        }
+      },
+      { new: true }
+    );
+
+    if (!updatedBooking) {
+      return res.status(409).json({ 
+        success: false, 
+        message: "Booking state changed during cancellation. Please refresh." 
+      });
+    }
+
+    // Free up partner availability
     if (booking.partner) {
       await syncPartnerOperationalState(booking.partner._id);
     }
-    const additionalPartners = booking.get("additionalPartners") || [];
-    for (const pId of additionalPartners) {
+    for (const pId of booking.additionalPartners || []) {
       await syncPartnerOperationalState(pId);
+    }
+
+    // Notify partner — they need to know the booking is no longer in their queue
+    if (global.io && booking.partner) {
+      global.io.to(`partner_${booking.partner._id}`).emit("booking_cancelled", {
+        bookingId: booking._id.toString(),
+        cancelledBy: "user",
+      });
     }
 
     res.json({
       success: true,
       message: "Booking cancelled successfully",
+      refund: {
+        percent: refund.percent,
+        amount: refund.amount,
+        status: booking.refundStatus,
+      },
+      cancellationFee: Number(booking.totalAmount || 0) - refund.amount,
     });
   } catch (error) {
+    console.error("cancelBookingByUser error:", error);
     res.status(500).json({ message: "Cancellation failed" });
   }
 };
@@ -863,13 +1206,25 @@ exports.getPartnerLiveLocation = async (req, res) => {
 ======================= */
 exports.getMyBookings = async (req, res) => {
   try {
-    const bookings = await Booking.find({ user: req.user._id }).sort({
-      createdAt: -1,
-    });
+    const page  = Math.max(1, Number(req.query.page)  || 1);
+    const limit = Math.min(50, Number(req.query.limit) || 20);
+    const skip  = (page - 1) * limit;
+
+    const [bookings, total] = await Promise.all([
+      Booking.find({ user: req.user._id })
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      Booking.countDocuments({ user: req.user._id }),
+    ]);
 
     res.json({
       success: true,
       count: bookings.length,
+      total,
+      page,
+      pages: Math.ceil(total / limit),
       bookings,
     });
   } catch (err) {

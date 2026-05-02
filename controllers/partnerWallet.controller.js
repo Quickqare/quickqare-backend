@@ -126,10 +126,16 @@ exports.getWalletHistory = async (req, res) => {
 exports.requestWithdrawal = async (req, res) => {
   try {
     const partnerId = req.partner._id;
-    const amount = roundAmount(Number(req.body.amount));
-
-    if (!amount || amount < 200) {
+    const rawAmount = Number(req.body.amount);
+    if (!Number.isFinite(rawAmount) || rawAmount <= 0) {
+      return res.status(400).json({ success: false, message: "Invalid withdrawal amount" });
+    }
+    const amount = roundAmount(rawAmount);
+    if (amount < 200) {
       return res.status(400).json({ success: false, message: "Minimum withdrawal amount is ₹200" });
+    }
+    if (amount > 100_000) {
+      return res.status(400).json({ success: false, message: "Maximum withdrawal amount is ₹1,00,000 per request" });
     }
 
     await releasePendingEarnings(partnerId);
@@ -201,6 +207,14 @@ exports.creditWallet = async ({
     throw new Error("partnerId and amount are required");
   }
 
+  // Idempotency: Prevent double-payouts for the same job
+  if (bookingId && reason === "job_payment") {
+    const existingTxn = await WalletTransaction.findOne({ partnerId, bookingId, reason: "job_payment" });
+    if (existingTxn) {
+      return; // Already credited for this job
+    }
+  }
+
   let wallet = await PartnerWallet.findOne({ partnerId });
 
   if (!wallet) {
@@ -248,28 +262,31 @@ exports.debitWallet = async ({
     throw new Error("partnerId and amount are required");
   }
 
-  const wallet = await PartnerWallet.findOne({ partnerId });
+  const safeAmount = roundAmount(amount);
+
+  // Atomic debit: only succeeds if sufficient balance exists — prevents concurrent double-spend
+  const wallet = await PartnerWallet.findOneAndUpdate(
+    { partnerId, withdrawableBalance: { $gte: safeAmount } },
+    {
+      $inc: {
+        withdrawableBalance: -safeAmount,
+        balance: -safeAmount,
+        totalWithdrawn: safeAmount,
+      },
+      $set: { lastUpdated: new Date() },
+    },
+    { new: true }
+  );
 
   if (!wallet) {
-    throw new Error("Wallet not found");
-  }
-
-  normalizeWallet(wallet);
-
-  if (wallet.withdrawableBalance < amount) {
+    const exists = await PartnerWallet.exists({ partnerId });
+    if (!exists) throw new Error("Wallet not found");
     throw new Error("Insufficient wallet balance");
   }
 
-  wallet.withdrawableBalance = roundAmount(wallet.withdrawableBalance - amount);
-  wallet.balance = roundAmount(wallet.withdrawableBalance);
-  wallet.totalWithdrawn = roundAmount(wallet.totalWithdrawn + amount);
-  wallet.lastUpdated = new Date();
-
-  await wallet.save();
-
   await WalletTransaction.create({
     partnerId,
-    amount,
+    amount: safeAmount,
     type: "debit",
     reason,
     bookingId,

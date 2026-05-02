@@ -2,6 +2,25 @@ const { reverseGeocode } = require("../services/geocode.service");
 const GOOGLE_MAPS_SERVER_API_KEY =
   process.env.GOOGLE_MAPS_SERVER_API_KEY || process.env.GOOGLE_MAPS_API_KEY;
 
+/*
+=====================================================
+GOOGLE MAPS CACHE
+Caches geocode and search responses for 30 days to 
+reduce API billing costs drastically.
+=====================================================
+*/
+const mapsCache = new Map();
+const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, value] of mapsCache.entries()) {
+    if (now - value.timestamp > CACHE_TTL_MS) {
+      mapsCache.delete(key);
+    }
+  }
+}, 12 * 60 * 60 * 1000); // Check every 12 hours
+
 exports.reverseGeocode = async (req, res) => {
   try {
     const latitude = Number(req.query.lat);
@@ -21,6 +40,13 @@ exports.reverseGeocode = async (req, res) => {
       });
     }
 
+    // Check Cache (round coordinate precision to ~11m)
+    const cacheKey = `revgeo_${latitude.toFixed(4)}_${longitude.toFixed(4)}`;
+    const cached = mapsCache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+      return res.json(cached.data);
+    }
+
     const resolved = await reverseGeocode(latitude, longitude);
     if (!resolved.ok) {
       const status = resolved.error === "GOOGLE_MAPS_KEY_MISSING" ? 500 : 502;
@@ -34,7 +60,7 @@ exports.reverseGeocode = async (req, res) => {
       });
     }
 
-    return res.json({
+    const responsePayload = {
       success: true,
       location: {
         latitude,
@@ -43,7 +69,14 @@ exports.reverseGeocode = async (req, res) => {
         address: resolved.address || "",
       },
       google: resolved.google || null,
+    };
+
+    mapsCache.set(cacheKey, {
+      timestamp: Date.now(),
+      data: responsePayload,
     });
+
+    return res.json(responsePayload);
   } catch (error) {
     return res.status(500).json({
       success: false,
@@ -69,6 +102,12 @@ exports.searchAddress = async (req, res) => {
         success: false,
         message: "query is required",
       });
+    }
+
+    const cacheKey = `search_${query.toLowerCase()}`;
+    const cached = mapsCache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+      return res.json(cached.data);
     }
 
     const response = await fetch(
@@ -122,7 +161,7 @@ exports.searchAddress = async (req, res) => {
       };
     });
 
-    return res.json({
+    const responsePayload = {
       success: true,
       count: locations.length,
       locations,
@@ -130,7 +169,14 @@ exports.searchAddress = async (req, res) => {
         status: googleStatus || "OK",
         errorMessage: googleErrorMessage || "",
       },
+    };
+
+    mapsCache.set(cacheKey, {
+      timestamp: Date.now(),
+      data: responsePayload,
     });
+
+    return res.json(responsePayload);
   } catch (error) {
     return res.status(500).json({
       success: false,

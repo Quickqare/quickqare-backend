@@ -69,6 +69,14 @@ router.patch(
   bookingController.markOnTheWay
 );
 
+// Optional intermediate state — partner reached customer's door
+router.patch(
+  "/arrived/:bookingId",
+  partnerAuth,
+  bookingController.markArrived
+);
+
+// Body: { otp: "1234" } — OTP given to customer when partner went on-the-way
 router.patch(
   "/start/:bookingId",
   partnerAuth,

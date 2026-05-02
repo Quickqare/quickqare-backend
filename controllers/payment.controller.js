@@ -149,24 +149,6 @@ exports.verifyPayment = async (req, res) => {
       });
     }
 
-    /* =====================
-       MARK PAYMENT SUCCESS
-    ===================== */
-    booking.payment.razorpay_payment_id = razorpay_payment_id;
-    booking.payment.razorpay_order_id = razorpay_order_id;
-    booking.payment.razorpay_signature = razorpay_signature;
-    booking.payment.status = "PAID";
-
-
-    if (booking.couponId && booking.couponCode) {
-      await recordCouponRedemption({
-        couponId: booking.couponId,
-        bookingId: booking._id,
-        customerId: booking.user,
-        discountAmountInr: booking.discountAmount || booking.couponDiscountAmount || 0,
-      });
-    }
-
     const scheduledStart = booking.scheduledStartAt 
       ? new Date(booking.scheduledStartAt) 
       : buildDateTime(booking.scheduledDate, booking.scheduledTime);
@@ -174,18 +156,45 @@ exports.verifyPayment = async (req, res) => {
     const timeToServiceMs = scheduledStart.getTime() - Date.now();
     const hoursToService = timeToServiceMs / (1000 * 60 * 60);
 
+    const newStatus = hoursToService > 24 ? "QUEUED" : "PENDING_ASSIGNMENT";
+
+    // ATOMIC UPDATE: Prevent duplicate webhook & client requests from running assignment twice
+    const updatedBooking = await Booking.findOneAndUpdate(
+      { _id: bookingId, "payment.status": { $ne: "PAID" } },
+      {
+        $set: {
+          status: newStatus,
+          "payment.razorpay_payment_id": razorpay_payment_id,
+          "payment.razorpay_order_id": razorpay_order_id,
+          "payment.razorpay_signature": razorpay_signature,
+          "payment.status": "PAID"
+        }
+      },
+      { new: true }
+    );
+
+    if (!updatedBooking) {
+      return res.json({
+        success: true,
+        message: "Payment already verified",
+      });
+    }
+
+    if (updatedBooking.couponId && updatedBooking.couponCode) {
+      await recordCouponRedemption({
+        couponId: updatedBooking.couponId,
+        bookingId: updatedBooking._id,
+        customerId: updatedBooking.user,
+        discountAmountInr: updatedBooking.discountAmount || updatedBooking.couponDiscountAmount || 0,
+      });
+    }
+
     if (hoursToService > 24) {
-      booking.status = "QUEUED";
-      await booking.save();
-      
       return res.json({
         success: true,
         message: "Payment verified. Booking queued for partner assignment closer to the service date.",
       });
     } else {
-      booking.status = "PENDING_ASSIGNMENT";
-      await booking.save();
-
       /* =====================
          AUTO ASSIGN PARTNER
       ===================== */

@@ -1,73 +1,76 @@
 /*
 =====================================================
 ACK TIMEOUT SERVICE
-Schedules a 2-minute acknowledgment window for
-auto-accepted bookings. If the partner does not
-emit an ACK event within the window, the system
-automatically reassigns the booking and penalises
-the partner's reliability score.
+Schedules a 2-minute acknowledgment window after a
+booking is assigned. If the partner does not emit an
+acknowledgeJob/acceptJob socket event within the
+window, the system reassigns the booking.
 
-DEPENDENCY OPTIONS (pick one):
-  Option A — BullMQ (recommended for production)
-    npm install bullmq ioredis
-  Option B — In-process setTimeout (simpler, no Redis)
-    Use ACKQ_DRIVER=memory in env (or no BullMQ installed)
+DB-BASED ACK CHECK (no in-memory state)
+The old approach stored acknowledged booking IDs in
+a Set(). That Set is lost on process restart, causing
+false reassignments for bookings acknowledged just
+before the server went down.
 
-Set env: ACKQ_DRIVER=bullmq | memory
-         REDIS_URL=redis://localhost:6379 (for bullmq)
+The new approach queries the booking document:
+  - booking.ackReceivedAt is set → already acknowledged
+  - booking.status is terminal → skip reassignment
+Server restarts are now safe.
+
+DRIVERS
+  BullMQ (recommended for multi-instance):
+    Set ACKQ_DRIVER=bullmq, REDIS_URL=redis://...
+  In-process setTimeout (default, single-instance):
+    No extra env vars needed. Timers are lost on
+    restart, but the DB check prevents false fires.
 =====================================================
 */
 
 const ACK_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
 
-/*
-=====================================================
-ACKNOWLEDGED BOOKING REGISTRY
-Tracks which bookings have been ACK'd so the
-timeout job can skip them if the partner tapped
-on time.
-=====================================================
-*/
-const acknowledgedBookings = new Set();
-
-function markAcknowledged(bookingId) {
-  acknowledgedBookings.add(String(bookingId));
-}
-
-function isAcknowledged(bookingId) {
-  return acknowledgedBookings.has(String(bookingId));
-}
+/* Statuses that mean the booking is already handled */
+const TERMINAL_OR_ACCEPTED_STATUSES = new Set([
+  "PARTNER_ACCEPTED",
+  "ON_THE_WAY",
+  "IN_PROGRESS",
+  "COMPLETED",
+  "CANCELLED",
+]);
 
 /*
 =====================================================
-TIMEOUT HANDLER
-Called when the ACK window expires.
+TIMEOUT HANDLER — DB-based, no in-memory Set
 =====================================================
 */
 async function handleAckTimeout(bookingId, partnerId) {
   try {
-    if (isAcknowledged(bookingId)) {
-      // Partner tapped "Acknowledge" in time — nothing to do.
-      acknowledgedBookings.delete(bookingId);
-      return;
-    }
+    const Booking = require("../models/Booking");
+    const booking = await Booking.findById(bookingId)
+      .select("status ackReceivedAt")
+      .lean();
+
+    if (!booking) return;
+
+    // Partner acknowledged via socket before timeout fired
+    if (booking.ackReceivedAt) return;
+
+    // Booking already progressed past the ACK gate
+    if (TERMINAL_OR_ACCEPTED_STATUSES.has(booking.status)) return;
 
     console.warn(
-      `ACK timeout: booking ${bookingId} unacknowledged by partner ${partnerId}. Triggering reassignment.`
+      `[ack-timeout] Booking ${bookingId} unacknowledged by partner ${partnerId}. Triggering reassignment.`
     );
 
     const { reassignBooking } = require("./assignmentEngine");
     await reassignBooking(bookingId, partnerId, "TIMEOUT");
   } catch (err) {
-    console.error("ACK timeout handler error:", err);
+    console.error("[ack-timeout] handleAckTimeout error:", err.message);
   }
 }
 
 /*
 =====================================================
-BULLMQ DRIVER (production)
-Uses Redis-backed queue for reliability across
-restarts and multiple server instances.
+BULLMQ DRIVER (production, multi-instance)
 =====================================================
 */
 let bullQueue = null;
@@ -77,9 +80,10 @@ async function initBullMQ() {
   try {
     const { Queue, Worker } = require("bullmq");
     const IORedis = require("ioredis");
-    const connection = new IORedis(process.env.REDIS_URL || "redis://localhost:6379", {
-      maxRetriesPerRequest: null,
-    });
+    const connection = new IORedis(
+      process.env.REDIS_URL || "redis://localhost:6379",
+      { maxRetriesPerRequest: null }
+    );
 
     bullQueue = new Queue("ack-timeout", { connection });
 
@@ -93,14 +97,14 @@ async function initBullMQ() {
     );
 
     bullWorker.on("failed", (job, err) => {
-      console.error(`ACK timeout job ${job?.id} failed:`, err.message);
+      console.error(`[ack-timeout] BullMQ job ${job?.id} failed:`, err.message);
     });
 
-    console.log("ACK timeout service initialised (BullMQ driver)");
+    console.log("[ack-timeout] Initialised (BullMQ driver)");
     return true;
   } catch (err) {
     console.warn(
-      "BullMQ not available, falling back to in-process timeout driver:",
+      "[ack-timeout] BullMQ unavailable, falling back to in-process driver:",
       err.message
     );
     return false;
@@ -109,19 +113,17 @@ async function initBullMQ() {
 
 /*
 =====================================================
-IN-PROCESS DRIVER (development / fallback)
-Simple setTimeout — works without Redis.
-Not suitable for multi-instance deployments.
+IN-PROCESS DRIVER (development / single-instance)
+Timers are lost on restart, but handleAckTimeout
+queries the DB so a post-restart false fire is safe.
 =====================================================
 */
 const inProcessTimers = new Map();
 
 function scheduleInProcess(bookingId, partnerId) {
   const key = String(bookingId);
-  // Clear any existing timer for this booking (idempotent)
-  if (inProcessTimers.has(key)) {
-    clearTimeout(inProcessTimers.get(key));
-  }
+  if (inProcessTimers.has(key)) clearTimeout(inProcessTimers.get(key));
+
   const timer = setTimeout(async () => {
     inProcessTimers.delete(key);
     await handleAckTimeout(bookingId, partnerId);
@@ -148,16 +150,14 @@ let useBullMQ = false;
 
 async function init() {
   const driverEnv = (process.env.ACKQ_DRIVER || "").toLowerCase();
-  if (driverEnv === "bullmq" || driverEnv === "") {
+  if (driverEnv === "bullmq") {
     useBullMQ = await initBullMQ();
   }
   driverReady = true;
 }
 
 /**
- * Schedule a 2-minute ACK timeout for an auto-accepted booking.
- * If the partner acknowledges via socket before expiry, call cancelAckTimeout().
- *
+ * Schedule a 2-minute ACK timeout after a booking is assigned.
  * @param {string|ObjectId} bookingId
  * @param {string|ObjectId} partnerId
  */
@@ -168,7 +168,6 @@ async function scheduleAckTimeout(bookingId, partnerId) {
   const pid = String(partnerId);
 
   if (useBullMQ && bullQueue) {
-    // BullMQ: delay = 2 minutes, no retries (one-shot)
     await bullQueue.add(
       "ack-check",
       { bookingId: bid, partnerId: pid },
@@ -180,19 +179,15 @@ async function scheduleAckTimeout(bookingId, partnerId) {
 }
 
 /**
- * Cancel a pending ACK timeout (partner tapped "Acknowledge" in time).
- * Call this from your Socket.io ACK event handler.
- *
+ * Cancel a pending ACK timeout. Call this when the partner sends
+ * acknowledgeJob or acceptJob. Set booking.ackReceivedAt in the DB
+ * before calling this so restarts stay safe.
  * @param {string|ObjectId} bookingId
  */
 async function cancelAckTimeout(bookingId) {
   const bid = String(bookingId);
-  markAcknowledged(bid);
 
   if (useBullMQ && bullQueue) {
-    // BullMQ jobs can't easily be removed by payload; the acknowledged flag
-    // in handleAckTimeout() is the canonical cancellation mechanism.
-    // For completeness, attempt to drain jobs with matching data (best effort).
     try {
       const delayed = await bullQueue.getDelayed();
       for (const job of delayed) {
@@ -202,7 +197,7 @@ async function cancelAckTimeout(bookingId) {
         }
       }
     } catch {
-      // Non-fatal — the acknowledged flag will prevent action on expiry.
+      // Non-fatal — DB ackReceivedAt is the canonical safety net
     }
   } else {
     cancelInProcess(bid);
@@ -211,11 +206,10 @@ async function cancelAckTimeout(bookingId) {
 
 // Initialise on first import
 init().catch((err) =>
-  console.error("ACK timeout service init error:", err.message)
+  console.error("[ack-timeout] Init error:", err.message)
 );
 
 module.exports = {
   scheduleAckTimeout,
   cancelAckTimeout,
-  markAcknowledged,
 };

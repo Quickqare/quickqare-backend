@@ -12,8 +12,10 @@ exports.registerUserValidator = [
     .withMessage("Phone must be at least 10 digits"),
 
   body("password")
-    .isLength({ min: 6 })
-    .withMessage("Password must be at least 6 characters"),
+    .isLength({ min: 8 })
+    .withMessage("Password must be at least 8 characters")
+    .matches(/^(?=.*[A-Z])(?=.*\d)/)
+    .withMessage("Password must contain at least one uppercase letter and one number"),
 ];
 
 /* =====================================================
@@ -28,8 +30,10 @@ exports.registerPartnerValidator = [
     .withMessage("Phone must be at least 10 digits"),
 
   body("password")
-    .isLength({ min: 6 })
-    .withMessage("Password must be at least 6 characters"),
+    .isLength({ min: 8 })
+    .withMessage("Password must be at least 8 characters")
+    .matches(/^(?=.*[A-Z])(?=.*\d)/)
+    .withMessage("Password must contain at least one uppercase letter and one number"),
 
   body("gender")
     .notEmpty()
@@ -117,12 +121,12 @@ exports.createBookingValidator = [
     .withMessage("location coordinates required"),
 
   body("location.coordinates.0")
-    .isFloat()
-    .withMessage("longitude must be number"),
+    .isFloat({ min: -180, max: 180 })
+    .withMessage("longitude must be a number between -180 and 180"),
 
   body("location.coordinates.1")
-    .isFloat()
-    .withMessage("latitude must be number"),
+    .isFloat({ min: -90, max: 90 })
+    .withMessage("latitude must be a number between -90 and 90"),
 
   body("pincode")
     .notEmpty()

@@ -660,8 +660,8 @@ function calculatePartnerScore({
       })();
   const idleScore = Math.min(idleTimeHours / FAIRNESS_LOOKBACK_HOURS, 1) * 100;
 
-  const distanceScore =
-    distanceMeters > 0 ? Math.min((1000 / distanceMeters) * 100, 100) : 100;
+  const safeDist = Math.max(distanceMeters, 1); // guard against division by zero/near-zero
+  const distanceScore = Math.min((1000 / safeDist) * 100, 100);
   const earningsScore =
     earningsToday > 0 ? Math.min((1000 / earningsToday) * 100, 100) : 100;
   const skillScore = scoreSkillMatch(skillMatchLevel);
@@ -745,6 +745,10 @@ async function findEligiblePartnersForBooking(booking, pincodes = []) {
     approvalStatus: "APPROVED",
     isOnline: true,
     isAvailable: true,
+    // Exclude partners under active suspension.
+    // $not + $gt matches: null, missing field, or a past date — i.e. not currently suspended.
+    // Avoids using $or here because the pincode block below also uses $or.
+    suspendedUntil: { $not: { $gt: new Date() } },
     _id: { $nin: booking?.rejectedPartners || [] },
   };
 
@@ -865,6 +869,27 @@ async function findEligiblePartnersForBooking(booking, pincodes = []) {
 
 /*
 =====================================================
+SLOT AVAILABILITY CACHE (PERFORMANCE FIX)
+=====================================================
+*/
+const slotAvailabilityCache = new Map();
+const CACHE_TTL_MS = 3 * 60 * 1000; // 3 minutes TTL
+
+// Singleton guard: prevent stacking multiple intervals if module is re-required (e.g. in tests)
+if (!global.__slotCacheCleanupStarted) {
+  global.__slotCacheCleanupStarted = true;
+  setInterval(() => {
+    const now = Date.now();
+    for (const [key, value] of slotAvailabilityCache.entries()) {
+      if (now - value.timestamp > CACHE_TTL_MS) {
+        slotAvailabilityCache.delete(key);
+      }
+    }
+  }, CACHE_TTL_MS).unref(); // unref so it doesn't keep the process alive in tests
+}
+
+/*
+=====================================================
 SLOT AVAILABILITY ENGINE
 =====================================================
 */
@@ -889,6 +914,20 @@ async function getAvailableSlotsForRequest({
     requestContext.serviceMap,
     requestContext.isAC
   );
+
+  // --- PERFORMANCE FIX: CACHING ---
+  // Round location to 2 decimal places (~1.1km precision) to group nearby users
+  let locKey = "none";
+  if (Array.isArray(location?.coordinates) && location.coordinates.length === 2) {
+    locKey = `${Number(location.coordinates[0]).toFixed(2)},${Number(location.coordinates[1]).toFixed(2)}`;
+  }
+  const cacheKey = `${normalizeDateKey(date)}_${pincode}_${locKey}_${requestContext.requestedServiceIds.join(",")}_${durationMinutes}`;
+  
+  const cached = slotAvailabilityCache.get(cacheKey);
+  if (cached && (Date.now() - cached.timestamp < CACHE_TTL_MS)) {
+    return cached.data;
+  }
+  // --------------------------------
 
   const now = new Date();
   const isToday = normalizeDateKey(date) === normalizeDateKey(now);
@@ -1000,6 +1039,13 @@ async function getAvailableSlotsForRequest({
       isAC: requestContext.isAC,
     });
   }
+
+  // --- PERFORMANCE FIX: CACHING ---
+  slotAvailabilityCache.set(cacheKey, {
+    timestamp: Date.now(),
+    data: slotResults,
+  });
+  // --------------------------------
 
   return slotResults;
 }

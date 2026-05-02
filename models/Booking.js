@@ -1,7 +1,25 @@
 const mongoose = require("mongoose");
 
+/* Short, user-friendly booking reference shown on UI / SMS / support calls */
+function generateBookingNumber() {
+  const year = String(new Date().getFullYear()).slice(-2);
+  const ts = Date.now().toString(36).slice(-5).toUpperCase();
+  const rnd = Math.random().toString(36).slice(2, 4).toUpperCase();
+  return `QQ${year}${ts}${rnd}`;
+}
+
 const bookingSchema = new mongoose.Schema(
   {
+    /* ======================
+       USER-FACING REFERENCE
+    ====================== */
+    bookingNumber: {
+      type: String,
+      unique: true,
+      sparse: true, // allow existing rows without one
+      index: true,
+    },
+
     /* ======================
        USER & PARTNER
     ====================== */
@@ -16,6 +34,15 @@ const bookingSchema = new mongoose.Schema(
       ref: "Partner",
       default: null,
     },
+
+    // Team members beyond the primary (mehendi multi-artist, AC multi-unit).
+    // Previously written via { strict: false } hack — declaring it properly here.
+    additionalPartners: [
+      {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Partner",
+      },
+    ],
 
     /* ======================
        SERVICES (PRODUCTION CART SYSTEM)
@@ -235,11 +262,13 @@ const bookingSchema = new mongoose.Schema(
         "PENDING_ASSIGNMENT",
         "QUEUED",
         "SEARCHING",
+        "ASSIGNING_LOCK", // brief atomic lock during assignBooking
         "ASSIGNED",
         "CONFIRMED",
         "NO_PARTNER_AVAILABLE",
         "PARTNER_ACCEPTED",
         "ON_THE_WAY",
+        "ARRIVED",
         "IN_PROGRESS",
         "COMPLETED",
         "CANCELLED",
@@ -249,7 +278,77 @@ const bookingSchema = new mongoose.Schema(
 
     cancelledBy: {
       type: String,
-      enum: ["user", "partner"],
+      enum: ["user", "partner", "system"],
+      default: null,
+    },
+
+    cancelledAt: {
+      type: Date,
+      default: null,
+    },
+
+    cancelReason: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+
+    /* ======================
+       REFUND (for user cancels)
+    ====================== */
+    refundAmount: {
+      type: Number,
+      default: 0,
+    },
+
+    refundStatus: {
+      type: String,
+      enum: ["NONE", "PENDING", "PROCESSED", "FAILED"],
+      default: "NONE",
+    },
+
+    refundProcessedAt: {
+      type: Date,
+      default: null,
+    },
+
+    /* ======================
+       ARRIVAL & OTP
+    ====================== */
+    estimatedArrivalAt: {
+      type: Date,
+      default: null,
+    },
+
+    arrivedAt: {
+      type: Date,
+      default: null,
+    },
+
+    // 4-digit OTP shown to customer; partner enters it to start service.
+    // Generated when partner marks ON_THE_WAY.
+    serviceStartOtp: {
+      type: String,
+      default: null,
+      select: false, // never returned in normal queries — only via explicit .select("+serviceStartOtp")
+    },
+
+    otpVerifiedAt: {
+      type: Date,
+      default: null,
+    },
+
+    /* ======================
+       POST-COMPLETION
+    ====================== */
+    requiresRating: {
+      type: Boolean,
+      default: false,
+    },
+
+    ratingId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Rating",
       default: null,
     },
 
@@ -264,7 +363,14 @@ const bookingSchema = new mongoose.Schema(
       type: Date,
       default: null,
     },
-    
+
+    // Set when partner sends acknowledgeJob or acceptJob socket event.
+    // handleAckTimeout checks this instead of an in-memory Set so restarts don't cause false reassignments.
+    ackReceivedAt: {
+      type: Date,
+      default: null,
+    },
+
     lockedCapacityMinutes: {
       type: Number,
       default: 0,
@@ -400,5 +506,24 @@ const bookingSchema = new mongoose.Schema(
    GEO INDEX
 ====================== */
 bookingSchema.index({ location: "2dsphere" });
+
+/* ======================
+   PRE-SAVE: AUTO-GENERATE BOOKING NUMBER
+   Retries on the rare collision (uniqueness backed by index).
+====================== */
+bookingSchema.pre("save", async function (next) {
+  if (this.bookingNumber) return next();
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const candidate = generateBookingNumber();
+    const exists = await this.constructor.findOne({ bookingNumber: candidate }).lean();
+    if (!exists) {
+      this.bookingNumber = candidate;
+      return next();
+    }
+  }
+  // Extremely unlikely fallback — collisions in 5 attempts at this entropy
+  this.bookingNumber = `${generateBookingNumber()}${Math.random().toString(36).slice(2, 5).toUpperCase()}`;
+  next();
+});
 
 module.exports = mongoose.model("Booking", bookingSchema);

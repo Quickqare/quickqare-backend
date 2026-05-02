@@ -164,13 +164,20 @@ io.use((socket, next) => {
   next();
 });
 
+// Short-lived dedup set: prevents double-fire of acceptJob on flaky networks.
+// Key = `${partnerId}:${bookingId}`, cleared after 5 s.
+const acceptJobDedup = new Set();
+
 io.on("connection", (socket) => {
 
   /* ======================
      USER ROOM
+     Require a verified token — unauthenticated clients cannot join user rooms,
+     which prevents leaking live partner-location events to unknown listeners.
   ====================== */
   socket.on("joinUserRoom", (userId) => {
-    if (socket.verifiedUserId && socket.verifiedUserId !== String(userId)) return;
+    if (!socket.verifiedUserId) return;
+    if (socket.verifiedUserId !== String(userId)) return;
     socket.join(`user_${userId}`);
   });
 
@@ -178,57 +185,100 @@ io.on("connection", (socket) => {
      PARTNER ROOM
   ====================== */
   socket.on("joinPartnerRoom", (partnerId) => {
-    // If the handshake token was verified, only allow joining the correct room.
-    if (socket.verifiedPartnerId && socket.verifiedPartnerId !== String(partnerId)) return;
+    if (!socket.verifiedPartnerId || socket.verifiedPartnerId !== String(partnerId)) return;
     socket.join(`partner_${partnerId}`);
     socket.partnerId = String(partnerId);
   });
 
   /* ======================
+     PARTNER ACKNOWLEDGE JOB
+  ====================== */
+  socket.on("acknowledgeJob", async ({ bookingId }) => {
+    try {
+      if (!socket.partnerId) {
+        socket.emit("error", { event: "acknowledgeJob", message: "Authentication required" });
+        return;
+      }
+
+      const booking = await Booking.findById(bookingId).select("partner status user");
+      if (!booking) return;
+
+      const pid = String(socket.partnerId);
+      const isAssigned = booking.partner?.toString() === pid;
+      if (!isAssigned) {
+        socket.emit("error", { event: "acknowledgeJob", message: "Not assigned to this booking" });
+        return;
+      }
+
+      await Booking.findByIdAndUpdate(bookingId, { ackReceivedAt: new Date() });
+
+      const { cancelAckTimeout } = require("./services/ackTimeout.service");
+      await cancelAckTimeout(bookingId);
+
+      io.to(`user_${booking.user}`).emit("booking_update", {
+        bookingId: booking._id.toString(),
+        status: booking.status,
+        partnerAcknowledged: true,
+      });
+
+      console.log(`[ack] Booking ${bookingId} acknowledged by partner ${pid}`);
+    } catch (err) {
+      console.error("acknowledgeJob error:", err);
+    }
+  });
+
+  /* ======================
      PARTNER ACCEPT JOB
-     ASSIGNED → PARTNER_ACCEPTED
+     ASSIGNED or CONFIRMED → PARTNER_ACCEPTED
   ====================== */
   socket.on("acceptJob", async ({ bookingId }) => {
     try {
-      if (!socket.partnerId) return;
+      if (!socket.partnerId) {
+        socket.emit("error", { event: "acceptJob", message: "Authentication required" });
+        return;
+      }
+
+      // Dedup: ignore rapid duplicate fires from the same partner+booking
+      const dedupKey = `${socket.partnerId}:${bookingId}`;
+      if (acceptJobDedup.has(dedupKey)) return;
+      acceptJobDedup.add(dedupKey);
+      setTimeout(() => acceptJobDedup.delete(dedupKey), 5000);
 
       const booking = await Booking.findById(bookingId);
       if (!booking) return;
 
-      if (booking.status !== "ASSIGNED") return;
+      if (!["ASSIGNED", "CONFIRMED"].includes(booking.status)) return;
 
-      // Verify this partner is actually assigned to this booking —
-      // prevents a spoofed partnerId from accepting someone else's job.
       const pid = String(socket.partnerId);
       const isAssigned =
         booking.partner?.toString() === pid ||
         (booking.additionalPartners || []).some((p) => p.toString() === pid);
-      if (!isAssigned) return;
+      if (!isAssigned) {
+        socket.emit("error", { event: "acceptJob", message: "Not assigned to this booking" });
+        return;
+      }
 
+      booking.ackReceivedAt = booking.ackReceivedAt ?? new Date();
       booking.status = "PARTNER_ACCEPTED";
-      // partner field already set by assignment engine — do not overwrite
       await booking.save();
 
-      // increase partner load
+      const { cancelAckTimeout } = require("./services/ackTimeout.service");
+      await cancelAckTimeout(bookingId);
+
       await Partner.findByIdAndUpdate(socket.partnerId, {
         $inc: { activeJobs: 1 },
       });
 
-      // notify user
       io.to(`user_${booking.user}`).emit("booking_update", {
         bookingId: booking._id.toString(),
         status: "PARTNER_ACCEPTED",
       });
 
-      // confirm to partner
-      io.to(`partner_${socket.partnerId}`).emit(
-        "job_accepted_confirmation",
-        {
-          bookingId: booking._id.toString(),
-        }
-      );
+      io.to(`partner_${socket.partnerId}`).emit("job_accepted_confirmation", {
+        bookingId: booking._id.toString(),
+      });
 
-      console.log("✅ Booking accepted:", bookingId);
+      console.log(`[socket] Booking ${bookingId} accepted by partner ${pid}`);
     } catch (err) {
       console.error("acceptJob error:", err);
     }
@@ -236,42 +286,42 @@ io.on("connection", (socket) => {
 
   /* ======================
      PARTNER REJECT JOB
-     → SEARCHING → REASSIGN
+     ASSIGNED or CONFIRMED → SEARCHING → REASSIGN
   ====================== */
   socket.on("rejectJob", async ({ bookingId }) => {
     try {
-      if (!socket.partnerId) return;
+      if (!socket.partnerId) {
+        socket.emit("error", { event: "rejectJob", message: "Authentication required" });
+        return;
+      }
 
       const booking = await Booking.findById(bookingId);
       if (!booking) return;
 
-      if (booking.status !== "ASSIGNED") return;
+      if (!["ASSIGNED", "CONFIRMED"].includes(booking.status)) return;
 
-      // Verify this partner is actually assigned before allowing rejection.
       const pid = String(socket.partnerId);
       const isAssigned =
         booking.partner?.toString() === pid ||
         (booking.additionalPartners || []).some((p) => p.toString() === pid);
-      if (!isAssigned) return;
+      if (!isAssigned) {
+        socket.emit("error", { event: "rejectJob", message: "Not assigned to this booking" });
+        return;
+      }
 
       booking.status = "SEARCHING";
       booking.partner = null;
-
-      // prevent reassigning same partner
       booking.rejectedPartners.push(socket.partnerId);
-
       await booking.save();
 
-      // notify user
       io.to(`user_${booking.user}`).emit("booking_update", {
         bookingId: booking._id.toString(),
         status: "SEARCHING",
       });
 
-      // re-run assignment engine
       await assignBooking(booking._id);
 
-      console.log("🔄 Booking reassigned:", bookingId);
+      console.log(`[socket] Booking ${bookingId} rejected by partner ${pid}, reassigning`);
     } catch (err) {
       console.error("rejectJob error:", err);
     }

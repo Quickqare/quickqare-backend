@@ -170,8 +170,20 @@ ASSIGN BOOKING
 */
 async function assignBooking(bookingId) {
   try {
-    // Use an atomic update to lock the booking and prevent race conditions
-    // (e.g. double assignments if two requests hit this simultaneously)
+    // Self-heal: if a previous assignBooking crashed or was killed mid-run,
+    // the booking will be stuck in ASSIGNING_LOCK forever. Reset locks older
+    // than 60 seconds back to PENDING_ASSIGNMENT before trying to acquire.
+    const lockExpiry = new Date(Date.now() - 60 * 1000);
+    await Booking.updateOne(
+      {
+        _id: bookingId,
+        status: "ASSIGNING_LOCK",
+        updatedAt: { $lt: lockExpiry },
+      },
+      { $set: { status: "PENDING_ASSIGNMENT" } }
+    );
+
+    // Atomic lock — prevents two parallel assignment attempts from running together.
     const booking = await Booking.findOneAndUpdate(
       { _id: bookingId, partner: null, status: { $nin: ["ASSIGNING_LOCK", "COMPLETED", "CANCELLED"] } },
       { $set: { status: "ASSIGNING_LOCK" } },
@@ -251,15 +263,9 @@ async function assignBooking(bookingId) {
       const finalStatus = autoAccepted ? "CONFIRMED" : "ASSIGNED";
 
       booking.partner = primaryPartner._id;
-      booking.set("teamAllocations", teamAllocations);
-      if (additionalPartners.length > 0) {
-        booking.set(
-          "additionalPartners",
-          additionalPartners.map((p) => p._id),
-          { strict: false }
-        );
-      }
-      booking.set("standbyPartners", standbyCandidates);
+      booking.teamAllocations = teamAllocations;
+      booking.additionalPartners = additionalPartners.map((p) => p._id);
+      booking.standbyPartners = standbyCandidates;
 
       booking.status = finalStatus;
       booking.assignmentAudit.push({
@@ -471,10 +477,10 @@ async function reassignBooking(bookingId, partnerId) {
     }
 
     const prevPartner = booking.partner;
-    const prevAdditional = booking.get("additionalPartners") || [];
+    const prevAdditional = booking.additionalPartners || [];
 
     booking.partner = null;
-    booking.set("additionalPartners", [], { strict: false });
+    booking.additionalPartners = [];
     booking.status = "PENDING_ASSIGNMENT";
     booking.assignmentAudit.push({
       stage: booking.assignmentStage || 1,

@@ -1,3 +1,4 @@
+const crypto = require("crypto");
 const User = require("../models/User");
 const Referral = require("../models/Referral");
 const ReferralSettings = require("../models/ReferralSettings");
@@ -5,28 +6,22 @@ const UserWallet = require("../models/UserWallet");
 const UserWalletTransaction = require("../models/UserWalletTransaction");
 const Coupon = require("../models/coupon");
 
-// Generate unique referral code
+const REFERRAL_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+// Generate unique referral code using cryptographically secure random bytes
 exports.generateReferralCode = () => {
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-  let code = "";
-  for (let i = 0; i < 8; i++) {
-    code += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return code;
+  const bytes = crypto.randomBytes(8);
+  return Array.from(bytes).map((b) => REFERRAL_CHARS[b % REFERRAL_CHARS.length]).join("");
 };
 
-// Get unique referral code
+// Get unique referral code (up to 20 retries before giving up)
 exports.getUniqueReferralCode = async () => {
-  let code;
-  let attempts = 0;
-  do {
-    code = this.generateReferralCode();
-    attempts++;
-    if (attempts > 10) {
-      throw new Error("Unable to generate unique referral code");
-    }
-  } while (await User.findOne({ referralCode: code }));
-  return code;
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const code = exports.generateReferralCode();
+    const exists = await User.exists({ referralCode: code });
+    if (!exists) return code;
+  }
+  throw new Error("Unable to generate unique referral code after 20 attempts");
 };
 
 // Validate referral code
@@ -104,7 +99,7 @@ exports.processReferralReward = async (userId, bookingId) => {
     if (!booking || booking.totalAmount < settings.minOrderAmount) return;
 
     // Create coupon for new user
-    const couponCode = `REF${Date.now()}${Math.random().toString(36).substr(2, 5).toUpperCase()}`;
+    const couponCode = `REF${Date.now()}${crypto.randomBytes(3).toString("hex").toUpperCase()}`;
     const expiryDate = new Date();
     expiryDate.setDate(expiryDate.getDate() + settings.couponExpiryDays);
 
