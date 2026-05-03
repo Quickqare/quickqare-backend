@@ -43,8 +43,13 @@ const corsOptions = {
     const isLocalOrigin =
       /^http:\/\/localhost:\d+$/.test(origin) ||
       /^http:\/\/127\.0\.0\.1:\d+$/.test(origin);
+    const isNetlifyOrigin =
+      /^https:\/\/[a-zA-Z0-9-]+\.netlify\.app$/.test(origin) ||
+      /^https:\/\/[a-zA-Z0-9-]+\.netlify\.live$/.test(origin);
+    const isQuickQareOrigin =
+      /^https:\/\/[a-zA-Z0-9-]+\.quickqare\.in$/.test(origin);
 
-    if (isConfiguredOrigin || isLocalOrigin) {
+    if (isConfiguredOrigin || isLocalOrigin || isNetlifyOrigin || isQuickQareOrigin) {
       return callback(null, true);
     }
 

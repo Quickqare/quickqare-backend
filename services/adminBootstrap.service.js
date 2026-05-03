@@ -4,7 +4,6 @@ const IS_PRODUCTION = String(process.env.NODE_ENV || "").toLowerCase() === "prod
 
 async function ensureBootstrapAdmin() {
   const enabled =
-    !IS_PRODUCTION &&
     String(process.env.ADMIN_BOOTSTRAP_ENABLED || "").toLowerCase() === "true";
 
   if (!enabled) {

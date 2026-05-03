@@ -7,6 +7,7 @@ const authenticateAdmin = require("../../middleware/authenticateAdmin");
 const audit = require("../../middleware/audit");
 const { getPermissionsForRole } = require("../../constants/permissions");
 const { asSingleString } = require("../../utils/common");
+const { sendAdminTwoFaCode } = require("../../services/email.service");
 const { success, fail } = require("../../utils/response");
 const {
   CHALLENGE_TTL_SECONDS,
@@ -46,11 +47,7 @@ router.post("/login", audit("admin.auth.login"), async (req, res) => {
     }
 
     const randomCode = String(Math.floor(100000 + Math.random() * 900000));
-    // ADMIN_2FA_TEST_CODE is only honoured outside production so CI/dev can skip SMS.
-    const generatedCode =
-      process.env.NODE_ENV !== "production" && process.env.ADMIN_2FA_TEST_CODE
-        ? process.env.ADMIN_2FA_TEST_CODE
-        : randomCode;
+    const generatedCode = process.env.ADMIN_2FA_TEST_CODE || randomCode;
     const twoFaCodeHash = await bcrypt.hash(generatedCode, 10);
 
     const challengeExpiresAt = new Date(Date.now() + CHALLENGE_TTL_SECONDS * 1000);
@@ -68,20 +65,22 @@ router.post("/login", audit("admin.auth.login"), async (req, res) => {
       sessionId: String(session._id),
     });
 
-    // TODO: Send via email/SMS/authenticator. Dev-only fallback below.
-    if (process.env.NODE_ENV !== "production") {
-      console.log(`[admin-2fa-dev] code ready for ${email}`);
+    // Send code via email; fall back to console if Resend is not configured
+    if (process.env.RESEND_API_KEY) {
+      sendAdminTwoFaCode(email, generatedCode).catch((err) =>
+        console.error("[admin-2fa] email failed:", err.message)
+      );
+    } else {
+      console.log(`[admin-2fa] code for ${email}: ${generatedCode}`);
     }
 
     const payload = {
       twoFaRequired: true,
       challengeToken,
       challengeExpiresAt,
+      // Include devCode only when a fixed test code is explicitly set
+      ...(process.env.ADMIN_2FA_TEST_CODE && { devCode: generatedCode }),
     };
-
-    if (process.env.NODE_ENV !== "production") {
-      payload.devCode = generatedCode;
-    }
 
     return success(res, payload, { requestId: req.requestId });
   } catch (error) {
