@@ -21,6 +21,7 @@ const PERMISSIONS = Object.freeze({
   AUDIT_READ: "audit.read",
   COMPLAINTS_VIEW: "complaints.view",
   COMPLAINTS_UPDATE: "complaints.update",
+  SERVICES_MANAGE: "services.manage",
 });
 
 const ROLE_PERMISSIONS = Object.freeze({

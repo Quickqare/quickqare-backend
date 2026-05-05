@@ -1258,3 +1258,82 @@ exports.getActiveCart = async (req, res) => {
     res.status(500).json({ message: "Server error while fetching cart" });
   }
 };
+
+/* =====================================================
+   GET ESTIMATE  –  GET /api/booking/:bookingId/estimate
+   Returns the pending estimate for a booking (user only).
+===================================================== */
+exports.getEstimate = async (req, res) => {
+  try {
+    const booking = await Booking.findOne({
+      _id: req.params.bookingId,
+      user: req.user._id,
+    }).select("estimateItems estimateTotal estimateStatus estimateSubmittedAt");
+
+    if (!booking) return res.status(404).json({ success: false, message: "Booking not found" });
+    if (booking.estimateStatus === "none" || !booking.estimateItems?.length) {
+      return res.status(404).json({ success: false, message: "No estimate available for this booking" });
+    }
+
+    return res.json({
+      success: true,
+      estimate: {
+        items: booking.estimateItems,
+        baseAmount: booking.estimateTotal,
+        gstAmount: 0,
+        totalAmount: booking.estimateTotal,
+        status: booking.estimateStatus,
+        submittedAt: booking.estimateSubmittedAt,
+      },
+    });
+  } catch (err) {
+    console.error("getEstimate error:", err);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
+/* =====================================================
+   RESPOND TO ESTIMATE  –  POST /api/booking/:bookingId/estimate/respond
+   Customer approves or rejects the pending estimate.
+===================================================== */
+exports.respondToEstimate = async (req, res) => {
+  try {
+    const { approved } = req.body;
+    if (typeof approved !== "boolean") {
+      return res.status(400).json({ success: false, message: "approved (boolean) is required" });
+    }
+
+    const booking = await Booking.findOne({
+      _id: req.params.bookingId,
+      user: req.user._id,
+    });
+
+    if (!booking) return res.status(404).json({ success: false, message: "Booking not found" });
+    if (booking.estimateStatus !== "pending") {
+      return res.status(409).json({ success: false, message: "Estimate already responded to or not pending" });
+    }
+
+    booking.estimateStatus = approved ? "approved" : "rejected";
+    if (approved) booking.estimateApprovedAt = new Date();
+    else booking.estimateRejectedAt = new Date();
+    await booking.save();
+
+    // Notify the partner in real time
+    if (global.io && booking.partner) {
+      global.io.to(`partner_${booking.partner}`).emit("estimate_response", {
+        bookingId: booking._id.toString(),
+        approved,
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: approved
+        ? "Estimate approved. Your technician will proceed with the work."
+        : "Estimate rejected. Your technician has been notified.",
+    });
+  } catch (err) {
+    console.error("respondToEstimate error:", err);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+};

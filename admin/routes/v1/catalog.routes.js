@@ -31,6 +31,7 @@ router.post("/", audit("admin.catalog.create"), async (req, res) => {
     const row = await CatalogItem.create({
       name,
       priceInr: price,
+      unit: String(req.body.unit || "piece").trim(),
       description: String(req.body.description || "").trim(),
       isActive: req.body.isActive !== false,
       sortOrder: Number(req.body.sortOrder) || 0,
@@ -54,6 +55,7 @@ router.patch("/:id", audit("admin.catalog.update"), async (req, res) => {
       if (!Number.isFinite(p) || p < 0) return fail(res, 400, "VALIDATION_ERROR", "priceInr must be a non-negative number", null, { requestId: req.requestId });
       patch.priceInr = p;
     }
+    if (typeof req.body.unit === "string" && req.body.unit.trim()) patch.unit = req.body.unit.trim();
     if (typeof req.body.description === "string") patch.description = req.body.description.trim();
     if (req.body.isActive !== undefined) patch.isActive = Boolean(req.body.isActive);
     if (req.body.sortOrder !== undefined) patch.sortOrder = Number(req.body.sortOrder) || 0;

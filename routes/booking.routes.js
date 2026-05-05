@@ -48,6 +48,20 @@ router.get(
   bookingController.getPartnerLiveLocation
 );
 
+// Estimate: fetch pending estimate
+router.get(
+  "/:bookingId/estimate",
+  userAuth,
+  bookingController.getEstimate
+);
+
+// Estimate: customer approve/reject
+router.post(
+  "/:bookingId/estimate/respond",
+  userAuth,
+  bookingController.respondToEstimate
+);
+
 // Get available slots
 router.get(
   "/available-slots",

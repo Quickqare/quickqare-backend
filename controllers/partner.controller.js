@@ -461,7 +461,7 @@ exports.getPartnerAppSettings = async (_req, res) => {
 exports.getPartsCatalog = async (req, res) => {
   try {
     const items = await CatalogItem.find({ isActive: true })
-      .select("_id name priceInr description")
+      .select("_id name priceInr unit description")
       .sort({ sortOrder: 1, name: 1 })
       .lean();
 
@@ -470,6 +470,7 @@ exports.getPartsCatalog = async (req, res) => {
       _id: i._id,
       name: i.name,
       price: i.priceInr,
+      unit: i.unit || "piece",
       description: i.description,
     }));
 
