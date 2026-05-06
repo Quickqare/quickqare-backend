@@ -9,7 +9,9 @@ const { creditWallet } = require("./partnerWallet.controller");
 const { getAvailableSlots } = require("../services/slotAvailability_service");
 const { assignBooking, reassignBooking } = require("../services/assignmentEngine");
 const {
+  addMinutes,
   buildDateTime,
+  clearSlotCache,
   findEligiblePartnersForBooking,
   syncPartnerOperationalState,
 } = require("../services/scheduling_service");
@@ -351,6 +353,60 @@ exports.createBooking = async (req, res) => {
       scheduledStartAt.getTime() + estimatedDurationMinutes * 60 * 1000
     );
 
+    /* =====================
+       SLOT CAPACITY GUARD
+       Prevents double-booking when two customers check the same slot
+       simultaneously or when the slot cache is slightly stale.
+       PENDING_PAYMENT bookings don't have a partner assigned yet so
+       they never appear in getBlockingWindowsByPartner — we catch them
+       here with a direct DB count before creating anything.
+    ===================== */
+    const activePartnersInZone = await Partner.countDocuments({
+      $or: [{ serviceAreas: pincode }, { currentPincode: pincode }],
+      approvalStatus: "APPROVED",
+      isBlocked: { $ne: true },
+    });
+
+    if (activePartnersInZone > 0) {
+      const conflictBookings = await Booking.find({
+        pincode,
+        scheduledDate: new Date(scheduledDate),
+        $or: [
+          {
+            status: {
+              $in: [
+                "PENDING_ASSIGNMENT",
+                "QUEUED",
+                "ASSIGNED",
+                "CONFIRMED",
+                "PARTNER_ACCEPTED",
+                "ON_THE_WAY",
+                "IN_PROGRESS",
+              ],
+            },
+          },
+          { status: "PENDING_PAYMENT", lockedUntil: { $gt: new Date() } },
+        ],
+      }).select("scheduledStartAt scheduledTime scheduledDate estimatedDurationMinutes lockedCapacityMinutes");
+
+      const overlappingCount = conflictBookings.filter((b) => {
+        const bStart = b.scheduledStartAt
+          ? new Date(b.scheduledStartAt)
+          : buildDateTime(b.scheduledDate, b.scheduledTime || "09:00");
+        const bDurMs =
+          (b.lockedCapacityMinutes || b.estimatedDurationMinutes || 60) * 60 * 1000;
+        const bEnd = new Date(bStart.getTime() + bDurMs);
+        return bStart < scheduledEndAt && bEnd > scheduledStartAt;
+      }).length;
+
+      if (overlappingCount >= activePartnersInZone) {
+        return res.status(409).json({
+          success: false,
+          message: "This slot is no longer available. Please go back and select another time.",
+        });
+      }
+    }
+
     const slotCandidates = await findEligiblePartnersForBooking(
       {
         services: bookingServices,
@@ -419,6 +475,10 @@ exports.createBooking = async (req, res) => {
       payment: { status: "PENDING" },
       status: "PENDING_PAYMENT",
     });
+
+    // Bust the slot cache for this pincode+date so any other customer
+    // immediately sees the updated availability without waiting for TTL.
+    clearSlotCache(pincode, scheduledDate);
 
     return res.status(201).json({
       success: true,
@@ -1113,6 +1173,9 @@ exports.cancelBookingByUser = async (req, res) => {
     for (const pId of booking.additionalPartners || []) {
       await syncPartnerOperationalState(pId);
     }
+
+    // Bust slot cache so freed slot is visible to other customers immediately
+    clearSlotCache(booking.pincode, booking.scheduledDate);
 
     // Notify partner — they need to know the booking is no longer in their queue
     if (global.io && booking.partner) {

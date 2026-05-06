@@ -55,6 +55,7 @@ router.get(
 
 router.get(
   "/app-settings",
+  partnerAuth,
   partnerController.getPartnerAppSettings
 );
 

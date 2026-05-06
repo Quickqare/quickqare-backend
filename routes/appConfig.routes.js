@@ -34,8 +34,19 @@ router.get("/", async (_req, res) => {
         accentColor:     theme.accentColor     || DEFAULT_THEME.accentColor,
         backgroundColor: theme.backgroundColor || DEFAULT_THEME.backgroundColor,
         promoTagBadge:   theme.promoTagBadge   || DEFAULT_THEME.promoTagBadge,
-        promoTagline:    theme.promoTagline     || DEFAULT_THEME.promoTagline,
+        promoTagline:    theme.promoTagline     ?? DEFAULT_THEME.promoTagline,
         promoCta:        theme.promoCta        || DEFAULT_THEME.promoCta,
+        promoIconUrl:    theme.promoIconUrl    ?? "",
+        categoryIcons: {
+          acRepair:           theme.categoryIcons?.acRepair    ?? "",
+          acRepairShimmer:    theme.categoryIcons?.acRepairShimmer    !== false,
+          plumbing:           theme.categoryIcons?.plumbing    ?? "",
+          plumbingShimmer:    theme.categoryIcons?.plumbingShimmer    !== false,
+          mehendi:            theme.categoryIcons?.mehendi     ?? "",
+          mehendiShimmer:     theme.categoryIcons?.mehendiShimmer     !== false,
+          electrician:        theme.categoryIcons?.electrician ?? "",
+          electricianShimmer: theme.categoryIcons?.electricianShimmer !== false,
+        },
       },
     });
   } catch (err) {

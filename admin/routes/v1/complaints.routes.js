@@ -16,7 +16,7 @@ const { PERMISSIONS } = require("../../constants/permissions");
  */
 router.get("/",
   authenticateAdmin,
-  authorize([PERMISSIONS.VIEW_COMPLAINTS]),
+  authorize([PERMISSIONS.COMPLAINTS_VIEW]),
   getAllComplaints
 );
 
@@ -26,7 +26,7 @@ router.get("/",
  */
 router.get("/:id",
   authenticateAdmin,
-  authorize([PERMISSIONS.VIEW_COMPLAINTS]),
+  authorize([PERMISSIONS.COMPLAINTS_VIEW]),
   getComplaintDetailsAdmin
 );
 
@@ -36,7 +36,7 @@ router.get("/:id",
  */
 router.patch("/:id/status",
   authenticateAdmin,
-  authorize([PERMISSIONS.UPDATE_COMPLAINTS]),
+  authorize([PERMISSIONS.COMPLAINTS_UPDATE]),
   updateComplaintStatus
 );
 
@@ -46,7 +46,7 @@ router.patch("/:id/status",
  */
 router.patch("/:id/resolution",
   authenticateAdmin,
-  authorize([PERMISSIONS.UPDATE_COMPLAINTS]),
+  authorize([PERMISSIONS.COMPLAINTS_UPDATE]),
   addComplaintResolution
 );
 

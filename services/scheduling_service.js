@@ -873,7 +873,7 @@ SLOT AVAILABILITY CACHE (PERFORMANCE FIX)
 =====================================================
 */
 const slotAvailabilityCache = new Map();
-const CACHE_TTL_MS = 3 * 60 * 1000; // 3 minutes TTL
+const CACHE_TTL_MS = 30 * 1000; // 30 seconds — short enough to reflect new bookings quickly
 
 // Singleton guard: prevent stacking multiple intervals if module is re-required (e.g. in tests)
 if (!global.__slotCacheCleanupStarted) {
@@ -886,6 +886,23 @@ if (!global.__slotCacheCleanupStarted) {
       }
     }
   }, CACHE_TTL_MS).unref(); // unref so it doesn't keep the process alive in tests
+}
+
+/*
+=====================================================
+CACHE INVALIDATION
+Call this after any booking is created or cancelled
+so the next slot check hits the DB fresh.
+=====================================================
+*/
+function clearSlotCache(pincode, date) {
+  const dateKey = normalizeDateKey(date);
+  const prefix = `${dateKey}_${pincode}_`;
+  for (const key of slotAvailabilityCache.keys()) {
+    if (key.startsWith(prefix)) {
+      slotAvailabilityCache.delete(key);
+    }
+  }
 }
 
 /*
@@ -1062,9 +1079,11 @@ module.exports = {
   WORKDAY_END_HOUR,
   WORKDAY_START_HOUR,
   // Utilities
+  addMinutes,
   buildDateTime,
   normalizeDateKey,
   // Core functions
+  clearSlotCache,
   findEligiblePartnersForBooking,
   getAvailableSlotsForRequest,
   getBookingWindow,

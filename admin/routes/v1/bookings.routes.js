@@ -131,6 +131,121 @@ router.post("/:id/assign", audit("admin.bookings.assign"), async (req, res) => {
   }
 });
 
+// POST /:id/reassign — force-reassign a booking to a different partner, with full safeguards
+router.post("/:id/reassign", audit("admin.bookings.reassign"), async (req, res) => {
+  try {
+    const bookingId = asSingleString(req.params.id);
+    const partnerId = String(req.body.partnerId || "");
+    const reason = String(req.body.reason || "").trim();
+
+    if (!bookingId || !mongoose.Types.ObjectId.isValid(bookingId)) {
+      return fail(res, 400, "INVALID_ID", "Invalid booking id", null, { requestId: req.requestId });
+    }
+    if (!partnerId || !mongoose.Types.ObjectId.isValid(partnerId)) {
+      return fail(res, 400, "VALIDATION_ERROR", "Valid partnerId is required", null, { requestId: req.requestId });
+    }
+    if (!reason || reason.length < 3) {
+      return fail(res, 400, "VALIDATION_ERROR", "reason must be at least 3 characters", null, { requestId: req.requestId });
+    }
+
+    const [booking, newPartner] = await Promise.all([
+      Booking.findById(bookingId),
+      Partner.findById(partnerId),
+    ]);
+
+    if (!booking) return fail(res, 404, "NOT_FOUND", "Booking not found", null, { requestId: req.requestId });
+    if (!newPartner) return fail(res, 404, "NOT_FOUND", "Partner not found", null, { requestId: req.requestId });
+
+    // Safeguard: partner must be active and approved
+    if (newPartner.approvalStatus !== "APPROVED" || newPartner.isBlocked) {
+      return fail(res, 400, "PARTNER_NOT_ELIGIBLE", "Partner is not approved or is blocked", null, { requestId: req.requestId });
+    }
+
+    // Safeguard: no overloading — partner must be below job limit
+    if (newPartner.activeJobs >= newPartner.maxJobsLimit) {
+      return fail(res, 400, "PARTNER_OVERLOADED",
+        `Partner already has ${newPartner.activeJobs}/${newPartner.maxJobsLimit} active jobs. Cannot assign more.`,
+        null, { requestId: req.requestId });
+    }
+
+    // Safeguard: booking must be in a reassignable state
+    const REASSIGNABLE = ["PENDING_ASSIGNMENT", "QUEUED", "SEARCHING", "ASSIGNED", "CONFIRMED",
+      "PARTNER_ACCEPTED", "ON_THE_WAY", "ARRIVED", "NO_PARTNER_AVAILABLE"];
+    if (!REASSIGNABLE.includes(booking.status)) {
+      return fail(res, 400, "NOT_REASSIGNABLE",
+        `Booking in status "${booking.status}" cannot be reassigned`, null, { requestId: req.requestId });
+    }
+
+    // Safeguard: can't reassign to the same partner
+    if (booking.partner && String(booking.partner) === String(newPartner._id)) {
+      return fail(res, 400, "SAME_PARTNER", "Booking is already assigned to this partner", null, { requestId: req.requestId });
+    }
+
+    // Release old partner's active job slot
+    const oldPartnerId = booking.partner;
+    if (oldPartnerId) {
+      await Partner.findByIdAndUpdate(oldPartnerId, { $inc: { activeJobs: -1 } });
+    }
+
+    // Assign to new partner and record in audit log
+    booking.partner = newPartner._id;
+    booking.status = "ASSIGNED";
+    if (Array.isArray(booking.assignmentAudit)) {
+      booking.assignmentAudit.push({
+        stage: booking.assignmentStage || 1,
+        event: "admin_force_reassign",
+        selectedPartnerId: newPartner._id,
+        notes: `Force-reassigned by admin (${req.adminUser?.email || req.adminUser?.id}). Reason: ${reason}`,
+      });
+    }
+    await booking.save();
+
+    // Give new partner the job slot
+    await Partner.findByIdAndUpdate(newPartner._id, {
+      $inc: { activeJobs: 1 },
+      $set: { lastAssignedAt: new Date() },
+    });
+
+    // Persist in BookingAssignment + Timeline
+    await Promise.all([
+      BookingAssignment.create({
+        bookingId,
+        partnerId,
+        assignedByAdminId: req.adminUser.id,
+        reason: `REASSIGN: ${reason}`,
+      }),
+      BookingTimeline.create({
+        bookingId,
+        eventType: "REASSIGNED",
+        payload: JSON.stringify({
+          oldPartnerId: oldPartnerId || null,
+          newPartnerId: partnerId,
+          adminId: req.adminUser.id,
+          reason,
+        }),
+        createdByAdminId: req.adminUser.id,
+      }),
+    ]);
+
+    // Notify new partner over socket if connected
+    if (global.io) {
+      global.io.to(`partner_${newPartner._id}`).emit("booking_assigned", {
+        bookingId: booking._id,
+        bookingNumber: booking.bookingNumber,
+      });
+    }
+
+    return success(res, {
+      bookingId: booking._id,
+      status: booking.status,
+      newPartnerId: newPartner._id,
+      newPartnerName: newPartner.name,
+    }, { requestId: req.requestId });
+  } catch (error) {
+    return fail(res, 500, "BOOKING_REASSIGN_FAILED", "Unable to reassign booking", error.message, { requestId: req.requestId });
+  }
+});
+
 router.post("/:id/cancel", audit("admin.bookings.cancel"), async (req, res) => {
   try {
     const bookingId = asSingleString(req.params.id);

@@ -18,6 +18,7 @@ const reportsRoutes = require("./reports.routes");
 const referralsRoutes = require("./referrals.routes");
 const complaintsRoutes = require("./complaints.routes");
 const catalogRoutes = require("./catalog.routes");
+const policiesRoutes = require("./policies.routes");
 const { success } = require("../../utils/response");
 
 const router = express.Router();
@@ -46,5 +47,6 @@ router.use("/", rolesRoutes);
 router.use("/referrals", referralsRoutes);
 router.use("/complaints", complaintsRoutes);
 router.use("/catalog", catalogRoutes);
+router.use("/policies", policiesRoutes);
 
 module.exports = router;

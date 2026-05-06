@@ -65,6 +65,18 @@ const zoneSchema = new mongoose.Schema(
     },
 
     /* =====================
+       PER-SERVICE ACTIVATION
+       Controls which service categories
+       are available in this pincode.
+    ===================== */
+    services: {
+      acRepair:    { type: Boolean, default: true },
+      plumbing:    { type: Boolean, default: true },
+      mehendi:     { type: Boolean, default: true },
+      electrician: { type: Boolean, default: true },
+    },
+
+    /* =====================
        OPTIONAL METADATA
        (future analytics)
     ===================== */

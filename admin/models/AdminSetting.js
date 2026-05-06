@@ -37,6 +37,16 @@ const adminSettingSchema = new mongoose.Schema(
       promoTagline:     { type: String,  default: "" },
       promoCta:         { type: String,  default: "Book now  →" },
       promoIconUrl:     { type: String,  default: "" },
+      categoryIcons: {
+        acRepair:           { type: String,  default: "" },
+        acRepairShimmer:    { type: Boolean, default: true },
+        plumbing:           { type: String,  default: "" },
+        plumbingShimmer:    { type: Boolean, default: true },
+        mehendi:            { type: String,  default: "" },
+        mehendiShimmer:     { type: Boolean, default: true },
+        electrician:        { type: String,  default: "" },
+        electricianShimmer: { type: Boolean, default: true },
+      },
     },
   },
   { timestamps: true }

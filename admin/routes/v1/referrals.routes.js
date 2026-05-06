@@ -38,7 +38,7 @@ router.put("/referral-settings", async (req, res) => {
 });
 
 // Get referrals list
-router.get("/referrals", async (req, res) => {
+router.get("/", async (req, res) => {
   try {
     const { page = 1, limit = 20, status, referrerId, referredId } = req.query;
 
