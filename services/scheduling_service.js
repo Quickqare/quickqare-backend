@@ -734,6 +734,10 @@ can actually arrive in time.
 =====================================================
 */
 function isPartnerReachable(distanceMeters, scheduledStartAt) {
+  // If either location is missing, distance is Infinity — can't compute reachability.
+  // Pincode/area filter already restricts the partner pool, so assume reachable.
+  if (!Number.isFinite(distanceMeters)) return true;
+
   const distanceKm = distanceMeters / 1000;
   const travelTimeMinutes = distanceKm * 3; // ~3 min/km — conservative for Indian traffic
   const estimatedArrival = addMinutes(new Date(), travelTimeMinutes);
