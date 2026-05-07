@@ -1,12 +1,12 @@
 const Booking = require("../models/Booking");
 const User = require("../models/User");
-const Zone = require("../models/zone.model");
 const {
   findEligiblePartnersForBooking,
   syncPartnerOperationalState,
   AC_CATEGORY_SLUGS,
   AC_MAX_CAPACITY_MINUTES,
 } = require("./scheduling_service");
+const { resolveZoneForPincode, getZoneCoveragePincodes } = require("./zone.service");
 
 /*
 =====================================================
@@ -18,12 +18,8 @@ async function getPincodesForStage(booking) {
     return [booking.pincode];
   }
 
-  const zone = await Zone.findOne({
-    pincode: booking.pincode,
-    isActive: true,
-  });
-
-  if (!zone) return [booking.pincode];
+  const zone = await resolveZoneForPincode(booking.pincode);
+  if (!zone || zone.isActive === false) return [booking.pincode];
   if (zone.partnerAppEnabled === false) return [];
 
   if (booking.assignmentStage === 2 && zone.nearbyPincodes?.length) {
@@ -34,7 +30,8 @@ async function getPincodesForStage(booking) {
     return zone.extendedPincodes;
   }
 
-  return [booking.pincode];
+  const coverage = getZoneCoveragePincodes(zone);
+  return coverage.length ? coverage : [booking.pincode];
 }
 
 /*

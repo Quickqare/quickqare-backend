@@ -3,11 +3,15 @@ const Booking = require("../models/Booking");
 const Partner = require("../models/Partner");
 const Service = require("../models/service.model");
 const mongoose = require("mongoose");
-const Zone = require("../models/zone.model");
 const Category = require("../models/Category");
 const { creditWallet } = require("./partnerWallet.controller");
 const { getAvailableSlots } = require("../services/slotAvailability_service");
 const { assignBooking, reassignBooking } = require("../services/assignmentEngine");
+const {
+  getZoneServiceKeysFromValues,
+  isZoneServiceEnabled,
+  resolveZoneForPincode,
+} = require("../services/zone.service");
 const {
   addMinutes,
   buildDateTime,
@@ -119,14 +123,14 @@ exports.createBooking = async (req, res) => {
       });
     }
 
-    const zone = await Zone.findOne({ pincode });
-    if (zone && zone.isActive === false) {
+    const zone = await resolveZoneForPincode(pincode);
+    if (!zone || zone.isActive === false) {
       return res.status(403).json({
         success: false,
         message: "Service not available in this pincode",
       });
     }
-    if (zone && zone.customerAppEnabled === false) {
+    if (zone.customerAppEnabled === false || zone.partnerAppEnabled === false) {
       return res.status(403).json({
         success: false,
         message: "Customer app is disabled for this pincode",
@@ -295,6 +299,19 @@ exports.createBooking = async (req, res) => {
           };
         });
       }
+
+      const zoneServiceKeys = getZoneServiceKeysFromValues([
+        serviceCategory,
+        ...bookingServices.map((item) => item.category),
+        ...bookingServices.map((item) => item.name),
+      ]);
+
+      if (!isZoneServiceEnabled(zone, zoneServiceKeys)) {
+        return res.status(403).json({
+          success: false,
+          message: "Selected service is not enabled in this pincode",
+        });
+      }
     }
 
     /* =====================
@@ -319,6 +336,19 @@ exports.createBooking = async (req, res) => {
       return res.status(400).json({
         success: false,
         message: "Services or serviceId is required",
+      });
+    }
+
+    const zoneServiceKeys = getZoneServiceKeysFromValues([
+      serviceCategory,
+      ...bookingServices.map((item) => item.category),
+      ...bookingServices.map((item) => item.name),
+    ]);
+
+    if (!isZoneServiceEnabled(zone, zoneServiceKeys)) {
+      return res.status(403).json({
+        success: false,
+        message: "Selected service is not enabled in this pincode",
       });
     }
 
@@ -363,7 +393,6 @@ exports.createBooking = async (req, res) => {
        here with a direct DB count before creating anything.
     ===================== */
     const activePartnersInZone = await Partner.countDocuments({
-      $or: [{ serviceAreas: pincode }, { currentPincode: pincode }],
       approvalStatus: "APPROVED",
       isBlocked: { $ne: true },
     });
@@ -432,7 +461,7 @@ exports.createBooking = async (req, res) => {
         pincode,
         rejectedPartners: [],
       },
-      [pincode],
+      [],
       // Booking creation is forward-looking — partner doesn't need to be online
       // right now, only when the actual service window arrives.
       { requireOnline: false }

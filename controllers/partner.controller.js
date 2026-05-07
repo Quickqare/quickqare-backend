@@ -3,11 +3,14 @@ const Partner = require("../models/Partner");
 const Service = require("../models/service.model");
 const CatalogItem = require("../models/CatalogItem");
 const SubCategory = require("../models/SubCategory");
-const Zone = require("../models/zone.model");
 const { reverseGeocode } = require("../services/geocode.service");
 const { syncPartnerOperationalState } = require("../services/scheduling_service");
 const { emitBookingUpdate } = require("../socket/emitters");
 const { completeBooking } = require("./booking.controller");
+const {
+  filterServicesByZone,
+  resolveZoneForPincode,
+} = require("../services/zone.service");
 
 function toPartnerJobPayload(booking, partnerId) {
   const firstService = booking?.services?.[0] || {};
@@ -387,8 +390,8 @@ exports.getAvailableServicesForLocation = async (req, res) => {
       });
     }
 
-    const zone = await Zone.findOne({ pincode }).lean();
-    if (zone && (zone.isActive === false || zone.partnerAppEnabled === false)) {
+    const zone = await resolveZoneForPincode(pincode);
+    if (!zone || zone.isActive === false || zone.partnerAppEnabled === false) {
       return res.json({
         success: true,
         pincode,
@@ -416,12 +419,14 @@ exports.getAvailableServicesForLocation = async (req, res) => {
       .sort({ createdAt: -1 })
       .lean();
 
+    const filteredServices = filterServicesByZone(services, zone);
+
     return res.json({
       success: true,
       pincode,
       address: resolved.address || "",
-      count: services.length,
-      services,
+      count: filteredServices.length,
+      services: filteredServices,
     });
   } catch (err) {
     console.error("getAvailableServicesForLocation error:", err);

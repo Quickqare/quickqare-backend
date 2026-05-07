@@ -2,6 +2,10 @@ const Booking = require("../models/Booking");
 const Partner = require("../models/Partner");
 const Service = require("../models/service.model");
 const AdminSetting = require("../admin/models/AdminSetting");
+const {
+  isZoneServiceEnabled,
+  resolveZoneForPincode,
+} = require("./zone.service");
 
 /*
 =====================================================
@@ -775,6 +779,16 @@ async function findEligiblePartnersForBooking(booking, pincodes = [], opts = {})
     return [];
   }
 
+  const zone = await resolveZoneForPincode(booking?.pincode);
+  if (
+    !zone ||
+    zone.isActive === false ||
+    zone.partnerAppEnabled === false ||
+    !isZoneServiceEnabled(zone, requestContext.requestedCategories)
+  ) {
+    return [];
+  }
+
   const settings = await AdminSetting.findOne().lean();
 
   const query = {
@@ -809,15 +823,6 @@ async function findEligiblePartnersForBooking(booking, pincodes = [], opts = {})
   // For AC Level 2/3 jobs, pre-filter at DB level for technician tier
   if (requestContext.isAC && requestContext.requiredSkillTier >= 2) {
     query.skillTier = { $gte: requestContext.requiredSkillTier };
-  }
-
-  if (Array.isArray(pincodes) && pincodes.length) {
-    query.$or = [
-      { serviceAreas: { $in: pincodes } },
-      { currentPincode: { $in: pincodes } },
-      { serviceAreas: { $exists: false } },
-      { serviceAreas: { $size: 0 } },
-    ];
   }
 
   if (
@@ -982,6 +987,17 @@ async function getAvailableSlotsForRequest({
     requestContext.isAC
   );
 
+  const zone = await resolveZoneForPincode(pincode);
+  if (
+    !zone ||
+    zone.isActive === false ||
+    zone.customerAppEnabled === false ||
+    zone.partnerAppEnabled === false ||
+    !isZoneServiceEnabled(zone, requestContext.requestedCategories)
+  ) {
+    return [];
+  }
+
   // --- PERFORMANCE FIX: CACHING ---
   // Round location to 2 decimal places (~1.1km precision) to group nearby users
   let locKey = "none";
@@ -998,19 +1014,6 @@ async function getAvailableSlotsForRequest({
 
   const now = new Date();
   const isToday = normalizeDateKey(date) === normalizeDateKey(now);
-
-  // Count ALL approved partners in the zone (not filtered by isOnline/isAvailable).
-  // Online status can flip to false the moment a partner is assigned a booking, which
-  // would collapse totalCapacity to 0 and block every remaining slot for that day —
-  // even slots that don't overlap with the booked one.
-  const activePartnersInZone = await Partner.countDocuments({
-    $or: [{ serviceAreas: pincode }, { currentPincode: pincode }],
-    approvalStatus: "APPROVED",
-    isBlocked: { $ne: true },
-    ...(requestContext.isAC && requestContext.requiredSkillTier >= 2
-      ? { skillTier: { $gte: requestContext.requiredSkillTier } }
-      : {}),
-  });
 
   // Use day bounds rather than exact-equality on scheduledDate. The stored
   // scheduledDate may have any time component (varies by timezone); strict
@@ -1049,21 +1052,6 @@ async function getAvailableSlotsForRequest({
     if (isToday && slotStart.getTime() <= now.getTime()) continue;
     if (!isInsideWorkday(slotStart, slotEnd)) continue;
 
-    // Per-slot capacity check: count bookings that actually overlap THIS time window.
-    // A daily-aggregate check would block afternoon slots because of a morning booking
-    // (the two don't share capacity — a partner free at 2 PM can take a new job).
-    if (activePartnersInZone > 0) {
-      const overlappingCount = existingBookings.filter((b) => {
-        const bStart = b.scheduledStartAt
-          ? new Date(b.scheduledStartAt)
-          : buildDateTime(b.scheduledDate, b.scheduledTime || "09:00");
-        const bDur = b.lockedCapacityMinutes || b.estimatedDurationMinutes || 60;
-        const bEnd = addMinutes(bStart, bDur);
-        return bStart < slotEnd && bEnd > slotStart;
-      }).length;
-      if (overlappingCount >= activePartnersInZone) continue; // Every partner is busy in this window
-    }
-
     const rankedPartners = await findEligiblePartnersForBooking(
       {
         scheduledDate: date,
@@ -1082,11 +1070,24 @@ async function getAvailableSlotsForRequest({
         scheduledStartAt: slotStart,
         scheduledEndAt: slotEnd,
       },
-      pincode ? [pincode] : [],
+      [],
       { requireOnline: false } // slot listing — partner may come online later
     );
 
     if (!rankedPartners.length) continue;
+
+    // Per-slot capacity check: count bookings that actually overlap THIS time window.
+    // A daily-aggregate check would block afternoon slots because of a morning booking
+    // (the two don't share capacity — a partner free at 2 PM can take a new job).
+    const overlappingCount = existingBookings.filter((b) => {
+      const bStart = b.scheduledStartAt
+        ? new Date(b.scheduledStartAt)
+        : buildDateTime(b.scheduledDate, b.scheduledTime || "09:00");
+      const bDur = b.lockedCapacityMinutes || b.estimatedDurationMinutes || 60;
+      const bEnd = addMinutes(bStart, bDur);
+      return bStart < slotEnd && bEnd > slotStart;
+    }).length;
+    if (overlappingCount >= rankedPartners.length) continue;
 
     slotResults.push({
       time: getTimeLabel(slotStart),
