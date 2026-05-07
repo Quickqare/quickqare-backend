@@ -342,8 +342,7 @@ async function assignBooking(bookingId) {
           isACJob: acBooking,
           customerName: user?.name || "Customer",
           customerPhone: user?.phone || "",
-          address:
-            booking.address || booking.pincode || "Address not available",
+          address: booking.address?.trim() || "",
           pincode: booking.pincode || "",
           customerLatitude,
           customerLongitude,
@@ -411,6 +410,22 @@ async function assignBooking(bookingId) {
     });
     await booking.save();
 
+    // Bust slot cache: NO_PARTNER_AVAILABLE no longer holds slot capacity, so
+    // the slot may be available to a different (better-matched) customer now.
+    try {
+      const { clearSlotCache } = require("./scheduling_service");
+      clearSlotCache(booking.pincode, booking.scheduledDate);
+    } catch (_) { /* non-fatal */ }
+
+    // Tell the customer immediately so the BookingStatusScreen surfaces the
+    // "No partner available" banner instead of spinning on SEARCHING.
+    if (global.io) {
+      global.io.to(`user_${booking.user}`).emit("booking_update", {
+        bookingId: booking._id.toString(),
+        status: "NO_PARTNER_AVAILABLE",
+      });
+    }
+
     // Escalation: notify ops dashboard + customer
     // The escalation service handles:
     //   1. Admin dashboard flag
@@ -441,6 +456,12 @@ Handles: partner reject, ACK timeout, admin force,
 and customer cancel (partnerId = null).
 =====================================================
 */
+// Hard cap on reassignment loops. Without this, a booking that no partner accepts
+// can recurse forever (reject → reassign → reject → reassign...). At this cap we
+// escalate to ops instead — the customer is better served by a human dispatcher
+// than by an infinite background spin.
+const MAX_REASSIGN_ATTEMPTS = 5;
+
 async function reassignBooking(bookingId, partnerId) {
   try {
     const booking = await Booking.findById(bookingId);
@@ -448,6 +469,42 @@ async function reassignBooking(bookingId, partnerId) {
 
     // Gate: don't reassign already-completed or cancelled bookings
     if (["COMPLETED", "CANCELLED"].includes(booking.status)) return;
+
+    // Hard cap on reassignment attempts — count REASSIGN_REQUESTED audit entries.
+    const reassignCount = (booking.assignmentAudit || []).filter(
+      (entry) => entry.event === "REASSIGN_REQUESTED"
+    ).length;
+
+    if (reassignCount >= MAX_REASSIGN_ATTEMPTS) {
+      booking.status = "NO_PARTNER_AVAILABLE";
+      booking.assignmentAudit.push({
+        stage: booking.assignmentStage || 3,
+        event: "REASSIGN_LIMIT_REACHED",
+        searchedPincodes: [],
+        notes: `Max reassignment attempts (${MAX_REASSIGN_ATTEMPTS}) reached — escalating to ops`,
+        candidates: [],
+      });
+      await booking.save();
+
+      try {
+        const { escalateUnassignedBooking } = require("./escalation.service");
+        await escalateUnassignedBooking(booking._id);
+      } catch (escErr) {
+        console.error("Escalation error:", escErr.message);
+      }
+
+      if (global.io) {
+        global.io.to(`user_${booking.user}`).emit("booking_update", {
+          bookingId: booking._id.toString(),
+          status: "NO_PARTNER_AVAILABLE",
+        });
+      }
+
+      console.warn(
+        `[reassign] Booking ${bookingId} hit reassignment cap (${reassignCount}). Escalated.`
+      );
+      return;
+    }
 
     if (partnerId) {
       booking.rejectedPartners.push(partnerId);
@@ -481,7 +538,7 @@ async function reassignBooking(bookingId, partnerId) {
 
     booking.partner = null;
     booking.additionalPartners = [];
-    booking.status = "PENDING_ASSIGNMENT";
+    booking.status = "SEARCHING";
     booking.assignmentAudit.push({
       stage: booking.assignmentStage || 1,
       event: "REASSIGN_REQUESTED",
@@ -493,6 +550,23 @@ async function reassignBooking(bookingId, partnerId) {
       candidates: [],
     });
     await booking.save();
+
+    // Bust slot cache: the rejecting partner is no longer holding this window,
+    // so the slot may now be available to a different customer. Without this,
+    // the cache shows the slot as full for up to 30s after reassignment frees it.
+    try {
+      const { clearSlotCache } = require("./scheduling_service");
+      clearSlotCache(booking.pincode, booking.scheduledDate);
+    } catch (_) { /* non-fatal */ }
+
+    // Tell the customer we're re-searching so the BookingStatusScreen flips back
+    // to "Searching for Partner" instead of staying on a stale ASSIGNED/CONFIRMED.
+    if (global.io) {
+      global.io.to(`user_${booking.user}`).emit("booking_update", {
+        bookingId: booking._id.toString(),
+        status: "SEARCHING",
+      });
+    }
 
     // Sync operational state for all previously assigned partners
     if (prevPartner) await syncPartnerOperationalState(prevPartner);

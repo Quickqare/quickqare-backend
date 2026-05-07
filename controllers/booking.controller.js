@@ -14,6 +14,7 @@ const {
   clearSlotCache,
   findEligiblePartnersForBooking,
   syncPartnerOperationalState,
+  SLOT_HOLDING_BOOKING_STATUSES,
 } = require("../services/scheduling_service");
 const { calculatePricing } = require("../utils/pricing");
 const { validateCouponForAmount } = require("../services/coupon.service");
@@ -368,23 +369,30 @@ exports.createBooking = async (req, res) => {
     });
 
     if (activePartnersInZone > 0) {
+      // Day-bounds query: stored scheduledDate may have any time component, so
+      // strict equality misses bookings made from different timezones and lets
+      // the same slot get sold twice. Bound by [day-start, next-day-start).
+      const requestedDate = new Date(scheduledDate);
+      const dayStart = new Date(
+        requestedDate.getFullYear(),
+        requestedDate.getMonth(),
+        requestedDate.getDate(),
+        0, 0, 0, 0
+      );
+      const dayEnd = new Date(
+        requestedDate.getFullYear(),
+        requestedDate.getMonth(),
+        requestedDate.getDate() + 1,
+        0, 0, 0, 0
+      );
+
       const conflictBookings = await Booking.find({
         pincode,
-        scheduledDate: new Date(scheduledDate),
+        scheduledDate: { $gte: dayStart, $lt: dayEnd },
         $or: [
-          {
-            status: {
-              $in: [
-                "PENDING_ASSIGNMENT",
-                "QUEUED",
-                "ASSIGNED",
-                "CONFIRMED",
-                "PARTNER_ACCEPTED",
-                "ON_THE_WAY",
-                "IN_PROGRESS",
-              ],
-            },
-          },
+          // SLOT_HOLDING_BOOKING_STATUSES includes SEARCHING / ASSIGNING_LOCK /
+          // ARRIVED so in-flight and mid-service bookings still hold capacity.
+          { status: { $in: SLOT_HOLDING_BOOKING_STATUSES } },
           { status: "PENDING_PAYMENT", lockedUntil: { $gt: new Date() } },
         ],
       }).select("scheduledStartAt scheduledTime scheduledDate estimatedDurationMinutes lockedCapacityMinutes");
@@ -424,7 +432,10 @@ exports.createBooking = async (req, res) => {
         pincode,
         rejectedPartners: [],
       },
-      [pincode]
+      [pincode],
+      // Booking creation is forward-looking — partner doesn't need to be online
+      // right now, only when the actual service window arrives.
+      { requireOnline: false }
     );
 
     if (!slotCandidates.length) {
@@ -449,7 +460,7 @@ exports.createBooking = async (req, res) => {
         typeof serviceCategory === "string" && serviceCategory.trim()
           ? serviceCategory.trim()
           : bookingServices[0]?.category || "general",
-      serviceId,
+      serviceId: serviceId ?? finalPrimaryService ?? null,
 
         pincode,
         address: String(address || "").trim(),
@@ -516,13 +527,37 @@ exports.afterPaymentSuccess = async (req, res) => {
     if (hoursToService > 24) {
       booking.status = "QUEUED";
       await booking.save();
+
+      // Tell the customer their booking is confirmed and queued — without this the
+      // BookingStatusScreen sits on PENDING_PAYMENT until partner assignment runs
+      // hours later, which looks like the payment failed.
+      if (global.io) {
+        global.io.to(`user_${booking.user}`).emit("booking_update", {
+          bookingId: booking._id.toString(),
+          status: "QUEUED",
+          paymentConfirmed: true,
+        });
+      }
+
       res.json({
         success: true,
         message: "Payment verified. Booking queued for partner assignment closer to the service date.",
       });
     } else {
-      booking.status = "PENDING_ASSIGNMENT";
+      // Use SEARCHING (a public-facing status the BookingStatusScreen timeline
+      // recognises) so the customer immediately sees "Searching for Partner".
+      // assignBooking's atomic lock will flip this through ASSIGNING_LOCK → ASSIGNED
+      // within a moment; we still emit the SEARCHING update first for instant feedback.
+      booking.status = "SEARCHING";
       await booking.save();
+
+      if (global.io) {
+        global.io.to(`user_${booking.user}`).emit("booking_update", {
+          bookingId: booking._id.toString(),
+          status: "SEARCHING",
+          paymentConfirmed: true,
+        });
+      }
 
       // 🚀 QUEUE ASSIGNMENT (Simulating batch dispatch)
       await assignBooking(booking._id);
@@ -1076,6 +1111,10 @@ exports.cancelBooking = async (req, res) => {
     await partner.save();
     await syncPartnerOperationalState(partner._id);
 
+    // Bust slot cache so the freed slot is visible to other customers
+    // immediately (without waiting for the 30s TTL).
+    clearSlotCache(booking.pincode, booking.scheduledDate);
+
     /* =====================
        REASSIGN BOOKING
     ===================== */
@@ -1398,5 +1437,23 @@ exports.respondToEstimate = async (req, res) => {
   } catch (err) {
     console.error("respondToEstimate error:", err);
     res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
+exports.getBookingById = async (req, res) => {
+  try {
+    const booking = await Booking.findOne({
+      _id: req.params.bookingId,
+      user: req.user._id,
+    }).lean();
+
+    if (!booking) {
+      return res.status(404).json({ success: false, message: "Booking not found" });
+    }
+
+    return res.json({ success: true, booking });
+  } catch (err) {
+    console.error("getBookingById error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
   }
 };

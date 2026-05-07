@@ -37,6 +37,7 @@ router.get("/", async (_req, res) => {
         promoTagline:    theme.promoTagline     ?? DEFAULT_THEME.promoTagline,
         promoCta:        theme.promoCta        || DEFAULT_THEME.promoCta,
         promoIconUrl:    theme.promoIconUrl    ?? "",
+        razorpayKeyId:   process.env.RAZORPAY_KEY_ID || "",
         categoryIcons: {
           acRepair:           theme.categoryIcons?.acRepair    ?? "",
           acRepairShimmer:    theme.categoryIcons?.acRepairShimmer    !== false,

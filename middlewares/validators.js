@@ -134,6 +134,12 @@ exports.createBookingValidator = [
     .isLength({ min: 6, max: 6 })
     .withMessage("pincode must be 6 digits"),
 
+  body("address")
+    .notEmpty()
+    .withMessage("address is required")
+    .isLength({ min: 5 })
+    .withMessage("address must be at least 5 characters"),
+
   body("couponCode")
     .optional()
     .isString()

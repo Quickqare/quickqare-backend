@@ -32,10 +32,34 @@ const FAIRNESS_LOOKBACK_HOURS = 12;
 // AC category detection slugs — extend this list as needed
 const AC_CATEGORY_SLUGS = ["ac", "air conditioner", "air-conditioner", "aircon"];
 
+// Statuses where a partner is committed to a booking and that booking's window
+// must block them from being assigned to overlapping work.
+// CONFIRMED: auto-accept partners skip ASSIGNED and land here directly.
+// ARRIVED: partner is on-site; they cannot serve another booking until done.
 const BLOCKING_BOOKING_STATUSES = [
   "ASSIGNED",
+  "CONFIRMED",
   "PARTNER_ACCEPTED",
   "ON_THE_WAY",
+  "ARRIVED",
+  "IN_PROGRESS",
+];
+
+// Statuses where a booking holds capacity in the pincode (regardless of whether
+// a specific partner is attached). Used for the slot-capacity pre-filter and the
+// createBooking double-book guard. Includes pre-assignment statuses (SEARCHING,
+// PENDING_ASSIGNMENT, ASSIGNING_LOCK, QUEUED) because those bookings are in
+// flight and will land on a partner momentarily — we must reserve their capacity.
+const SLOT_HOLDING_BOOKING_STATUSES = [
+  "PENDING_ASSIGNMENT",
+  "QUEUED",
+  "SEARCHING",
+  "ASSIGNING_LOCK",
+  "ASSIGNED",
+  "CONFIRMED",
+  "PARTNER_ACCEPTED",
+  "ON_THE_WAY",
+  "ARRIVED",
   "IN_PROGRESS",
 ];
 
@@ -729,7 +753,16 @@ function isPartnerReachable(distanceMeters, scheduledStartAt) {
 ELIGIBLE PARTNER FINDER
 =====================================================
 */
-async function findEligiblePartnersForBooking(booking, pincodes = []) {
+/**
+ * @param {Object} booking
+ * @param {string[]} pincodes
+ * @param {Object} [opts]
+ * @param {boolean} [opts.requireOnline=true] - false for slot-listing/booking-creation
+ *   (booking may be hours/days away, partner doesn't need to be online RIGHT NOW);
+ *   true for live assignment (we need someone reachable now).
+ */
+async function findEligiblePartnersForBooking(booking, pincodes = [], opts = {}) {
+  const { requireOnline = true } = opts;
   const requestContext = await buildRequestContext({ booking });
   if (
     !requestContext.requestedServiceIds.length &&
@@ -743,14 +776,27 @@ async function findEligiblePartnersForBooking(booking, pincodes = []) {
   const query = {
     isBlocked: false,
     approvalStatus: "APPROVED",
-    isOnline: true,
-    isAvailable: true,
     // Exclude partners under active suspension.
     // $not + $gt matches: null, missing field, or a past date — i.e. not currently suspended.
     // Avoids using $or here because the pincode block below also uses $or.
     suspendedUntil: { $not: { $gt: new Date() } },
     _id: { $nin: booking?.rejectedPartners || [] },
   };
+
+  // For live assignment we require partners to be currently online + available.
+  // For slot listing / pre-booking checks we DON'T — a partner that took a 1pm
+  // job and went offline shouldn't make every other slot of the day vanish for
+  // future customers. The window-overlap check below still blocks them from
+  // being matched to truly conflicting slots.
+  if (requireOnline) {
+    query.isOnline = true;
+    query.isAvailable = true;
+  } else {
+    // Even in availability mode, exclude partners who are explicitly unavailable
+    // (auto-suspended cancellers). isOnline is allowed to be false because
+    // partners may go offline temporarily and come back online before the slot.
+    query.isAvailable = { $ne: false };
+  }
 
   if (settings?.partnerVerificationRequired) {
     query.verificationStatus = "VERIFIED";
@@ -962,23 +1008,16 @@ async function getAvailableSlotsForRequest({
       : {}),
   });
 
+  // Use day bounds rather than exact-equality on scheduledDate. The stored
+  // scheduledDate may have any time component (varies by timezone); strict
+  // equality silently misses bookings and lets the same slot be sold twice.
+  const { start: dayStartBound, end: dayEndBound } = getDayBounds(date);
+
   const existingBookings = await Booking.find({
     pincode,
-    scheduledDate: date,
+    scheduledDate: { $gte: dayStartBound, $lt: dayEndBound },
     $or: [
-      {
-        status: {
-          $in: [
-            "PENDING_ASSIGNMENT",
-            "QUEUED",
-            "ASSIGNED",
-            "CONFIRMED",
-            "PARTNER_ACCEPTED",
-            "ON_THE_WAY",
-            "IN_PROGRESS",
-          ],
-        },
-      },
+      { status: { $in: SLOT_HOLDING_BOOKING_STATUSES } },
       { status: "PENDING_PAYMENT", lockedUntil: { $gt: new Date() } },
     ],
   }).select(
@@ -1039,7 +1078,8 @@ async function getAvailableSlotsForRequest({
         scheduledStartAt: slotStart,
         scheduledEndAt: slotEnd,
       },
-      pincode ? [pincode] : []
+      pincode ? [pincode] : [],
+      { requireOnline: false } // slot listing — partner may come online later
     );
 
     if (!rankedPartners.length) continue;
@@ -1073,6 +1113,7 @@ module.exports = {
   AC_MAX_CAPACITY_MINUTES,
   AC_TRAVEL_BUFFER_MINUTES,
   BLOCKING_BOOKING_STATUSES,
+  SLOT_HOLDING_BOOKING_STATUSES,
   DEFAULT_SERVICE_DURATION_MINUTES,
   DEFAULT_TRAVEL_BUFFER_MINUTES,
   SLOT_GAP_MINUTES,

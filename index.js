@@ -11,7 +11,6 @@ const helmet = require("helmet");
 const path = require("path");
 
 const { setSocketIO } = require("./socket/emitters");
-const { assignBooking } = require("./services/assignmentEngine");
 const { ensureBootstrapAdmin } = require("./services/adminBootstrap.service");
 const { initCronJobs } = require("./services/cron.service");
 
@@ -292,6 +291,8 @@ io.on("connection", (socket) => {
   /* ======================
      PARTNER REJECT JOB
      ASSIGNED or CONFIRMED → SEARCHING → REASSIGN
+     Delegates to reassignBooking() so weekly cancel penalty, ack-timeout cancel,
+     and operational-state sync are handled in one place.
   ====================== */
   socket.on("rejectJob", async ({ bookingId }) => {
     try {
@@ -300,7 +301,7 @@ io.on("connection", (socket) => {
         return;
       }
 
-      const booking = await Booking.findById(bookingId);
+      const booking = await Booking.findById(bookingId).select("status partner additionalPartners user");
       if (!booking) return;
 
       if (!["ASSIGNED", "CONFIRMED"].includes(booking.status)) return;
@@ -314,17 +315,22 @@ io.on("connection", (socket) => {
         return;
       }
 
-      booking.status = "SEARCHING";
-      booking.partner = null;
-      booking.rejectedPartners.push(socket.partnerId);
-      await booking.save();
+      // Cancel the pending ACK timeout so reassignBooking isn't called twice (here + ackTimeout)
+      try {
+        const { cancelAckTimeout } = require("./services/ackTimeout.service");
+        await cancelAckTimeout(bookingId);
+      } catch (_) { /* non-fatal */ }
 
+      // Notify the customer immediately while reassignment runs in the background
       io.to(`user_${booking.user}`).emit("booking_update", {
         bookingId: booking._id.toString(),
         status: "SEARCHING",
       });
 
-      await assignBooking(booking._id);
+      // reassignBooking handles: rejectedPartners push, weekly cancel penalty + auto-suspend,
+      // partner operational state sync, and recursive assignBooking call.
+      const { reassignBooking } = require("./services/assignmentEngine");
+      await reassignBooking(bookingId, socket.partnerId);
 
       console.log(`[socket] Booking ${bookingId} rejected by partner ${pid}, reassigning`);
     } catch (err) {

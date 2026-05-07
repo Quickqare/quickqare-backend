@@ -41,7 +41,7 @@ function toPartnerJobPayload(booking, partnerId) {
     serviceCategory: booking?.serviceCategory || firstService?.category || "general",
     customerName: booking?.user?.name || "Customer",
     customerPhone: booking?.user?.phone || "",
-    address: booking?.address || booking?.pincode || "",
+    address: booking?.address?.trim() || "",
     pincode: booking?.pincode ? String(booking.pincode) : "",
     customerLatitude: Number.isFinite(customerLatitude) ? customerLatitude : null,
     customerLongitude: Number.isFinite(customerLongitude) ? customerLongitude : null,
@@ -313,7 +313,7 @@ exports.updateLocation = async (req, res) => {
     const activeBookings = await Booking.find({
       $or: [{ partner: req.partner._id }, { additionalPartners: req.partner._id }],
       status: {
-        $in: ["CONFIRMED", "PARTNER_ACCEPTED", "ON_THE_WAY", "IN_PROGRESS"],
+        $in: ["CONFIRMED", "PARTNER_ACCEPTED", "ON_THE_WAY", "ARRIVED", "IN_PROGRESS"],
       },
     }).select("_id user");
 

@@ -41,6 +41,13 @@ router.get(
   bookingController.getActiveCart
 );
 
+// Get a single booking by ID
+router.get(
+  "/:bookingId",
+  userAuth,
+  bookingController.getBookingById
+);
+
 // Track assigned partner live location for a booking
 router.get(
   "/:bookingId/partner-location",
