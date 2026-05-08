@@ -30,8 +30,10 @@ const ACK_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
 
 /* Statuses that mean the booking is already handled */
 const TERMINAL_OR_ACCEPTED_STATUSES = new Set([
+  "CONFIRMED",       // Auto-accepted — partner opted in, no manual ACK needed
   "PARTNER_ACCEPTED",
   "ON_THE_WAY",
+  "ARRIVED",
   "IN_PROGRESS",
   "COMPLETED",
   "CANCELLED",

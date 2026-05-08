@@ -279,6 +279,11 @@ async function assignBooking(bookingId, opts = {}) {
       booking.standbyPartners = standbyCandidates;
 
       booking.status = finalStatus;
+      // Auto-accepted bookings don't need a manual ACK from the partner.
+      // Mark ackReceivedAt now so the ACK timeout handler skips reassignment.
+      if (autoAccepted) {
+        booking.ackReceivedAt = new Date();
+      }
       booking.assignmentAudit.push({
         stage,
         event: autoAccepted ? "CONFIRMED_AUTO" : "SOFT_ASSIGNED",
@@ -302,15 +307,16 @@ async function assignBooking(bookingId, opts = {}) {
       });
       await booking.save();
 
-      // Enqueue ACK-timeout job for ALL bookings (prevents silent no-shows and stuck manual assignments).
-      // The ackTimeout.service watches for partners who don't tap "Acknowledge" or "Accept"
-      // within 2 minutes and triggers reassignBooking automatically.
-      try {
-        const { scheduleAckTimeout } = require("./ackTimeout.service");
-        await scheduleAckTimeout(booking._id, primaryPartner._id);
-      } catch (timeoutErr) {
-        // Non-fatal — log and continue. The ops team will catch unacknowledged jobs.
-        console.error("ACK timeout schedule error:", timeoutErr.message);
+      // Schedule ACK timeout only for manual-accept bookings (ASSIGNED).
+      // Auto-accepted bookings (CONFIRMED) already have ackReceivedAt set above —
+      // no partner action required, so no timeout needed.
+      if (!autoAccepted) {
+        try {
+          const { scheduleAckTimeout } = require("./ackTimeout.service");
+          await scheduleAckTimeout(booking._id, primaryPartner._id);
+        } catch (timeoutErr) {
+          console.error("ACK timeout schedule error:", timeoutErr.message);
+        }
       }
 
       // Update all assigned partners' state
