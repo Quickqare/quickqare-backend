@@ -797,12 +797,23 @@ async function findEligiblePartnersForBooking(booking, pincodes = [], opts = {})
   }
 
   const zone = await resolveZoneForPincode(booking?.pincode);
-  if (
-    !zone ||
+  let noZoneFallback = false;
+  if (!zone) {
+    // No zone configured for this pincode. Don't hard-block — fall back to
+    // matching partners whose serviceAreas explicitly include this pincode.
+    // This allows assignment to work in areas the admin hasn't zoned yet.
+    console.warn(
+      `[assignment] No zone found for pincode "${booking?.pincode}" (booking ${booking?._id}) — using serviceAreas fallback`
+    );
+    noZoneFallback = true;
+  } else if (
     zone.isActive === false ||
     zone.partnerAppEnabled === false ||
     !isZoneServiceEnabled(zone, requestContext.requestedCategories)
   ) {
+    console.warn(
+      `[assignment] Zone check blocked assignment for pincode "${booking?.pincode}" (booking ${booking?._id}): isActive=${zone.isActive}, partnerAppEnabled=${zone.partnerAppEnabled}`
+    );
     return [];
   }
 
@@ -817,6 +828,11 @@ async function findEligiblePartnersForBooking(booking, pincodes = [], opts = {})
     suspendedUntil: { $not: { $gt: new Date() } },
     _id: { $nin: booking?.rejectedPartners || [] },
   };
+
+  // No-zone fallback: restrict to partners who registered this pincode as a service area
+  if (noZoneFallback && booking?.pincode) {
+    query.serviceAreas = booking.pincode;
+  }
 
   // For live assignment we require partners to be currently online + available.
   // For slot listing / pre-booking checks we DON'T — a partner that took a 1pm
@@ -848,7 +864,12 @@ async function findEligiblePartnersForBooking(booking, pincodes = [], opts = {})
   // visibility; valid GPS is used later only for ranking/reachability.
 
   const partners = await Partner.find(query);
-  if (!partners.length) return [];
+  if (!partners.length) {
+    console.warn(
+      `[assignment] DB query returned 0 partners for booking ${booking?._id} (pincode: ${booking?.pincode}, requireOnline: ${requireOnline})`
+    );
+    return [];
+  }
 
   const bookingWindow = await getBookingWindow(booking);
   if (
@@ -857,6 +878,9 @@ async function findEligiblePartnersForBooking(booking, pincodes = [], opts = {})
       bookingWindow.scheduledEndAt
     )
   ) {
+    console.warn(
+      `[assignment] Booking ${booking?._id} window is outside workday: ${bookingWindow.scheduledStartAt}`
+    );
     return [];
   }
 
@@ -865,13 +889,20 @@ async function findEligiblePartnersForBooking(booking, pincodes = [], opts = {})
     booking.scheduledDate
   );
 
+  let skillBlockCount = 0;
+  let windowBlockCount = 0;
+  let reachabilityBlockCount = 0;
+
   const ranked = partners
     .map((partner) => {
       const skillMatchLevel = getPartnerSkillMatchLevel(
         partner,
         requestContext
       );
-      if (!skillMatchLevel) return null;
+      if (!skillMatchLevel) {
+        skillBlockCount++;
+        return null;
+      }
 
       const partnerWindows =
         windowsByPartner.get(String(partner._id)) || [];
@@ -880,7 +911,10 @@ async function findEligiblePartnersForBooking(booking, pincodes = [], opts = {})
         endAt: bookingWindow.scheduledEndAt,
       };
 
-      if (!isWindowAvailable(candidateWindow, partnerWindows)) return null;
+      if (!isWindowAvailable(candidateWindow, partnerWindows)) {
+        windowBlockCount++;
+        return null;
+      }
 
       const distanceMeters = calculateDistanceMeters(
         booking.location,
@@ -892,6 +926,7 @@ async function findEligiblePartnersForBooking(booking, pincodes = [], opts = {})
           bookingWindow.scheduledStartAt
         )
       ) {
+        reachabilityBlockCount++;
         return null;
       }
 
@@ -928,6 +963,12 @@ async function findEligiblePartnersForBooking(booking, pincodes = [], opts = {})
     })
     .filter(Boolean)
     .sort(sortRankedPartners);
+
+  if (!ranked.length && partners.length) {
+    console.warn(
+      `[assignment] Booking ${booking?._id}: ${partners.length} DB candidates all filtered out — skill:${skillBlockCount} window:${windowBlockCount} reachability:${reachabilityBlockCount}`
+    );
+  }
 
   return ranked;
 }

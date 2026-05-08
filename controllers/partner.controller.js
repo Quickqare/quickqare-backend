@@ -598,6 +598,7 @@ exports.getPartnerBookings = async (req, res) => {
           "CONFIRMED",
           "PARTNER_ACCEPTED",
           "ON_THE_WAY",
+          "ARRIVED",
           "IN_PROGRESS",
           "COMPLETED",
         ],
