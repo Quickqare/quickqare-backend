@@ -162,8 +162,13 @@ io.use((socket, next) => {
     try { payload = jwt.verify(token, partnerSecret); } catch (_) {
       try { payload = jwt.verify(token, userSecret); } catch (__) { return next(); }
     }
-    if (payload?.partnerId) socket.verifiedPartnerId = String(payload.partnerId);
-    if (payload?.userId || payload?.sub) socket.verifiedUserId = String(payload?.userId || payload?.sub);
+    // Partner tokens are signed { id, role: "partner" } — check role+id first,
+    // then fall back to a legacy partnerId field if ever used.
+    if (payload?.role === "partner" && (payload?.id || payload?.partnerId)) {
+      socket.verifiedPartnerId = String(payload?.id || payload?.partnerId);
+    } else if (payload?.userId || payload?.sub) {
+      socket.verifiedUserId = String(payload?.userId || payload?.sub);
+    }
   } catch (_) { /* non-fatal — allow unauthenticated */ }
   next();
 });

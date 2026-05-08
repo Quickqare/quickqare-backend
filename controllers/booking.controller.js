@@ -274,7 +274,7 @@ exports.createBooking = async (req, res) => {
           const normalizedItemName = normalizeText(item.name);
           if (
             hasBridalDesign &&
-            (normalizedItemName === "basic feet" || normalizedItemName === "feet")
+            (normalizedItemName.includes("basic feet") || normalizedItemName === "feet")
           ) {
             return {
               ...item,
@@ -1486,3 +1486,4 @@ exports.getBookingById = async (req, res) => {
     return res.status(500).json({ success: false, message: "Server error" });
   }
 };
+

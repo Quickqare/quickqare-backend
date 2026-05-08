@@ -3,6 +3,7 @@ const User = require("../models/User");
 const {
   findEligiblePartnersForBooking,
   syncPartnerOperationalState,
+  buildDateTime,
   AC_CATEGORY_SLUGS,
   AC_MAX_CAPACITY_MINUTES,
 } = require("./scheduling_service");
@@ -165,7 +166,7 @@ async function computeRequiredPartners(booking) {
 ASSIGN BOOKING
 =====================================================
 */
-async function assignBooking(bookingId) {
+async function assignBooking(bookingId, opts = {}) {
   try {
     // Self-heal: if a previous assignBooking crashed or was killed mid-run,
     // the booking will be stuck in ASSIGNING_LOCK forever. Reset locks older
@@ -193,6 +194,18 @@ async function assignBooking(bookingId) {
 
     const acBooking = isACBooking(booking);
 
+    // For future bookings (scheduled more than 30 min from now) we don't require
+    // partners to be online RIGHT NOW — they only need to be approved and available.
+    // They will come online before the actual service. Requiring online=true for
+    // next-day bookings means zero partners match and the booking hits NO_PARTNER_AVAILABLE.
+    const scheduledStart = booking.scheduledStartAt
+      ? new Date(booking.scheduledStartAt)
+      : buildDateTime(booking.scheduledDate, booking.scheduledTime);
+    const minutesToService = (scheduledStart.getTime() - Date.now()) / (1000 * 60);
+    const requireOnline = opts.requireOnline !== undefined
+      ? opts.requireOnline
+      : minutesToService <= 30; // only require online for imminent bookings
+
     for (let stage = booking.assignmentStage || 1; stage <= 3; stage += 1) {
       booking.assignmentStage = stage;
       await booking.save();
@@ -211,7 +224,8 @@ async function assignBooking(bookingId) {
 
       const rankedPartners = await findEligiblePartnersForBooking(
         booking,
-        pincodesToSearch
+        pincodesToSearch,
+        { requireOnline }
       );
 
       if (!rankedPartners.length) {
