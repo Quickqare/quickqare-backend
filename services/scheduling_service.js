@@ -546,6 +546,17 @@ function getPartnerSkillMatchLevel(partner, requestContext) {
   const partnerSubCategories = collectPartnerSubCategories(partner);
   const partnerCategories = collectPartnerCategories(partner);
 
+  // Legacy partners may not yet have migrated service snapshots.
+  // If admin zone already allows the booking category, keep them eligible
+  // instead of collapsing every slot to zero.
+  if (
+    partnerServiceIds.size === 0 &&
+    partnerSubCategories.size === 0 &&
+    partnerCategories.size === 0
+  ) {
+    return 1;
+  }
+
   // Smart onboarded partners (strict check)
   if (partnerServiceIds.size > 0) {
     if (!requestedServiceIds.length) return 1;
@@ -594,6 +605,12 @@ function calculateDistanceMeters(origin, destination) {
   const [lng2, lat2] = destination.coordinates.map(Number);
 
   if (![lng1, lat1, lng2, lat2].every(Number.isFinite)) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  // [0,0] is the schema default, not a real partner/customer location.
+  // Treat it as unknown so it does not block zone-based slot availability.
+  if ((lng1 === 0 && lat1 === 0) || (lng2 === 0 && lat2 === 0)) {
     return Number.POSITIVE_INFINITY;
   }
 
@@ -825,17 +842,10 @@ async function findEligiblePartnersForBooking(booking, pincodes = [], opts = {})
     query.skillTier = { $gte: requestContext.requiredSkillTier };
   }
 
-  if (
-    Array.isArray(booking?.location?.coordinates) &&
-    booking.location.coordinates.length === 2
-  ) {
-    query.location = {
-      $near: {
-        $geometry: booking.location,
-        $maxDistance: MAX_RADIUS_METERS,
-      },
-    };
-  }
+  // Do not apply $near as a hard DB filter here.
+  // Partner coordinates may be missing/default [0,0] until the partner app sends
+  // live GPS. Zone + service eligibility is the source of truth for slot
+  // visibility; valid GPS is used later only for ranking/reachability.
 
   const partners = await Partner.find(query);
   if (!partners.length) return [];

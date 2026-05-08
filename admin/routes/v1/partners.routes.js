@@ -346,4 +346,62 @@ router.patch("/:id/subscription", audit("admin.partners.subscription"), async (r
   }
 });
 
+router.delete("/:id", audit("admin.partners.delete"), async (req, res) => {
+  try {
+    const partnerId = asSingleString(req.params.id);
+    if (!partnerId || !mongoose.Types.ObjectId.isValid(partnerId)) {
+      return fail(res, 400, "INVALID_ID", "Invalid partner id", null, { requestId: req.requestId });
+    }
+
+    const pid = new mongoose.Types.ObjectId(partnerId);
+    const [partner, activeBookings] = await Promise.all([
+      Partner.findById(partnerId).lean(),
+      Booking.countDocuments({
+        $or: [{ partner: pid }, { additionalPartners: pid }],
+        status: { $in: ACTIVE_STATUSES },
+      }),
+    ]);
+
+    if (!partner) {
+      return fail(res, 404, "NOT_FOUND", "Partner not found", null, { requestId: req.requestId });
+    }
+
+    if (activeBookings > 0) {
+      return fail(
+        res,
+        409,
+        "PARTNER_HAS_ACTIVE_BOOKINGS",
+        "Cannot delete partner with active bookings. Complete, cancel, or reassign active jobs first.",
+        null,
+        { requestId: req.requestId, activeBookings }
+      );
+    }
+
+    await Promise.all([
+      Partner.deleteOne({ _id: pid }),
+      PartnerWallet.deleteMany({ partnerId: pid }),
+    ]);
+
+    if (global.io) {
+      global.io.to(`partner_${partnerId}`).emit("partner_account_deleted", {
+        message: "Your partner account was deleted by admin. Please sign up again.",
+      });
+    }
+
+    return success(
+      res,
+      {
+        deleted: true,
+        partnerId,
+        phone: partner.phone,
+      },
+      { requestId: req.requestId }
+    );
+  } catch (error) {
+    return fail(res, 500, "PARTNER_DELETE_FAILED", "Unable to delete partner", error.message, {
+      requestId: req.requestId,
+    });
+  }
+});
+
 module.exports = router;
