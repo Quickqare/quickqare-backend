@@ -13,9 +13,8 @@ const {
 } = require("../services/zone.service");
 
 function toPartnerJobPayload(booking, partnerId) {
-  const firstService = booking?.services?.[0] || {};
-  const firstServiceName =
-    firstService?.name || booking?.serviceCategory || "Service";
+  const firstService = Array.isArray(booking?.services) ? booking.services[0] || {} : {};
+  const firstServiceName = String(firstService?.name || booking?.serviceCategory || "Service");
   const customerLongitude = Array.isArray(booking?.location?.coordinates)
     ? Number(booking.location.coordinates[0])
     : null;
@@ -28,7 +27,8 @@ function toPartnerJobPayload(booking, partnerId) {
   let isPrimary = true;
 
   if (partnerId) {
-    const allocations = booking.get("teamAllocations") || [];
+    // booking is a lean() plain object — use direct property access, not .get()
+    const allocations = Array.isArray(booking.teamAllocations) ? booking.teamAllocations : [];
     const myAllocation = allocations.find(a => a.partnerId?.toString() === partnerId.toString());
     if (allocations.length > 1) isTeamJob = true;
     if (myAllocation) {
@@ -37,6 +37,10 @@ function toPartnerJobPayload(booking, partnerId) {
     }
   }
 
+  // CONFIRMED = auto-accepted on the backend. Return PARTNER_ACCEPTED so the
+  // partner app treats it identically to a manually accepted job.
+  const partnerStatus = booking?.status === "CONFIRMED" ? "PARTNER_ACCEPTED" : (booking?.status || "ASSIGNED");
+
   return {
     id: String(booking?._id || ""),
     bookingId: String(booking?._id || ""),
@@ -44,7 +48,7 @@ function toPartnerJobPayload(booking, partnerId) {
     serviceCategory: booking?.serviceCategory || firstService?.category || "general",
     customerName: booking?.user?.name || "Customer",
     customerPhone: booking?.user?.phone || "",
-    address: booking?.address?.trim() || "",
+    address: String(booking?.address || "").trim(),
     pincode: booking?.pincode ? String(booking.pincode) : "",
     customerLatitude: Number.isFinite(customerLatitude) ? customerLatitude : null,
     customerLongitude: Number.isFinite(customerLongitude) ? customerLongitude : null,
@@ -54,7 +58,7 @@ function toPartnerJobPayload(booking, partnerId) {
     isPrimary,
     scheduledDate: booking?.scheduledDate || null,
     scheduledTime: booking?.scheduledTime || "",
-    status: booking?.status || "ASSIGNED",
+    status: partnerStatus,
     autoAccepted: booking?.status === "CONFIRMED",
     createdAt: booking?.createdAt || new Date(),
     updatedAt: booking?.updatedAt || new Date(),
@@ -589,6 +593,12 @@ exports.submitEstimate = async (req, res) => {
 exports.getPartnerBookings = async (req, res) => {
   try {
     const partnerId = req.partner?._id;
+    if (!partnerId) {
+      return res.status(401).json({
+        success: false,
+        message: "Partner auth required",
+      });
+    }
 
     const bookings = await Booking.find({
       $or: [{ partner: partnerId }, { additionalPartners: partnerId }],
@@ -608,10 +618,22 @@ exports.getPartnerBookings = async (req, res) => {
       .sort({ createdAt: -1 })
       .lean();
 
+    const payloads = [];
+    for (const booking of bookings) {
+      try {
+        payloads.push(toPartnerJobPayload(booking, partnerId));
+      } catch (itemErr) {
+        console.error("getPartnerBookings item error:", {
+          bookingId: booking?._id?.toString?.() || String(booking?._id || ""),
+          message: itemErr.message,
+        });
+      }
+    }
+
     return res.json({
       success: true,
-      count: bookings.length,
-      bookings: bookings.map(b => toPartnerJobPayload(b, partnerId)),
+      count: payloads.length,
+      bookings: payloads,
     });
   } catch (err) {
     console.error("getPartnerBookings error:", err);
