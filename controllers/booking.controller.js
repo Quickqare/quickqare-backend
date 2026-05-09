@@ -12,17 +12,20 @@ const {
   resolveZoneForPincode,
 } = require("../services/zone.service");
 const {
-  addMinutes,
   buildDateTime,
   clearSlotCache,
-  findEligiblePartnersForBooking,
   syncPartnerOperationalState,
-  SLOT_HOLDING_BOOKING_STATUSES,
 } = require("../services/scheduling_service");
 const { calculatePricing } = require("../utils/pricing");
 const { validateCouponForAmount } = require("../services/coupon.service");
+const {
+  SLOT_LOCK_MINUTES,
+  markSlotLockPaid,
+  releaseSlotCapacityByBookingId,
+  reserveSlotCapacityForBooking,
+} = require("../services/slotCapacity.service");
 
-const PAYMENT_LOCK_MINUTES = 15;
+const PAYMENT_LOCK_MINUTES = SLOT_LOCK_MINUTES;
 
 const normalizeText = (value = "") =>
   String(value).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
@@ -384,136 +387,72 @@ exports.createBooking = async (req, res) => {
     );
 
     /* =====================
-       SLOT CAPACITY GUARD
-       Prevents double-booking when two customers check the same slot
-       simultaneously or when the slot cache is slightly stale.
-       PENDING_PAYMENT bookings don't have a partner assigned yet so
-       they never appear in getBlockingWindowsByPartner — we catch them
-       here with a direct DB count before creating anything.
+       CREATE BOOKING + RESERVE SLOT CAPACITY
+       The reservation is written before payment starts so two customers cannot
+       both pay for the same limited slot.
     ===================== */
-    const activePartnersInZone = await Partner.countDocuments({
-      approvalStatus: "APPROVED",
-      isBlocked: { $ne: true },
-    });
-
-    if (activePartnersInZone > 0) {
-      // Day-bounds query: stored scheduledDate may have any time component, so
-      // strict equality misses bookings made from different timezones and lets
-      // the same slot get sold twice. Bound by [day-start, next-day-start).
-      const requestedDate = new Date(scheduledDate);
-      const dayStart = new Date(
-        requestedDate.getFullYear(),
-        requestedDate.getMonth(),
-        requestedDate.getDate(),
-        0, 0, 0, 0
-      );
-      const dayEnd = new Date(
-        requestedDate.getFullYear(),
-        requestedDate.getMonth(),
-        requestedDate.getDate() + 1,
-        0, 0, 0, 0
-      );
-
-      const conflictBookings = await Booking.find({
-        pincode,
-        scheduledDate: { $gte: dayStart, $lt: dayEnd },
-        $or: [
-          // SLOT_HOLDING_BOOKING_STATUSES includes SEARCHING / ASSIGNING_LOCK /
-          // ARRIVED so in-flight and mid-service bookings still hold capacity.
-          { status: { $in: SLOT_HOLDING_BOOKING_STATUSES } },
-          { status: "PENDING_PAYMENT", lockedUntil: { $gt: new Date() } },
-        ],
-      }).select("scheduledStartAt scheduledTime scheduledDate estimatedDurationMinutes lockedCapacityMinutes");
-
-      const overlappingCount = conflictBookings.filter((b) => {
-        const bStart = b.scheduledStartAt
-          ? new Date(b.scheduledStartAt)
-          : buildDateTime(b.scheduledDate, b.scheduledTime || "09:00");
-        const bDurMs =
-          (b.lockedCapacityMinutes || b.estimatedDurationMinutes || 60) * 60 * 1000;
-        const bEnd = new Date(bStart.getTime() + bDurMs);
-        return bStart < scheduledEndAt && bEnd > scheduledStartAt;
-      }).length;
-
-      if (overlappingCount >= activePartnersInZone) {
-        return res.status(409).json({
-          success: false,
-          message: "This slot is no longer available. Please go back and select another time.",
-        });
-      }
-    }
-
-    const slotCandidates = await findEligiblePartnersForBooking(
-      {
-        services: bookingServices,
-        serviceId,
-        serviceCategory:
-          typeof serviceCategory === "string" && serviceCategory.trim()
-            ? serviceCategory.trim()
-            : bookingServices[0]?.category || "general",
-        scheduledDate: new Date(scheduledDate),
-        scheduledTime,
-        scheduledStartAt,
-        scheduledEndAt,
-        estimatedDurationMinutes,
-        location,
-        pincode,
-        rejectedPartners: [],
-      },
-      [],
-      // Booking creation is forward-looking — partner doesn't need to be online
-      // right now, only when the actual service window arrives.
-      { requireOnline: false }
-    );
-
-    if (!slotCandidates.length) {
-      return res.status(409).json({
-        success: false,
-        message: "Selected slot is no longer available",
-      });
-    }
-
-    /* =====================
-       CREATE BOOKING
-    ===================== */
-    const booking = await Booking.create({
+    const bookingPayload = {
       user: req.user._id,
-
-      // new multi service
       services: bookingServices,
       primaryService: finalPrimaryService,
-
-      // backward compatibility
       serviceCategory:
         typeof serviceCategory === "string" && serviceCategory.trim()
           ? serviceCategory.trim()
           : bookingServices[0]?.category || "general",
       serviceId: serviceId ?? finalPrimaryService ?? null,
-
-        pincode,
-        address: String(address || "").trim(),
-        couponCode: appliedCoupon ? appliedCoupon.code : null,
-        couponId: appliedCoupon ? appliedCoupon._id : null,
-        couponDiscountAmount: discountAmount,
-
-        baseAmount: pricing.baseAmount,
-        discountAmount: pricing.discountAmount,
+      pincode,
+      address: String(address || "").trim(),
+      couponCode: appliedCoupon ? appliedCoupon.code : null,
+      couponId: appliedCoupon ? appliedCoupon._id : null,
+      couponDiscountAmount: discountAmount,
+      baseAmount: pricing.baseAmount,
+      discountAmount: pricing.discountAmount,
       gstAmount: pricing.gstAmount,
       totalAmount: pricing.totalAmount,
-
       scheduledDate: new Date(scheduledDate),
       scheduledTime,
       scheduledStartAt,
       scheduledEndAt,
       estimatedDurationMinutes,
       location,
-
       lockedUntil: new Date(Date.now() + PAYMENT_LOCK_MINUTES * 60 * 1000),
       lockedCapacityMinutes: estimatedDurationMinutes,
-
       payment: { status: "PENDING" },
       status: "PENDING_PAYMENT",
-    });
+    };
+
+    const session = await mongoose.startSession();
+    let booking = null;
+
+    try {
+      await session.withTransaction(async () => {
+        const [createdBooking] = await Booking.create([bookingPayload], { session });
+        booking = createdBooking;
+
+        const reservation = await reserveSlotCapacityForBooking(booking, { session });
+        booking.slotLockId = reservation.lock._id;
+        booking.slotReservationUnits = reservation.requiredCount;
+        booking.slotReservationExpiresAt = reservation.expiresAt;
+        booking.lockedUntil = reservation.expiresAt;
+        booking.lockedCapacityMinutes = estimatedDurationMinutes;
+      });
+    } catch (reserveError) {
+      const code = reserveError?.statusCode || 500;
+      if (code === 409) {
+        return res.status(409).json({
+          success: false,
+          message: reserveError.message || "Selected slot is no longer available",
+        });
+      }
+
+      console.error("Booking reservation error:", reserveError);
+      return res.status(code).json({
+        success: false,
+        message: reserveError.message || "Booking creation failed",
+      });
+    } finally {
+      await session.endSession();
+    }
 
     // Bust the slot cache for this pincode+date so any other customer
     // immediately sees the updated availability without waiting for TTL.
@@ -544,6 +483,8 @@ exports.afterPaymentSuccess = async (req, res) => {
 
     booking.payment.status = "PAID";
     booking.lockedUntil = null; // Convert lock to permanent capacity
+    booking.slotReservationExpiresAt = null;
+    await markSlotLockPaid(booking._id);
 
     const scheduledStart = booking.scheduledStartAt 
       ? new Date(booking.scheduledStartAt) 
@@ -1210,6 +1151,10 @@ exports.cancelBookingByUser = async (req, res) => {
         message: "Booking state changed during cancellation. Please refresh." 
       });
     }
+
+    await releaseSlotCapacityByBookingId(booking._id, {
+      releaseReason: "user_cancelled",
+    });
 
     // Free up partner availability
     if (booking.partner) {

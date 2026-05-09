@@ -608,4 +608,5 @@ module.exports = {
   assignBooking,
   reassignBooking,
   isACBooking,
+  computeRequiredPartners,
 };

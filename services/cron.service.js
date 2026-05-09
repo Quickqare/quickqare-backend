@@ -8,6 +8,7 @@ No external scheduler library required.
 
 const STALE_HOURS = 48;
 const CHECK_INTERVAL_MS = 30 * 60 * 1000; // every 30 minutes
+const SLOT_LOCK_CHECK_INTERVAL_MS = 5 * 60 * 1000; // every 5 minutes
 
 // QUEUED bookings are dispatched when they are this many hours before service.
 // 3 hours gives the partner enough notice while not assigning too far in advance.
@@ -35,6 +36,7 @@ Rules:
 async function cancelStaleBookings() {
   try {
     const Booking = require("../models/Booking");
+    const { releaseSlotCapacityByBookingId } = require("./slotCapacity.service");
     const cutoff = new Date(Date.now() - STALE_HOURS * 60 * 60 * 1000);
     const now = new Date();
 
@@ -57,6 +59,13 @@ async function cancelStaleBookings() {
     if (!stale.length) return;
 
     const ids = stale.map((b) => b._id);
+
+    for (const id of ids) {
+      await releaseSlotCapacityByBookingId(id, {
+        releaseReason: "stale_booking_cleanup",
+      });
+    }
+
     const result = await Booking.updateMany(
       { _id: { $in: ids } },
       { $set: { status: "CANCELLED", cancelledBy: "system" } }
@@ -130,6 +139,18 @@ async function dispatchQueuedBookings() {
   }
 }
 
+async function cleanupExpiredSlotLocks() {
+  try {
+    const { cleanupExpiredSlotLocks } = require("./slotCapacity.service");
+    const result = await cleanupExpiredSlotLocks();
+    if (result?.released) {
+      console.log(`[cron] Released ${result.released} expired slot lock(s)`);
+    }
+  } catch (err) {
+    console.error("[cron] cleanupExpiredSlotLocks error:", err.message);
+  }
+}
+
 /*
 =====================================================
 INIT — called once after MongoDB connects
@@ -139,9 +160,11 @@ function initCronJobs() {
   // Run once on startup to catch stale bookings from before last restart
   cancelStaleBookings();
   dispatchQueuedBookings();
+  cleanupExpiredSlotLocks();
 
   setInterval(cancelStaleBookings, CHECK_INTERVAL_MS);
   setInterval(dispatchQueuedBookings, CHECK_INTERVAL_MS);
+  setInterval(cleanupExpiredSlotLocks, SLOT_LOCK_CHECK_INTERVAL_MS);
 
   if (process.env.NODE_ENV !== "test") {
     console.log(
@@ -150,7 +173,10 @@ function initCronJobs() {
     console.log(
       `[cron] Queued booking dispatch active (fires ${DISPATCH_HOURS_BEFORE}h before service, checks every 30 min)`
     );
+    console.log(
+      `[cron] Slot lock cleanup active (checks every 5 min, expires ${require("./slotCapacity.service").SLOT_LOCK_MINUTES} min locks)`
+    );
   }
 }
 
-module.exports = { initCronJobs, dispatchQueuedBookings };
+module.exports = { initCronJobs, dispatchQueuedBookings, cleanupExpiredSlotLocks };

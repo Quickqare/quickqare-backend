@@ -363,6 +363,22 @@ const bookingSchema = new mongoose.Schema(
       default: 0,
     },
 
+    slotLockId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "SlotLock",
+      default: null,
+    },
+
+    slotReservationUnits: {
+      type: Number,
+      default: 0,
+    },
+
+    slotReservationExpiresAt: {
+      type: Date,
+      default: null,
+    },
+
     completedAt: {
       type: Date,
       default: null,

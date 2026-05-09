@@ -4,6 +4,7 @@ const Booking = require("../models/Booking");
 const { assignBooking } = require("../services/assignmentEngine");
 const { recordCouponRedemption } = require("../services/coupon.service");
 const { buildDateTime } = require("../services/scheduling_service");
+const { releaseSlotCapacityByBookingId, markSlotLockPaid } = require("../services/slotCapacity.service");
 
 /* =====================================================
    CREATE RAZORPAY ORDER
@@ -52,6 +53,26 @@ exports.createOrder = async (req, res) => {
       return res.status(400).json({
         success: false,
         message: "Booking is not eligible for payment",
+      });
+    }
+
+    if (!booking.lockedUntil || new Date(booking.lockedUntil).getTime() <= Date.now()) {
+      await releaseSlotCapacityByBookingId(booking._id, {
+        releaseReason: "payment_order_expired",
+      });
+      booking.status = "CANCELLED";
+      booking.payment.status = "FAILED";
+      booking.cancelledBy = "system";
+      booking.cancelReason = "Payment lock expired before order creation";
+      booking.lockedUntil = null;
+      booking.slotReservationExpiresAt = null;
+      booking.slotLockId = null;
+      booking.slotReservationUnits = 0;
+      await booking.save();
+
+      return res.status(409).json({
+        success: false,
+        message: "Selected slot is no longer available",
       });
     }
 
@@ -141,6 +162,13 @@ exports.verifyPayment = async (req, res) => {
 
     if (expectedSignature !== razorpay_signature) {
       booking.payment.status = "FAILED";
+      await releaseSlotCapacityByBookingId(booking._id, {
+        releaseReason: "payment_signature_failed",
+      });
+      booking.lockedUntil = null;
+      booking.slotReservationExpiresAt = null;
+      booking.slotLockId = null;
+      booking.slotReservationUnits = 0;
       await booking.save();
 
       return res.status(400).json({
@@ -179,6 +207,11 @@ exports.verifyPayment = async (req, res) => {
         message: "Payment already verified",
       });
     }
+
+    await markSlotLockPaid(updatedBooking._id);
+    updatedBooking.lockedUntil = null;
+    updatedBooking.slotReservationExpiresAt = null;
+    await updatedBooking.save();
 
     if (updatedBooking.couponId && updatedBooking.couponCode) {
       await recordCouponRedemption({

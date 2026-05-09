@@ -2,6 +2,7 @@ const crypto = require("crypto");
 const Booking = require("../models/Booking");
 const { assignBooking } = require("../services/assignmentEngine");
 const { buildDateTime } = require("../services/scheduling_service");
+const { releaseSlotCapacityByBookingId, markSlotLockPaid } = require("../services/slotCapacity.service");
 
 /* =====================================================
    VERIFY RAZORPAY PAYMENT → AUTO ASSIGN PARTNER
@@ -64,6 +65,26 @@ exports.verifyRazorpayPayment = async (req, res) => {
       });
     }
 
+    if (!booking.lockedUntil || new Date(booking.lockedUntil).getTime() <= Date.now()) {
+      await releaseSlotCapacityByBookingId(booking._id, {
+        releaseReason: "payment_order_expired",
+      });
+      booking.status = "CANCELLED";
+      booking.payment.status = "FAILED";
+      booking.cancelledBy = "system";
+      booking.cancelReason = "Payment lock expired before verification";
+      booking.lockedUntil = null;
+      booking.slotReservationExpiresAt = null;
+      booking.slotLockId = null;
+      booking.slotReservationUnits = 0;
+      await booking.save();
+
+      return res.status(409).json({
+        success: false,
+        message: "Selected slot is no longer available",
+      });
+    }
+
     /* =====================
        VERIFY SIGNATURE
     ===================== */
@@ -81,6 +102,13 @@ exports.verifyRazorpayPayment = async (req, res) => {
 
     if (expectedSignature !== razorpay_signature) {
       booking.payment.status = "FAILED";
+      await releaseSlotCapacityByBookingId(booking._id, {
+        releaseReason: "payment_signature_failed",
+      });
+      booking.lockedUntil = null;
+      booking.slotReservationExpiresAt = null;
+      booking.slotLockId = null;
+      booking.slotReservationUnits = 0;
       await booking.save();
 
       return res.status(400).json({
@@ -120,6 +148,11 @@ exports.verifyRazorpayPayment = async (req, res) => {
         bookingId: booking._id,
       });
     }
+
+    await markSlotLockPaid(updatedBooking._id);
+    updatedBooking.lockedUntil = null;
+    updatedBooking.slotReservationExpiresAt = null;
+    await updatedBooking.save();
 
     if (hoursToService > 24) {
       return res.json({

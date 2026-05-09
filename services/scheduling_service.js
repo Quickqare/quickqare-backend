@@ -1065,22 +1065,7 @@ async function getAvailableSlotsForRequest({
 
   const now = new Date();
   const isToday = normalizeDateKey(date) === normalizeDateKey(now);
-
-  // Use day bounds rather than exact-equality on scheduledDate. The stored
-  // scheduledDate may have any time component (varies by timezone); strict
-  // equality silently misses bookings and lets the same slot be sold twice.
-  const { start: dayStartBound, end: dayEndBound } = getDayBounds(date);
-
-  const existingBookings = await Booking.find({
-    pincode,
-    scheduledDate: { $gte: dayStartBound, $lt: dayEndBound },
-    $or: [
-      { status: { $in: SLOT_HOLDING_BOOKING_STATUSES } },
-      { status: "PENDING_PAYMENT", lockedUntil: { $gt: new Date() } },
-    ],
-  }).select(
-    "scheduledStartAt scheduledTime scheduledDate estimatedDurationMinutes lockedCapacityMinutes serviceCategory"
-  );
+  const { getSlotAvailabilitySnapshot } = require("./slotCapacity.service");
 
   const slotResults = [];
   const dayStart = buildDateTime(
@@ -1127,23 +1112,35 @@ async function getAvailableSlotsForRequest({
 
     if (!rankedPartners.length) continue;
 
-    // Per-slot capacity check: count bookings that actually overlap THIS time window.
-    // A daily-aggregate check would block afternoon slots because of a morning booking
-    // (the two don't share capacity — a partner free at 2 PM can take a new job).
-    const overlappingCount = existingBookings.filter((b) => {
-      const bStart = b.scheduledStartAt
-        ? new Date(b.scheduledStartAt)
-        : buildDateTime(b.scheduledDate, b.scheduledTime || "09:00");
-      const bDur = b.lockedCapacityMinutes || b.estimatedDurationMinutes || 60;
-      const bEnd = addMinutes(bStart, bDur);
-      return bStart < slotEnd && bEnd > slotStart;
-    }).length;
-    if (overlappingCount >= rankedPartners.length) continue;
+    const snapshot = await getSlotAvailabilitySnapshot(
+      {
+        services: requestContext.requestServices.map((item) => ({
+          serviceId: item.serviceId,
+          quantity: item.quantity || 1,
+          category: item.category,
+          subCategory: item.subCategory,
+        })),
+        serviceId,
+        serviceCategory,
+        scheduledDate: date,
+        scheduledTime: getTimeLabel(slotStart),
+        scheduledStartAt: slotStart,
+        scheduledEndAt: slotEnd,
+        estimatedDurationMinutes: durationMinutes,
+        location,
+        pincode,
+        rejectedPartners: [],
+      },
+      slotStart,
+      slotEnd
+    );
+
+    if (snapshot.availableUnits < snapshot.requiredCount) continue;
 
     slotResults.push({
       time: getTimeLabel(slotStart),
       durationMinutes,
-      availablePartners: rankedPartners.length,
+      availablePartners: snapshot.availableUnits,
       bestPartnerDistanceMeters: Number.isFinite(
         rankedPartners[0].distanceMeters
       )
