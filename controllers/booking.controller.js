@@ -1,4 +1,3 @@
-const crypto = require("crypto");
 const Booking = require("../models/Booking");
 const Partner = require("../models/Partner");
 const Service = require("../models/service.model");
@@ -647,7 +646,6 @@ exports.getAvailableSlots = async (req, res) => {
    PARTNER STARTS TRAVEL
    Guards: must be assigned partner; status must be PARTNER_ACCEPTED or CONFIRMED.
    Side effects:
-     - generates 4-digit OTP (customer must read it out at door)
      - estimates ETA from partner location → customer location
      - notifies user via socket
 ======================= */
@@ -678,9 +676,6 @@ exports.markOnTheWay = async (req, res) => {
         message: `Cannot mark on-the-way from status ${booking.status}`,
       });
     }
-
-    // OTP — 4-digit, persisted hidden (select: false)
-    const otp = String(crypto.randomInt(1000, 10000));
 
     // ETA — naive haversine + 3 min/km (Indian traffic baseline)
     let etaMinutes = null;
@@ -714,16 +709,14 @@ exports.markOnTheWay = async (req, res) => {
     }
 
     booking.status = "ON_THE_WAY";
-    booking.serviceStartOtp = otp;
     booking.estimatedArrivalAt = estimatedArrivalAt;
     await booking.save();
 
-    // Notify user with OTP and ETA — they show OTP to partner at the door
+    // Notify user with ETA only.
     if (global.io) {
       global.io.to(`user_${booking.user}`).emit("booking_update", {
         bookingId: booking._id.toString(),
         status: "ON_THE_WAY",
-        serviceStartOtp: otp,
         etaMinutes,
         estimatedArrivalAt,
       });
@@ -788,20 +781,17 @@ exports.markArrived = async (req, res) => {
 };
 
 /* =======================
-   PARTNER STARTS SERVICE — REQUIRES OTP
-   Customer reads out their 4-digit OTP at the door.
-   Prevents partner from marking IN_PROGRESS without being on-site.
+   PARTNER STARTS SERVICE
+   Transition from arrival to in-progress without OTP gating.
 ======================= */
 exports.startService = async (req, res) => {
   try {
     const { bookingId } = req.params;
-    const { otp } = req.body || {};
     const partnerId = req.partner?._id;
 
     if (!partnerId) return res.status(401).json({ message: "Partner auth required" });
-    if (!otp) return res.status(400).json({ message: "OTP required" });
 
-    const booking = await Booking.findById(bookingId).select("+serviceStartOtp");
+    const booking = await Booking.findById(bookingId);
     if (!booking) return res.status(404).json({ message: "Booking not found" });
 
     const pid = String(partnerId);
@@ -818,25 +808,12 @@ exports.startService = async (req, res) => {
       });
     }
 
-    const providedOtp = String(otp).trim();
-    const storedOtp   = booking.serviceStartOtp || "";
-    const otpValid =
-      storedOtp.length > 0 &&
-      providedOtp.length === storedOtp.length &&
-      crypto.timingSafeEqual(Buffer.from(providedOtp), Buffer.from(storedOtp));
-
-    if (!otpValid) {
-      return res.status(400).json({ message: "Invalid OTP" });
-    }
-
     // ATOMIC UPDATE: Prevent race conditions
     const updatedBooking = await Booking.findOneAndUpdate(
       { _id: bookingId, status: booking.status },
       {
         $set: {
           status: "IN_PROGRESS",
-          otpVerifiedAt: new Date(),
-          serviceStartOtp: null // burn the OTP after use
         }
       },
       { new: true }

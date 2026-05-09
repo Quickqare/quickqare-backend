@@ -97,7 +97,7 @@ router.patch(
   bookingController.markArrived
 );
 
-// Body: { otp: "1234" } — OTP given to customer when partner went on-the-way
+// Partner starts service after arrival
 router.patch(
   "/start/:bookingId",
   partnerAuth,

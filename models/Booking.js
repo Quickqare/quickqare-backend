@@ -313,7 +313,7 @@ const bookingSchema = new mongoose.Schema(
     },
 
     /* ======================
-       ARRIVAL & OTP
+       ARRIVAL TRACKING
     ====================== */
     estimatedArrivalAt: {
       type: Date,
@@ -321,19 +321,6 @@ const bookingSchema = new mongoose.Schema(
     },
 
     arrivedAt: {
-      type: Date,
-      default: null,
-    },
-
-    // 4-digit OTP shown to customer; partner enters it to start service.
-    // Generated when partner marks ON_THE_WAY.
-    serviceStartOtp: {
-      type: String,
-      default: null,
-      select: false, // never returned in normal queries — only via explicit .select("+serviceStartOtp")
-    },
-
-    otpVerifiedAt: {
       type: Date,
       default: null,
     },
