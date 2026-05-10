@@ -87,11 +87,7 @@ async function getSlotAvailabilitySnapshot(booking, slotStart, slotEnd, session)
     {
       $setOnInsert: {
         slotKey,
-        pincode: String(booking.pincode || "").trim(),
-        dateKey,
-        time,
         reservedUnits: 0,
-        totalUnits: eligibleUnits,
       },
       $set: {
         pincode: String(booking.pincode || "").trim(),
@@ -146,6 +142,9 @@ async function reserveSlotCapacityForBooking(booking, { session } = {}) {
       {
         $inc: { reservedUnits: requiredCount },
         $set: {
+          pincode: String(booking.pincode || "").trim(),
+          dateKey: snapshot.dateKey,
+          time: snapshot.time,
           totalUnits: snapshot.eligibleUnits,
           updatedAt: new Date(),
         },
