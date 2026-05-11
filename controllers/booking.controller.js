@@ -15,6 +15,8 @@ const {
   buildDateTime,
   clearSlotCache,
   syncPartnerOperationalState,
+  AC_MAX_CAPACITY_MINUTES,
+  AC_CATEGORY_SLUGS,
 } = require("../services/scheduling_service");
 const { calculatePricing } = require("../utils/pricing");
 const { validateCouponForAmount } = require("../services/coupon.service");
@@ -119,10 +121,22 @@ exports.createBooking = async (req, res) => {
     } = req.body;
 
     if (!pincode) {
-      return res.status(400).json({
-        success: false,
-        message: "pincode is required",
-      });
+      return res.status(400).json({ success: false, message: "pincode is required" });
+    }
+
+    if (!scheduledDate || !scheduledTime) {
+      return res.status(400).json({ success: false, message: "scheduledDate and scheduledTime are required" });
+    }
+
+    // Validate that the date + time form a real future slot before any DB work.
+    let _slotCheck;
+    try {
+      _slotCheck = buildDateTime(scheduledDate, scheduledTime);
+    } catch (dtErr) {
+      return res.status(400).json({ success: false, message: dtErr.message });
+    }
+    if (_slotCheck.getTime() < Date.now() - 5 * 60 * 1000) {
+      return res.status(400).json({ success: false, message: "Cannot book a slot that is already in the past" });
     }
 
     const zone = await resolveZoneForPincode(pincode);
@@ -132,10 +146,16 @@ exports.createBooking = async (req, res) => {
         message: "Service not available in this pincode",
       });
     }
-    if (zone.customerAppEnabled === false || zone.partnerAppEnabled === false) {
+    if (zone.customerAppEnabled === false) {
       return res.status(403).json({
         success: false,
-        message: "Customer app is disabled for this pincode",
+        message: "Bookings are currently paused for this pincode",
+      });
+    }
+    if (zone.partnerAppEnabled === false) {
+      return res.status(403).json({
+        success: false,
+        message: "Service is currently unavailable in this pincode",
       });
     }
 
@@ -302,18 +322,6 @@ exports.createBooking = async (req, res) => {
         });
       }
 
-      const zoneServiceKeys = getZoneServiceKeysFromValues([
-        serviceCategory,
-        ...bookingServices.map((item) => item.category),
-        ...bookingServices.map((item) => item.name),
-      ]);
-
-      if (!isZoneServiceEnabled(zone, zoneServiceKeys)) {
-        return res.status(403).json({
-          success: false,
-          message: "Selected service is not enabled in this pincode",
-        });
-      }
     }
 
     /* =====================
@@ -327,6 +335,37 @@ exports.createBooking = async (req, res) => {
           message: "Invalid serviceId",
         });
       }
+
+      // Fetch the service so the zone-service validation below has its
+      // category/name to inspect. Without this, legacy single-service bookings
+      // bypass the zone-service-enablement check entirely.
+      const Service = require("../models/service.model");
+      const legacyService = await Service.findById(serviceId).lean();
+      if (!legacyService) {
+        return res.status(404).json({
+          success: false,
+          message: `Service not found: ${serviceId}`,
+        });
+      }
+
+      const legacyCategorySlug = await resolveServiceCategorySlug(legacyService);
+
+      // Push one representative entry so the outer zone check picks it up.
+      // Pricing stays on the legacy BASE_PRICE path below — this is for
+      // validation only.
+      bookingServices.push({
+        serviceId: legacyService._id,
+        name: legacyService.name,
+        price: 500,
+        lineTotal: 500,
+        quantity: 1,
+        category:
+          legacyCategorySlug ||
+          (legacyService.category ? String(legacyService.category) : ""),
+        subCategory: legacyService.subCategory
+          ? String(legacyService.subCategory)
+          : "",
+      });
 
       const BASE_PRICE = 500; // your existing logic
       baseAmount = BASE_PRICE;
@@ -381,7 +420,22 @@ exports.createBooking = async (req, res) => {
     });
 
     const scheduledStartAt = buildDateTime(scheduledDate, scheduledTime);
-    const estimatedDurationMinutes = Math.min(Math.max(totalDurationMinutes || 60, 1), 240);
+
+    // Use the AC capacity ceiling for air-conditioning jobs; 240 min for everything else.
+    const allCategories = [
+      serviceCategory,
+      ...bookingServices.map((s) => s.category),
+      ...bookingServices.map((s) => s.name),
+    ].map((v) => String(v || "").toLowerCase());
+    const isAC = AC_CATEGORY_SLUGS.some((slug) =>
+      allCategories.some((c) => c.includes(slug))
+    );
+    const maxDurationMinutes = isAC ? AC_MAX_CAPACITY_MINUTES : 240;
+    const estimatedDurationMinutes = Math.min(
+      Math.max(totalDurationMinutes || 60, 1),
+      maxDurationMinutes
+    );
+
     const scheduledEndAt = new Date(
       scheduledStartAt.getTime() + estimatedDurationMinutes * 60 * 1000
     );
@@ -702,15 +756,22 @@ exports.markArrived = async (req, res) => {
       });
     }
 
-    booking.status = "ARRIVED";
-    booking.arrivedAt = new Date();
-    await booking.save();
+    const arrivedAt = new Date();
+    const updated = await Booking.findOneAndUpdate(
+      { _id: bookingId, status: "ON_THE_WAY" },
+      { $set: { status: "ARRIVED", arrivedAt } },
+      { new: true }
+    );
+
+    if (!updated) {
+      return res.status(409).json({ message: "Booking status changed concurrently — please refresh" });
+    }
 
     if (global.io) {
-      global.io.to(`user_${booking.user}`).emit("booking_update", {
-        bookingId: booking._id.toString(),
+      global.io.to(`user_${updated.user}`).emit("booking_update", {
+        bookingId: updated._id.toString(),
         status: "ARRIVED",
-        arrivedAt: booking.arrivedAt,
+        arrivedAt,
       });
     }
 
@@ -826,8 +887,20 @@ exports.completeBooking = async (req, res) => {
     // --- INDIVIDUAL PAYOUT & COMPLETION ---
     if (partnerId && teamAllocations.length > 0) {
       const allocation = teamAllocations.find(a => a.partnerId?.toString() === partnerId.toString());
-      
-      if (allocation) {
+
+      // If we have team allocations but this partner isn't in them, the booking
+      // data is inconsistent — fail loudly instead of silently paying ₹0.
+      if (!allocation) {
+        console.error(
+          `[completeBooking] Partner ${partnerId} authorized on booking ${bookingId} but missing from teamAllocations`
+        );
+        return res.status(409).json({
+          success: false,
+          message: "Your allocation on this booking is missing. Please contact support.",
+        });
+      }
+
+      {
         if (allocation.status === "COMPLETED") {
           return res.status(400).json({ success: false, message: "You have already completed your part." });
         }
@@ -993,7 +1066,7 @@ exports.completeBooking = async (req, res) => {
 
     res.json({
       success: true,
-      message: `Booking fully completed! ₹${currentPartnerShare} credited to your wallet.`,
+      message: `Booking fully completed by your team! Your share of ₹${currentPartnerShare} was credited to your wallet.`,
       settlement,
     });
   } catch (error) {
@@ -1031,7 +1104,10 @@ exports.cancelBooking = async (req, res) => {
     ===================== */
     const now = new Date();
     const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-    const diffDays = (now - new Date(partner.lastCancelReset || 0)) / (1000 * 60 * 60 * 24);
+    // Use epoch (0) as the safe default so a null lastCancelReset always triggers a reset,
+    // rather than comparing against NaN (which is what `new Date(null)` produces in some runtimes).
+    const lastReset = partner.lastCancelReset ? new Date(partner.lastCancelReset) : new Date(0);
+    const diffDays = (now.getTime() - lastReset.getTime()) / (1000 * 60 * 60 * 24);
 
     if (diffDays >= 7) {
       partner.weeklyCancelCount = 0;
@@ -1058,14 +1134,48 @@ exports.cancelBooking = async (req, res) => {
     await partner.save();
     await syncPartnerOperationalState(partner._id);
 
+    // Atomically release the booking before kicking off reassignment.
+    // Without this, if reassignBooking later throws inside its internal
+    // try/catch, the booking stays pointed at this partner forever (zombie
+    // state). With it, the booking is at minimum left in SEARCHING for a
+    // retry/admin recovery, even if reassignment fails.
+    const releasedBooking = await Booking.findOneAndUpdate(
+      {
+        _id: booking._id,
+        status: { $in: ["ASSIGNED", "CONFIRMED", "PARTNER_ACCEPTED", "ON_THE_WAY", "ARRIVED"] },
+      },
+      {
+        $set: { status: "SEARCHING", partner: null },
+      },
+      { new: true }
+    );
+
+    if (!releasedBooking) {
+      return res.status(409).json({
+        success: false,
+        message: "Booking state changed during cancellation — please refresh",
+      });
+    }
+
+    // Tell the customer immediately so their BookingStatusScreen flips back
+    // to "Searching for Partner" instead of staying on the cancelled assignment.
+    if (global.io) {
+      global.io.to(`user_${releasedBooking.user}`).emit("booking_update", {
+        bookingId: releasedBooking._id.toString(),
+        status: "SEARCHING",
+      });
+    }
+
     // Bust slot cache so the freed slot is visible to other customers
     // immediately (without waiting for the 30s TTL).
     clearSlotCache(booking.pincode, booking.scheduledDate);
 
     /* =====================
        REASSIGN BOOKING
+       skipPartnerPenalty: we already incremented weeklyCancelCount above.
+       Without the flag, reassignBooking would double-count this strike.
     ===================== */
-    await reassignBooking(booking._id, partner._id);
+    await reassignBooking(booking._id, partner._id, { skipPartnerPenalty: true });
 
     res.json({
       success: true,
@@ -1181,7 +1291,7 @@ exports.cancelBookingByUser = async (req, res) => {
       refund: {
         percent: refund.percent,
         amount: refund.amount,
-        status: booking.refundStatus,
+        status: updatedBooking.refundStatus,
       },
       cancellationFee: Number(booking.totalAmount || 0) - refund.amount,
     });
@@ -1268,6 +1378,9 @@ exports.getMyBookings = async (req, res) => {
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limit)
+        .populate("partner", "name phone")
+        .populate("services.serviceId", "name imageUrl duration")
+        .populate("primaryService", "name imageUrl duration")
         .lean(),
       Booking.countDocuments({ user: req.user._id }),
     ]);
@@ -1328,13 +1441,15 @@ exports.getEstimate = async (req, res) => {
       return res.status(404).json({ success: false, message: "No estimate available for this booking" });
     }
 
+    const estimatePricing = calculatePricing({ baseAmount: booking.estimateTotal });
+
     return res.json({
       success: true,
       estimate: {
         items: booking.estimateItems,
-        baseAmount: booking.estimateTotal,
-        gstAmount: 0,
-        totalAmount: booking.estimateTotal,
+        baseAmount: estimatePricing.baseAmount,
+        gstAmount: estimatePricing.gstAmount,
+        totalAmount: estimatePricing.totalAmount,
         status: booking.estimateStatus,
         submittedAt: booking.estimateSubmittedAt,
       },

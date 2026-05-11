@@ -156,6 +156,86 @@ async function init() {
     useBullMQ = await initBullMQ();
   }
   driverReady = true;
+
+  // Surface in-process driver risk loudly in production. Multi-instance
+  // deployments MUST set ACKQ_DRIVER=bullmq + REDIS_URL — otherwise pending
+  // ACK timers are only known to the instance that scheduled them, and a
+  // crash/deploy silently drops them.
+  if (!useBullMQ && String(process.env.NODE_ENV).toLowerCase() === "production") {
+    console.warn(
+      "[ack-timeout] WARNING — running with in-process driver in production. " +
+        "Set ACKQ_DRIVER=bullmq and REDIS_URL for multi-instance safety."
+    );
+  }
+
+  // Resume any ACK timers that were scheduled before the last restart so we
+  // don't strand bookings in ASSIGNED-but-unacknowledged limbo. The DB check
+  // inside handleAckTimeout makes a duplicate fire safe.
+  try {
+    await resumePendingAckTimeouts();
+  } catch (err) {
+    console.error("[ack-timeout] resumePendingAckTimeouts failed:", err.message);
+  }
+}
+
+/*
+=====================================================
+RESUME PENDING ACK TIMERS ON STARTUP
+
+In-process timers are lost when the process exits. Without this resume,
+a partner assigned just before a deploy never has their ACK window enforced,
+and the booking stays in ASSIGNED forever (no reassignment, no escalation).
+
+We scan ASSIGNED bookings without ackReceivedAt that were updated recently,
+compute the remaining time, and re-schedule. Old assignments past the window
+are kicked through handleAckTimeout immediately (idempotent via DB check).
+=====================================================
+*/
+async function resumePendingAckTimeouts() {
+  const Booking = require("../models/Booking");
+  // Look back ACK_TIMEOUT_MS + a small grace — any assignment older than that
+  // has already expired and just needs an immediate handleAckTimeout.
+  const lookbackMs = ACK_TIMEOUT_MS + 5 * 60 * 1000;
+  const since = new Date(Date.now() - lookbackMs);
+
+  const pending = await Booking.find({
+    status: "ASSIGNED",
+    ackReceivedAt: null,
+    partner: { $ne: null },
+    updatedAt: { $gte: since },
+  })
+    .select("_id partner updatedAt")
+    .lean();
+
+  for (const booking of pending) {
+    const elapsedMs = Date.now() - new Date(booking.updatedAt).getTime();
+    const remainingMs = ACK_TIMEOUT_MS - elapsedMs;
+
+    if (remainingMs <= 0) {
+      // Already past the window — fire the handler immediately.
+      await handleAckTimeout(booking._id, booking.partner);
+      continue;
+    }
+
+    if (useBullMQ && bullQueue) {
+      await bullQueue.add(
+        "ack-check",
+        { bookingId: String(booking._id), partnerId: String(booking.partner) },
+        { delay: remainingMs, attempts: 1, removeOnComplete: true }
+      );
+    } else {
+      const key = String(booking._id);
+      const timer = setTimeout(async () => {
+        inProcessTimers.delete(key);
+        await handleAckTimeout(booking._id, booking.partner);
+      }, remainingMs);
+      inProcessTimers.set(key, timer);
+    }
+  }
+
+  if (pending.length) {
+    console.log(`[ack-timeout] Resumed ${pending.length} pending ACK timer(s) after restart`);
+  }
 }
 
 /**

@@ -89,9 +89,18 @@ function normalizeDateKey(dateInput) {
 
 function buildDateTime(dateInput, time = "00:00") {
   const date = new Date(dateInput);
-  const [hours, minutes] = String(time || "00:00")
-    .split(":")
-    .map((part) => Number(part) || 0);
+  if (isNaN(date.getTime())) {
+    throw new Error(`buildDateTime: invalid date "${dateInput}"`);
+  }
+
+  const timeParts = String(time || "00:00").split(":");
+  const hours   = Number(timeParts[0]) || 0;
+  const minutes = Number(timeParts[1]) || 0;
+
+  if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) {
+    throw new Error(`buildDateTime: invalid time "${time}" — hours must be 0-23, minutes 0-59`);
+  }
+
   return new Date(
     date.getFullYear(),
     date.getMonth(),

@@ -8,6 +8,7 @@ const {
   AC_MAX_CAPACITY_MINUTES,
 } = require("./scheduling_service");
 const { resolveZoneForPincode, getZoneCoveragePincodes } = require("./zone.service");
+const { escalateUnassignedBooking } = require("./escalation.service");
 
 /*
 =====================================================
@@ -202,6 +203,23 @@ async function assignBooking(bookingId, opts = {}) {
       ? new Date(booking.scheduledStartAt)
       : buildDateTime(booking.scheduledDate, booking.scheduledTime);
     const minutesToService = (scheduledStart.getTime() - Date.now()) / (1000 * 60);
+
+    // Don't assign a booking whose service window has already passed.
+    // A booking more than 60 minutes in the past is unserviceable — escalate immediately.
+    if (minutesToService < -60) {
+      booking.status = "NO_PARTNER_AVAILABLE";
+      booking.assignmentAudit.push({
+        stage: booking.assignmentStage || 1,
+        event: "NO_PARTNER_AVAILABLE",
+        searchedPincodes: [],
+        notes: `Service window already passed (${Math.round(-minutesToService)} min ago) — cannot assign`,
+        candidates: [],
+      });
+      await booking.save();
+      await escalateUnassignedBooking(booking._id);
+      return null;
+    }
+
     const requireOnline = opts.requireOnline !== undefined
       ? opts.requireOnline
       : minutesToService <= 30; // only require online for imminent bookings
@@ -244,6 +262,19 @@ async function assignBooking(bookingId, opts = {}) {
       const { requiredCount, dedicatedMinutes, taskBins } =
         await computeRequiredPartners(booking);
 
+      // Not enough eligible partners available for this stage — try the next wider zone.
+      if (rankedPartners.length < requiredCount) {
+        booking.assignmentAudit.push({
+          stage,
+          event: "INSUFFICIENT_PARTNERS",
+          searchedPincodes: pincodesToSearch,
+          notes: `Need ${requiredCount} partner(s), only ${rankedPartners.length} eligible in stage ${stage}`,
+          candidates: rankedPartners.slice(0, 5).map((e) => ({ partnerId: e.partner._id, score: e.score })),
+        });
+        await booking.save();
+        continue;
+      }
+
       const selectedPartners = rankedPartners
         .slice(0, requiredCount)
         .map((r) => r.partner);
@@ -255,20 +286,34 @@ async function assignBooking(bookingId, opts = {}) {
         .slice(requiredCount, requiredCount + 3)
         .map((r) => r.partner._id);
 
-      // Build proportional workload + payout mapping
+      // Build proportional workload + payout mapping.
+      // The last partner absorbs the rounding remainder so the ratios sum to
+      // exactly 1.0 — otherwise toFixed(4) leaves a few paise unallocated and
+      // the customer's totalAmount never fully matches sum(partner earnings).
       const allWorkloads = [...dedicatedMinutes, ...taskBins].sort(
         (a, b) => b - a
       );
       const totalWorkloadMinutes = allWorkloads.reduce((a, b) => a + b, 0) || 1;
 
-      const teamAllocations = selectedPartners.map((p, index) => ({
-        partnerId: p._id,
-        assignedMinutes: allWorkloads[index] || 0,
-        payoutRatio: Number(
-          ((allWorkloads[index] || 0) / totalWorkloadMinutes).toFixed(4)
-        ),
-        isPrimary: index === 0,
-      }));
+      let assignedRatioSum = 0;
+      const teamAllocations = selectedPartners.map((p, index) => {
+        const isLast = index === selectedPartners.length - 1;
+        let payoutRatio;
+        if (isLast) {
+          payoutRatio = Number(Math.max(1 - assignedRatioSum, 0).toFixed(4));
+        } else {
+          payoutRatio = Number(
+            ((allWorkloads[index] || 0) / totalWorkloadMinutes).toFixed(4)
+          );
+          assignedRatioSum = Number((assignedRatioSum + payoutRatio).toFixed(4));
+        }
+        return {
+          partnerId: p._id,
+          assignedMinutes: allWorkloads[index] || 0,
+          payoutRatio,
+          isPrimary: index === 0,
+        };
+      });
 
       const autoAccepted = Boolean(primaryPartner.autoAccept);
       const finalStatus = autoAccepted ? "CONFIRMED" : "ASSIGNED";
@@ -448,12 +493,7 @@ async function assignBooking(bookingId, opts = {}) {
     //   1. Admin dashboard flag
     //   2. Customer WhatsApp/SMS "finding your partner" message
     //   3. Auto free-rescheduling offer 30 min before scheduled time
-    try {
-      const { escalateUnassignedBooking } = require("./escalation.service");
-      await escalateUnassignedBooking(booking._id);
-    } catch (escErr) {
-      console.error("Escalation error:", escErr.message);
-    }
+    await escalateUnassignedBooking(booking._id);
 
     return null;
   } catch (error) {
@@ -479,7 +519,14 @@ and customer cancel (partnerId = null).
 // than by an infinite background spin.
 const MAX_REASSIGN_ATTEMPTS = 5;
 
-async function reassignBooking(bookingId, partnerId) {
+async function reassignBooking(bookingId, partnerId, options = {}) {
+  // `options.skipPartnerPenalty` lets a caller (e.g. cancelBooking HTTP) tell us
+  // they've already incremented weeklyCancelCount themselves so we don't double-count.
+  // Legacy callers passing a string (e.g. "TIMEOUT") still work — only an object
+  // with the flag set true is honoured.
+  const skipPartnerPenalty =
+    options && typeof options === "object" && options.skipPartnerPenalty === true;
+
   try {
     const booking = await Booking.findById(bookingId);
     if (!booking) return;
@@ -503,12 +550,7 @@ async function reassignBooking(bookingId, partnerId) {
       });
       await booking.save();
 
-      try {
-        const { escalateUnassignedBooking } = require("./escalation.service");
-        await escalateUnassignedBooking(booking._id);
-      } catch (escErr) {
-        console.error("Escalation error:", escErr.message);
-      }
+      await escalateUnassignedBooking(booking._id);
 
       if (global.io) {
         global.io.to(`user_${booking.user}`).emit("booking_update", {
@@ -526,27 +568,32 @@ async function reassignBooking(bookingId, partnerId) {
     if (partnerId) {
       booking.rejectedPartners.push(partnerId);
 
-      // Apply reliability penalty
-      const Partner = require("../models/Partner");
-      const rejectingPartner = await Partner.findById(partnerId);
-      if (rejectingPartner) {
-        // Post-CONFIRMED cancel is penalised double — customer trust impact is higher
-        const penalty = booking.status === "CONFIRMED" ? 2 : 1;
-        rejectingPartner.weeklyCancelCount =
-          (rejectingPartner.weeklyCancelCount || 0) + penalty;
+      // Apply reliability penalty — unless the caller (HTTP cancelBooking) has
+      // already counted this strike themselves. Without the skip flag, an HTTP
+      // partner-cancel would increment weeklyCancelCount twice (once in the
+      // controller, once here) and auto-suspend after 3 real strikes.
+      if (!skipPartnerPenalty) {
+        const Partner = require("../models/Partner");
+        const rejectingPartner = await Partner.findById(partnerId);
+        if (rejectingPartner) {
+          // Post-CONFIRMED cancel is penalised double — customer trust impact is higher
+          const penalty = booking.status === "CONFIRMED" ? 2 : 1;
+          rejectingPartner.weeklyCancelCount =
+            (rejectingPartner.weeklyCancelCount || 0) + penalty;
 
-        // Hard suspension: ≥ 5 cancellations in the rolling week
-        if (rejectingPartner.weeklyCancelCount >= 5) {
-          rejectingPartner.isAvailable = false;
-          rejectingPartner.isBlocked = true;
-          rejectingPartner.suspendedUntil = new Date(
-            Date.now() + 7 * 24 * 60 * 60 * 1000
-          );
-          console.warn(
-            `Partner ${partnerId} auto-suspended for 7 days (weeklyCancelCount = ${rejectingPartner.weeklyCancelCount})`
-          );
+          // Hard suspension: ≥ 5 cancellations in the rolling week
+          if (rejectingPartner.weeklyCancelCount >= 5) {
+            rejectingPartner.isAvailable = false;
+            rejectingPartner.isBlocked = true;
+            rejectingPartner.suspendedUntil = new Date(
+              Date.now() + 7 * 24 * 60 * 60 * 1000
+            );
+            console.warn(
+              `Partner ${partnerId} auto-suspended for 7 days (weeklyCancelCount = ${rejectingPartner.weeklyCancelCount})`
+            );
+          }
+          await rejectingPartner.save();
         }
-        await rejectingPartner.save();
       }
     }
 

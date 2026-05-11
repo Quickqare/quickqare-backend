@@ -81,8 +81,8 @@ exports.createBookingValidator = [
 
   body("services.*.price")
     .optional()
-    .isFloat({ min: 0.01 })
-    .withMessage("price must be greater than 0"),
+    .isFloat({ min: 0 })
+    .withMessage("price must be a non-negative number"),
 
   /* =====================
      PRIMARY SERVICE (NEW)

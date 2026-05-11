@@ -72,7 +72,10 @@ function getAboveElbowBridalMehendiHandsPrice(hands = 1) {
 
   if (quantity === 1) return 2000;
   if (quantity === 2) return 3500;
-  return null;
+  // 3+ hands: fall back to a 25% bulk discount on the per-hand rate, mirroring
+  // the elbow-length curve. Previously returned null → callers hit
+  // `price <= 0` and the booking was rejected with no useful explanation.
+  return Math.round(quantity * 2000 * 0.75);
 }
 
 function getMehendiPricingRuleKey(serviceName = "") {

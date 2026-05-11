@@ -523,6 +523,25 @@ exports.submitEstimate = async (req, res) => {
       });
     }
 
+    // Block re-submission after the customer has already responded. Allowed
+    // states are "none" (first estimate) and "pending" (correcting an estimate
+    // the customer hasn't acted on yet). Without this guard, a partner could
+    // spam new estimates after a rejection.
+    const currentEstimateStatus = String(booking.estimateStatus || "none");
+    if (currentEstimateStatus === "approved") {
+      return res.status(409).json({
+        success: false,
+        message: "An estimate has already been approved for this booking",
+      });
+    }
+    if (currentEstimateStatus === "rejected") {
+      return res.status(409).json({
+        success: false,
+        message:
+          "The previous estimate was rejected by the customer. Contact support if you need to revise the scope.",
+      });
+    }
+
     // Fetch live prices from CatalogItem (admin-set) so price changes are always respected
     const itemIds = items.map((i) => i.serviceId).filter(Boolean);
     const catalogItems = await CatalogItem.find({

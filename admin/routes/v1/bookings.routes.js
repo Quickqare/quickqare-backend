@@ -283,6 +283,100 @@ router.post("/:id/cancel", audit("admin.bookings.cancel"), async (req, res) => {
   }
 });
 
+// POST /:id/force-cancel — admin hard-cancel from any non-terminal status
+// Distinct from /:id/cancel (which is a soft cancel that doesn't free the
+// partner or emit sockets). Force-cancel handles partner release, socket
+// notifications, and ack-timeout cleanup in one shot.
+router.post("/:id/force-cancel", audit("admin.bookings.force_cancel"), async (req, res) => {
+  try {
+    const bookingId = asSingleString(req.params.id);
+    const reason = String(req.body.reason || "").trim();
+
+    if (!bookingId || !mongoose.Types.ObjectId.isValid(bookingId)) {
+      return fail(res, 400, "INVALID_ID", "Invalid booking id", null, { requestId: req.requestId });
+    }
+    if (!reason || reason.length < 3) {
+      return fail(res, 400, "VALIDATION_ERROR", "reason must be at least 3 characters", null, { requestId: req.requestId });
+    }
+
+    const booking = await Booking.findById(bookingId);
+    if (!booking) {
+      return fail(res, 404, "NOT_FOUND", "Booking not found", null, { requestId: req.requestId });
+    }
+
+    if (booking.status === "CANCELLED") {
+      return fail(res, 409, "ALREADY_CANCELLED", "Booking is already cancelled", null, { requestId: req.requestId });
+    }
+    if (booking.status === "COMPLETED") {
+      return fail(res, 409, "ALREADY_COMPLETED", "Completed bookings cannot be force-cancelled", null, { requestId: req.requestId });
+    }
+
+    const assignedPartnerId = booking.partner;
+
+    // Atomically flip to CANCELLED so concurrent requests are safe
+    const updated = await Booking.findOneAndUpdate(
+      { _id: bookingId, status: { $nin: ["CANCELLED", "COMPLETED"] } },
+      {
+        $set: {
+          status: "CANCELLED",
+          cancelledBy: "admin",
+          cancelReason: reason,
+        },
+      },
+      { new: true }
+    );
+
+    if (!updated) {
+      // Race: another request already cancelled or completed it
+      return fail(res, 409, "STATUS_CONFLICT", "Booking status changed concurrently — refresh and try again", null, { requestId: req.requestId });
+    }
+
+    // Release partner's active job slot
+    if (assignedPartnerId) {
+      await Partner.findByIdAndUpdate(assignedPartnerId, {
+        $inc: { activeJobs: -1 },
+      });
+    }
+
+    // Cancel any pending ACK timeout so it doesn't fire after cancellation
+    try {
+      const { cancelAckTimeout } = require("../../../services/ackTimeout.service");
+      await cancelAckTimeout(bookingId);
+    } catch (_) { /* non-fatal */ }
+
+    // Release slot capacity if still held
+    try {
+      const { releaseSlotCapacityByBookingId } = require("../../../services/slotCapacity.service");
+      await releaseSlotCapacityByBookingId(booking._id, { releaseReason: "admin_force_cancel" });
+    } catch (_) { /* non-fatal */ }
+
+    // Notify customer and partner via socket
+    if (global.io) {
+      global.io.to(`user_${updated.user}`).emit("booking_update", {
+        bookingId: updated._id.toString(),
+        status: "CANCELLED",
+        cancelReason: reason,
+      });
+      if (assignedPartnerId) {
+        global.io.to(`partner_${assignedPartnerId}`).emit("booking_cancelled", {
+          bookingId: updated._id.toString(),
+        });
+      }
+    }
+
+    await BookingTimeline.create({
+      bookingId,
+      eventType: "FORCE_CANCELLED",
+      payload: JSON.stringify({ reason, adminId: req.adminUser.id, adminEmail: req.adminUser.email }),
+      createdByAdminId: req.adminUser.id,
+    });
+
+    return success(res, { bookingId: updated._id, status: "CANCELLED" }, { requestId: req.requestId });
+  } catch (error) {
+    return fail(res, 500, "BOOKING_FORCE_CANCEL_FAILED", "Unable to force-cancel booking", error.message, { requestId: req.requestId });
+  }
+});
+
 router.post(
   "/:id/refund",
   authorize(PERMISSIONS.PAYMENTS_REFUND),

@@ -1,10 +1,6 @@
 const Razorpay = require("razorpay");
-const crypto = require("crypto");
 const Booking = require("../models/Booking");
-const { assignBooking } = require("../services/assignmentEngine");
-const { recordCouponRedemption } = require("../services/coupon.service");
-const { buildDateTime } = require("../services/scheduling_service");
-const { releaseSlotCapacityByBookingId, markSlotLockPaid } = require("../services/slotCapacity.service");
+const { releaseSlotCapacityByBookingId } = require("../services/slotCapacity.service");
 
 /* =====================================================
    CREATE RAZORPAY ORDER
@@ -85,7 +81,10 @@ exports.createOrder = async (req, res) => {
     });
 
     const order = await razorpay.orders.create({
-      amount: booking.totalAmount * 100, // convert to paise
+      // Math.round — Razorpay rejects non-integer paise amounts. Without this,
+      // a totalAmount like 1180.5 produces 118050.0 (a float) and the order
+      // create silently fails.
+      amount: Math.round(Number(booking.totalAmount || 0) * 100),
       currency: "INR",
       receipt: `booking_${booking._id}`,
     });
@@ -117,132 +116,8 @@ exports.createOrder = async (req, res) => {
   }
 };
 
-/* =====================================================
-   VERIFY PAYMENT + AUTO ASSIGN PARTNER
-===================================================== */
-exports.verifyPayment = async (req, res) => {
-  try {
-    const {
-      bookingId,
-      razorpay_payment_id,
-      razorpay_order_id,
-      razorpay_signature,
-    } = req.body;
-
-    if (
-      !bookingId ||
-      !razorpay_payment_id ||
-      !razorpay_order_id ||
-      !razorpay_signature
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Missing payment details",
-      });
-    }
-
-    const booking = await Booking.findById(bookingId);
-
-    if (!booking) {
-      return res.status(404).json({
-        success: false,
-        message: "Booking not found",
-      });
-    }
-
-    /* =====================
-       VERIFY SIGNATURE
-    ===================== */
-    const body = razorpay_order_id + "|" + razorpay_payment_id;
-
-    const expectedSignature = crypto
-      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
-      .update(body.toString())
-      .digest("hex");
-
-    if (expectedSignature !== razorpay_signature) {
-      booking.payment.status = "FAILED";
-      await releaseSlotCapacityByBookingId(booking._id, {
-        releaseReason: "payment_signature_failed",
-      });
-      booking.lockedUntil = null;
-      booking.slotReservationExpiresAt = null;
-      booking.slotLockId = null;
-      booking.slotReservationUnits = 0;
-      await booking.save();
-
-      return res.status(400).json({
-        success: false,
-        message: "Payment verification failed",
-      });
-    }
-
-    const scheduledStart = booking.scheduledStartAt 
-      ? new Date(booking.scheduledStartAt) 
-      : buildDateTime(booking.scheduledDate, booking.scheduledTime);
-
-    const timeToServiceMs = scheduledStart.getTime() - Date.now();
-    const hoursToService = timeToServiceMs / (1000 * 60 * 60);
-
-    const newStatus = hoursToService > 24 ? "QUEUED" : "PENDING_ASSIGNMENT";
-
-    // ATOMIC UPDATE: Prevent duplicate webhook & client requests from running assignment twice
-    const updatedBooking = await Booking.findOneAndUpdate(
-      { _id: bookingId, "payment.status": { $ne: "PAID" } },
-      {
-        $set: {
-          status: newStatus,
-          "payment.razorpay_payment_id": razorpay_payment_id,
-          "payment.razorpay_order_id": razorpay_order_id,
-          "payment.razorpay_signature": razorpay_signature,
-          "payment.status": "PAID"
-        }
-      },
-      { new: true }
-    );
-
-    if (!updatedBooking) {
-      return res.json({
-        success: true,
-        message: "Payment already verified",
-      });
-    }
-
-    await markSlotLockPaid(updatedBooking._id);
-    updatedBooking.lockedUntil = null;
-    updatedBooking.slotReservationExpiresAt = null;
-    await updatedBooking.save();
-
-    if (updatedBooking.couponId && updatedBooking.couponCode) {
-      await recordCouponRedemption({
-        couponId: updatedBooking.couponId,
-        bookingId: updatedBooking._id,
-        customerId: updatedBooking.user,
-        discountAmountInr: updatedBooking.discountAmount || updatedBooking.couponDiscountAmount || 0,
-      });
-    }
-
-    if (hoursToService > 24) {
-      return res.json({
-        success: true,
-        message: "Payment verified. Booking queued for partner assignment closer to the service date.",
-      });
-    } else {
-      /* =====================
-         AUTO ASSIGN PARTNER
-      ===================== */
-      await assignBooking(booking._id);
-
-      return res.json({
-        success: true,
-        message: "Payment verified. Searching for partner.",
-      });
-    }
-  } catch (error) {
-    console.error("Payment verification error:", error);
-    return res.status(500).json({
-      success: false,
-      message: "Payment verification failed",
-    });
-  }
-};
+// NOTE: Payment verification lives in controllers/paymentVerify.controller.js
+// (mounted at POST /api/payment/verify via routes/payment.routes.js). Keeping
+// two divergent verify implementations side-by-side was a real production bug
+// — only one was reachable, and they differed on coupon redemption + socket
+// emits. Single source of truth from here on.

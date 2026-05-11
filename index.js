@@ -42,9 +42,13 @@ const corsOptions = {
     const isLocalOrigin =
       /^http:\/\/localhost:\d+$/.test(origin) ||
       /^http:\/\/127\.0\.0\.1:\d+$/.test(origin);
+    // Restrict to Netlify subdomains containing "quickqare" — the previous
+    // unrestricted /^[a-zA-Z0-9-]+\.netlify\.app$/ accepted ANY Netlify site,
+    // letting an attacker who hosts code on Netlify make authenticated
+    // cross-origin requests against this API.
     const isNetlifyOrigin =
-      /^https:\/\/[a-zA-Z0-9-]+\.netlify\.app$/.test(origin) ||
-      /^https:\/\/[a-zA-Z0-9-]+\.netlify\.live$/.test(origin);
+      /^https:\/\/[a-zA-Z0-9-]*quickqare[a-zA-Z0-9-]*\.netlify\.app$/.test(origin) ||
+      /^https:\/\/[a-zA-Z0-9-]*quickqare[a-zA-Z0-9-]*\.netlify\.live$/.test(origin);
     const isQuickQareOrigin =
       /^https:\/\/[a-zA-Z0-9-]+\.quickqare\.in$/.test(origin);
 
@@ -115,7 +119,6 @@ app.use("/api/booking", require("./routes/booking.routes"));
 app.use("/api/partner/auth", require("./routes/partnerAuth.routes"));
 app.use("/api/partner", require("./routes/partner.routes"));
 app.use("/api/coupons", require("./routes/coupon.routes"));
-app.use("/api/coupon", require("./routes/coupon.routes"));
 app.use("/api/payment", require("./routes/payment.routes"));
 app.use("/api/services", require("./routes/service.routes"));
 app.use("/api/maps", require("./routes/maps.routes"));
@@ -267,9 +270,25 @@ io.on("connection", (socket) => {
         return;
       }
 
-      booking.ackReceivedAt = booking.ackReceivedAt ?? new Date();
-      booking.status = "PARTNER_ACCEPTED";
-      await booking.save();
+      // ATOMIC: flip the status here, not on the in-memory `booking` doc.
+      // Two acceptJob events on different sockets (same partner, reconnect, two
+      // devices) used to both pass the status check and both increment
+      // activeJobs. The findOneAndUpdate makes exactly one of them win.
+      const accepted = await Booking.findOneAndUpdate(
+        { _id: bookingId, status: { $in: ["ASSIGNED", "CONFIRMED"] } },
+        {
+          $set: {
+            status: "PARTNER_ACCEPTED",
+            ackReceivedAt: booking.ackReceivedAt ?? new Date(),
+          },
+        },
+        { new: true }
+      );
+
+      if (!accepted) {
+        // Another socket won the race — nothing else to do.
+        return;
+      }
 
       const { cancelAckTimeout } = require("./services/ackTimeout.service");
       await cancelAckTimeout(bookingId);
@@ -278,13 +297,13 @@ io.on("connection", (socket) => {
         $inc: { activeJobs: 1 },
       });
 
-      io.to(`user_${booking.user}`).emit("booking_update", {
-        bookingId: booking._id.toString(),
+      io.to(`user_${accepted.user}`).emit("booking_update", {
+        bookingId: accepted._id.toString(),
         status: "PARTNER_ACCEPTED",
       });
 
       io.to(`partner_${socket.partnerId}`).emit("job_accepted_confirmation", {
-        bookingId: booking._id.toString(),
+        bookingId: accepted._id.toString(),
       });
 
       console.log(`[socket] Booking ${bookingId} accepted by partner ${pid}`);

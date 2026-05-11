@@ -3,6 +3,7 @@ const Booking = require("../models/Booking");
 const { assignBooking } = require("../services/assignmentEngine");
 const { buildDateTime } = require("../services/scheduling_service");
 const { releaseSlotCapacityByBookingId, markSlotLockPaid } = require("../services/slotCapacity.service");
+const { recordCouponRedemption } = require("../services/coupon.service");
 
 /* =====================================================
    VERIFY RAZORPAY PAYMENT → AUTO ASSIGN PARTNER
@@ -154,6 +155,39 @@ exports.verifyRazorpayPayment = async (req, res) => {
     updatedBooking.slotReservationExpiresAt = null;
     await updatedBooking.save();
 
+    // Record coupon redemption — previously only the dead verifyPayment in
+    // payment.controller.js did this, so production was paying through coupons
+    // without ever marking them used. Fail-soft: a redemption-tracking error
+    // must not undo a successful payment.
+    if (updatedBooking.couponId && updatedBooking.couponCode) {
+      try {
+        await recordCouponRedemption({
+          couponId: updatedBooking.couponId,
+          bookingId: updatedBooking._id,
+          customerId: updatedBooking.user,
+          discountAmountInr:
+            updatedBooking.discountAmount ||
+            updatedBooking.couponDiscountAmount ||
+            0,
+        });
+      } catch (couponErr) {
+        console.error(
+          "[payment-verify] recordCouponRedemption failed (non-fatal):",
+          couponErr.message
+        );
+      }
+    }
+
+    // Notify the customer so BookingStatusScreen flips off PENDING_PAYMENT
+    // immediately instead of waiting for the next poll.
+    if (global.io) {
+      global.io.to(`user_${updatedBooking.user}`).emit("booking_update", {
+        bookingId: updatedBooking._id.toString(),
+        status: hoursToService > 24 ? "QUEUED" : "SEARCHING",
+        paymentConfirmed: true,
+      });
+    }
+
     if (hoursToService > 24) {
       return res.json({
         success: true,
@@ -161,6 +195,13 @@ exports.verifyRazorpayPayment = async (req, res) => {
         bookingId: booking._id,
       });
     } else {
+      // Set the public-facing SEARCHING status before assignBooking flips it to
+      // ASSIGNING_LOCK → ASSIGNED — gives the customer instant visible feedback.
+      await Booking.updateOne(
+        { _id: updatedBooking._id, status: "PENDING_ASSIGNMENT" },
+        { $set: { status: "SEARCHING" } }
+      );
+
       /* =====================
          AUTO ASSIGN PARTNER
       ===================== */
