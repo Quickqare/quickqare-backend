@@ -91,7 +91,7 @@ exports.registerPartner = async (req, res) => {
 
     const resolvedMehendiSpecializations =
       Array.isArray(mehendiSpecializations) && mehendiSpecializations.length > 0
-        ? mehendiSpecializations.map((s: string) => String(s).trim()).filter(Boolean)
+        ? mehendiSpecializations.map((s) => String(s).trim()).filter(Boolean)
         : [];
 
     const partner = await Partner.create({
