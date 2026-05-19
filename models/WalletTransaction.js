@@ -103,6 +103,25 @@ const walletTransactionSchema = new mongoose.Schema(
 ===================== */
 walletTransactionSchema.index({ partnerId: 1, createdAt: -1 });
 
+/* =====================
+   IDEMPOTENCY GUARD
+   At most one job_payment credit per { partner, booking }. creditWallet relies
+   on this unique index so a concurrent double-complete fails at insert time
+   instead of double-crediting the wallet. Partial filter keeps non-job_payment
+   rows (bonus, adjustment, withdrawal) and null-booking rows unaffected.
+===================== */
+walletTransactionSchema.index(
+  { partnerId: 1, bookingId: 1, reason: 1 },
+  {
+    unique: true,
+    name: "uniq_job_payment_per_booking",
+    partialFilterExpression: {
+      reason: "job_payment",
+      bookingId: { $type: "objectId" },
+    },
+  }
+);
+
 module.exports = mongoose.model(
   "WalletTransaction",
   walletTransactionSchema

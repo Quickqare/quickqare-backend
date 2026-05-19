@@ -13,6 +13,7 @@ const path = require("path");
 const { setSocketIO } = require("./socket/emitters");
 const { ensureBootstrapAdmin } = require("./services/adminBootstrap.service");
 const { initCronJobs } = require("./services/cron.service");
+const { notifyCustomerOfBookingStatus } = require("./services/pushNotification.service");
 
 const Booking = require("./models/Booking");
 const Partner = require("./models/Partner");
@@ -50,7 +51,9 @@ const corsOptions = {
       /^https:\/\/[a-zA-Z0-9-]*quickqare[a-zA-Z0-9-]*\.netlify\.app$/.test(origin) ||
       /^https:\/\/[a-zA-Z0-9-]*quickqare[a-zA-Z0-9-]*\.netlify\.live$/.test(origin);
     const isQuickQareOrigin =
-      /^https:\/\/[a-zA-Z0-9-]+\.quickqare\.in$/.test(origin);
+      /^https:\/\/[a-zA-Z0-9-]+\.quickqare\.in$/.test(origin) ||
+      origin === "https://quickqare.in" ||
+      origin === "https://www.quickqare.in";
 
     if (isConfiguredOrigin || isLocalOrigin || isNetlifyOrigin || isQuickQareOrigin) {
       return callback(null, true);
@@ -118,6 +121,7 @@ app.use("/api/referral", require("./routes/referral.routes"));
 app.use("/api/booking", require("./routes/booking.routes"));
 app.use("/api/partner/auth", require("./routes/partnerAuth.routes"));
 app.use("/api/partner", require("./routes/partner.routes"));
+app.use("/api/partner", require("./routes/technicianHelper.routes"));
 app.use("/api/coupons", require("./routes/coupon.routes"));
 app.use("/api/payment", require("./routes/payment.routes"));
 app.use("/api/services", require("./routes/service.routes"));
@@ -301,6 +305,9 @@ io.on("connection", (socket) => {
         bookingId: accepted._id.toString(),
         status: "PARTNER_ACCEPTED",
       });
+
+      // Push the customer too — reaches them with the app closed.
+      notifyCustomerOfBookingStatus(accepted.user, "PARTNER_ACCEPTED", accepted._id);
 
       io.to(`partner_${socket.partnerId}`).emit("job_accepted_confirmation", {
         bookingId: accepted._id.toString(),

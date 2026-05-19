@@ -1,6 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const Policy = require("../../../models/Policy");
+const { resolveDefaultPolicy } = require("../../../services/policyDefaults.service");
 const authenticateAdmin = require("../../middleware/authenticateAdmin");
 const { PERMISSIONS } = require("../../constants/permissions");
 const authorize = require("../../middleware/authorize");
@@ -11,8 +12,18 @@ router.get("/:type",
   authorize(PERMISSIONS.SETTINGS_MANAGE),
   async (req, res) => {
     try {
-      const policy = await Policy.findOne({ type: req.params.type.toLowerCase() });
-      return res.json({ success: true, data: policy || { type: req.params.type, content: "", title: "" } });
+      const type = req.params.type.toLowerCase();
+      const policy = await Policy.findOne({ type });
+      const fallback = resolveDefaultPolicy(type);
+
+      return res.json({
+        success: true,
+        data: policy || {
+          type,
+          content: fallback?.content || "",
+          title: fallback?.title || "",
+        },
+      });
     } catch (err) {
       return res.status(500).json({ success: false, message: err.message });
     }
@@ -27,10 +38,15 @@ router.post("/:type",
     try {
       const { content, title } = req.body;
       const type = req.params.type.toLowerCase();
+      const fallback = resolveDefaultPolicy(type);
 
       const policy = await Policy.findOneAndUpdate(
         { type },
-        { content, title: title || type, lastUpdatedBy: req.admin?._id },
+        {
+          content: content || fallback?.content || "",
+          title: title || fallback?.title || type,
+          lastUpdatedBy: req.admin?._id,
+        },
         { upsert: true, new: true, runValidators: true }
       );
 

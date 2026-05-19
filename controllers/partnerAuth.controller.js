@@ -30,6 +30,8 @@ exports.registerPartner = async (req, res) => {
       serviceCategory, // OLD (string)
       serviceCategories, // NEW (array of categories)
       serviceIds, // SMART ONBOARDING (array of specific service IDs)
+      skillTier, // AC only: 2 = Technician, 1 = Non-Technician
+      mehendiSpecializations, // Mehendi subcategory names partner can perform
       latitude,
       longitude,
     } = req.body;
@@ -83,6 +85,15 @@ exports.registerPartner = async (req, res) => {
       resolvedCategories = [serviceCategory];
     }
 
+    // AC skill tier — only "2" (Technician) is meaningful; everything else
+    // (Non-Technician, Mehendi, missing) stays at tier 1.
+    const resolvedSkillTier = Number(skillTier) === 2 ? 2 : 1;
+
+    const resolvedMehendiSpecializations =
+      Array.isArray(mehendiSpecializations) && mehendiSpecializations.length > 0
+        ? mehendiSpecializations.map((s: string) => String(s).trim()).filter(Boolean)
+        : [];
+
     const partner = await Partner.create({
       name,
       phone,
@@ -94,6 +105,8 @@ exports.registerPartner = async (req, res) => {
       // NEW production system
       serviceCategories: resolvedCategories,
       services: resolvedServices, // Save specific skills to DB
+      skillTier: resolvedSkillTier,
+      mehendiSpecializations: resolvedMehendiSpecializations,
 
       // backward compatibility
       serviceCategory: serviceCategory || null,

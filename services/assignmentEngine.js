@@ -9,6 +9,7 @@ const {
 } = require("./scheduling_service");
 const { resolveZoneForPincode, getZoneCoveragePincodes } = require("./zone.service");
 const { escalateUnassignedBooking } = require("./escalation.service");
+const { sendJobAssignedPush } = require("./pushNotification.service");
 
 /*
 =====================================================
@@ -449,6 +450,15 @@ async function assignBooking(bookingId, opts = {}) {
           global.io
             .to(`partner_${teamPartner._id}`)
             .emit("job_assigned", partnerSpecificPayload);
+        }
+      }
+
+      // Push notification to each assigned partner — reaches them even with the
+      // app closed/backgrounded, where the socket emit above cannot. Fire and
+      // forget: sendJobAssignedPush swallows its own errors and never rejects.
+      for (const teamPartner of selectedPartners) {
+        if (teamPartner.fcmToken) {
+          sendJobAssignedPush(teamPartner.fcmToken, String(booking._id));
         }
       }
 

@@ -68,7 +68,10 @@ async function getEligibleUnitsForWindow(booking, slotStart, slotEnd, session) {
       pincode: booking.pincode,
       rejectedPartners: booking.rejectedPartners || [],
     },
-    booking.rejectedPartners || [],
+    // 2nd arg is the pincode-stage filter. Pass [] (no filter) so slot-capacity
+    // counting considers the whole zone — matching the previous behaviour.
+    // rejectedPartners is read from the booking object above, not from here.
+    [],
     { requireOnline: false, session }
   );
 

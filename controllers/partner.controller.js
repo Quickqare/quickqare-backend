@@ -41,6 +41,14 @@ function toPartnerJobPayload(booking, partnerId) {
   // partner app treats it identically to a manually accepted job.
   const partnerStatus = booking?.status === "CONFIRMED" ? "PARTNER_ACCEPTED" : (booking?.status || "ASSIGNED");
 
+  const helpers = Array.isArray(booking?.helpers)
+    ? booking.helpers.map((h) => ({
+        partnerId: String(h?.partnerId || ""),
+        name: String(h?.name || ""),
+        phone: String(h?.phone || ""),
+      }))
+    : [];
+
   return {
     id: String(booking?._id || ""),
     bookingId: String(booking?._id || ""),
@@ -56,6 +64,7 @@ function toPartnerJobPayload(booking, partnerId) {
     price: amount,
     isTeamJob,
     isPrimary,
+    helpers,
     scheduledDate: booking?.scheduledDate || null,
     scheduledTime: booking?.scheduledTime || "",
     status: partnerStatus,
@@ -270,7 +279,17 @@ exports.updateFcmToken = async (req, res) => {
       });
     }
 
-    req.partner.fcmToken = fcmToken.trim();
+    const trimmedToken = fcmToken.trim();
+
+    // A given FCM token belongs to exactly one device. If this token was
+    // previously registered to another partner (e.g. a resold/reused phone),
+    // detach it from them so pushes don't land on the wrong account.
+    await Partner.updateMany(
+      { fcmToken: trimmedToken, _id: { $ne: req.partner._id } },
+      { $set: { fcmToken: "" } }
+    );
+
+    req.partner.fcmToken = trimmedToken;
     req.partner.lastOnlineAt = new Date();
     await req.partner.save();
 

@@ -26,6 +26,10 @@ const {
   releaseSlotCapacityByBookingId,
   reserveSlotCapacityForBooking,
 } = require("../services/slotCapacity.service");
+const {
+  sendJobCancelledPush,
+  notifyCustomerOfBookingStatus,
+} = require("../services/pushNotification.service");
 
 const PAYMENT_LOCK_MINUTES = SLOT_LOCK_MINUTES;
 
@@ -717,6 +721,8 @@ exports.markOnTheWay = async (req, res) => {
       });
     }
 
+    notifyCustomerOfBookingStatus(booking.user, "ON_THE_WAY", booking._id);
+
     res.json({
       success: true,
       message: "Partner marked on the way",
@@ -774,6 +780,8 @@ exports.markArrived = async (req, res) => {
         arrivedAt,
       });
     }
+
+    notifyCustomerOfBookingStatus(updated.user, "ARRIVED", updated._id);
 
     res.json({ success: true, message: "Arrival recorded" });
   } catch (err) {
@@ -905,9 +913,17 @@ exports.completeBooking = async (req, res) => {
           return res.status(400).json({ success: false, message: "You have already completed your part." });
         }
 
-        // ATOMIC ARRAY UPDATE: Prevent teammates completing exactly at the same time from overwriting each other
+        // ATOMIC ARRAY UPDATE: the $elemMatch guard requires this partner's
+        // allocation to be not-yet-COMPLETED. Two concurrent completeBooking
+        // calls from the same partner therefore can't both pass — only the
+        // first flips the element and reaches the payout below. The earlier
+        // allocation.status check is a stale in-memory read and cannot stop a
+        // true concurrent double-tap; this guard does.
         const arrayUpdate = await Booking.findOneAndUpdate(
-          { _id: bookingId, "teamAllocations.partnerId": partnerId },
+          {
+            _id: bookingId,
+            teamAllocations: { $elemMatch: { partnerId, status: { $ne: "COMPLETED" } } },
+          },
           { $set: { "teamAllocations.$.status": "COMPLETED", "teamAllocations.$.completedAt": new Date() } },
           { new: true }
         );
@@ -1020,6 +1036,8 @@ exports.completeBooking = async (req, res) => {
         });
       }
 
+      notifyCustomerOfBookingStatus(booking.user, "COMPLETED", booking._id);
+
       return res.json({
         success: true,
         message: `Booking completed! ₹${currentPartnerShare} credited to your wallet.`,
@@ -1063,6 +1081,8 @@ exports.completeBooking = async (req, res) => {
         message: "Your service has been completed",
       });
     }
+
+    notifyCustomerOfBookingStatus(booking.user, "COMPLETED", booking._id);
 
     res.json({
       success: true,
@@ -1283,6 +1303,12 @@ exports.cancelBookingByUser = async (req, res) => {
         bookingId: booking._id.toString(),
         cancelledBy: "user",
       });
+    }
+
+    // Push the partner too — the socket above only reaches them with the app
+    // open. booking.partner is populated, so its fcmToken is available here.
+    if (booking.partner?.fcmToken) {
+      sendJobCancelledPush(booking.partner.fcmToken, booking._id.toString());
     }
 
     res.json({

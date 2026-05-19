@@ -14,6 +14,11 @@ const SLOT_LOCK_CHECK_INTERVAL_MS = 5 * 60 * 1000; // every 5 minutes
 // 3 hours gives the partner enough notice while not assigning too far in advance.
 const DISPATCH_HOURS_BEFORE = 3;
 
+// Reminder cron timing.
+const REMINDER_INTERVAL_MS = 5 * 60 * 1000; // every 5 minutes
+const REMINDER_LEAD_MINUTES = 30; // pre-job reminder fires ~30 min before service
+const HELPER_NUDGE_AFTER_HOURS = 6; // nudge a still-pending helper invite after 6h
+
 // Statuses that indicate a booking is stuck and should be auto-cancelled
 const STALE_PENDING_STATUSES = [
   "PENDING_ASSIGNMENT",
@@ -153,6 +158,177 @@ async function cleanupExpiredSlotLocks() {
 
 /*
 =====================================================
+SEND PRE-JOB REMINDERS
+Pushes a reminder to the assigned partner team, any
+helpers on the booking, and the customer ~30 minutes
+before an accepted job's scheduled start.
+=====================================================
+*/
+async function sendJobReminders() {
+  try {
+    const Booking = require("../models/Booking");
+    const Partner = require("../models/Partner");
+    const User = require("../models/User");
+    const { buildDateTime } = require("./scheduling_service");
+    const { sendPushNotification } = require("./pushNotification.service");
+
+    const now = new Date();
+    const windowEnd = new Date(now.getTime() + REMINDER_LEAD_MINUTES * 60 * 1000);
+
+    const candidates = await Booking.find({
+      status: { $in: ["CONFIRMED", "PARTNER_ACCEPTED"] },
+      preJobReminderSentAt: null,
+    })
+      .select(
+        "_id scheduledDate scheduledTime scheduledStartAt partner additionalPartners helpers user"
+      )
+      .lean();
+
+    let sentCount = 0;
+
+    for (const booking of candidates) {
+      const start = booking.scheduledStartAt
+        ? new Date(booking.scheduledStartAt)
+        : buildDateTime(booking.scheduledDate, booking.scheduledTime);
+
+      if (!(start instanceof Date) || Number.isNaN(start.getTime())) continue;
+      // Only remind for jobs starting within the lead window.
+      if (!(start > now && start <= windowEnd)) continue;
+
+      // Atomically claim the booking so the reminder is sent exactly once,
+      // even if multiple server instances run this cron.
+      const claimed = await Booking.findOneAndUpdate(
+        { _id: booking._id, preJobReminderSentAt: null },
+        { $set: { preJobReminderSentAt: now } }
+      );
+      if (!claimed) continue;
+
+      const timeLabel = booking.scheduledTime || start.toLocaleTimeString();
+
+      const partnerIds = [booking.partner, ...(booking.additionalPartners || [])]
+        .filter(Boolean)
+        .map((id) => String(id));
+      const helperIds = (booking.helpers || [])
+        .map((h) => h?.partnerId)
+        .filter(Boolean)
+        .map((id) => String(id));
+
+      const teamPartners = await Partner.find({
+        _id: { $in: [...partnerIds, ...helperIds] },
+      })
+        .select("_id fcmToken")
+        .lean();
+      const tokenById = new Map(
+        teamPartners.map((p) => [String(p._id), p.fcmToken])
+      );
+
+      for (const partnerId of partnerIds) {
+        const token = tokenById.get(partnerId);
+        if (token) {
+          sendPushNotification(
+            token,
+            "Upcoming Job",
+            `Your job is scheduled at ${timeLabel}. Get ready to head out.`,
+            { type: "JOB_REMINDER", bookingId: String(booking._id) }
+          );
+        }
+      }
+
+      for (const helperId of helperIds) {
+        const token = tokenById.get(helperId);
+        if (token) {
+          sendPushNotification(
+            token,
+            "Upcoming Job",
+            `You're helping on a job at ${timeLabel}. Get ready.`,
+            { type: "JOB_REMINDER", bookingId: String(booking._id) }
+          );
+        }
+      }
+
+      if (booking.user) {
+        const customer = await User.findById(booking.user)
+          .select("fcmToken")
+          .lean();
+        if (customer?.fcmToken) {
+          sendPushNotification(
+            customer.fcmToken,
+            "Service Reminder",
+            `Your service is scheduled at ${timeLabel}. Your partner will arrive soon.`,
+            { type: "BOOKING_REMINDER", bookingId: String(booking._id) }
+          );
+        }
+      }
+
+      sentCount += 1;
+    }
+
+    if (sentCount > 0) {
+      console.log(`[cron] Sent pre-job reminders for ${sentCount} booking(s)`);
+    }
+  } catch (err) {
+    console.error("[cron] sendJobReminders error:", err.message);
+  }
+}
+
+/*
+=====================================================
+SEND HELPER INVITATION REMINDERS
+Nudges a helper about a technician invitation that has
+sat unanswered (PENDING) for HELPER_NUDGE_AFTER_HOURS.
+=====================================================
+*/
+async function sendHelperInviteReminders() {
+  try {
+    const TechnicianHelper = require("../models/TechnicianHelper");
+    const { sendPushNotification } = require("./pushNotification.service");
+
+    const now = new Date();
+    const cutoff = new Date(
+      now.getTime() - HELPER_NUDGE_AFTER_HOURS * 60 * 60 * 1000
+    );
+
+    const pending = await TechnicianHelper.find({
+      status: "PENDING",
+      reminderSentAt: null,
+      invitedAt: { $lt: cutoff },
+    })
+      .populate("technician", "name")
+      .populate("helper", "fcmToken")
+      .lean();
+
+    let sentCount = 0;
+
+    for (const invite of pending) {
+      const claimed = await TechnicianHelper.findOneAndUpdate(
+        { _id: invite._id, status: "PENDING", reminderSentAt: null },
+        { $set: { reminderSentAt: now } }
+      );
+      if (!claimed) continue;
+
+      const token = invite.helper?.fcmToken;
+      if (token) {
+        sendPushNotification(
+          token,
+          "Pending Helper Invitation",
+          `${invite.technician?.name || "A technician"} invited you to join their team. Tap to accept or decline.`,
+          { type: "HELPER_INVITE_REMINDER", invitationId: String(invite._id) }
+        );
+      }
+
+      sentCount += 1;
+    }
+
+    if (sentCount > 0) {
+      console.log(`[cron] Sent ${sentCount} helper invitation reminder(s)`);
+    }
+  } catch (err) {
+    console.error("[cron] sendHelperInviteReminders error:", err.message);
+  }
+}
+
+/*
+=====================================================
 INIT — called once after MongoDB connects
 =====================================================
 */
@@ -161,10 +337,14 @@ function initCronJobs() {
   cancelStaleBookings();
   dispatchQueuedBookings();
   cleanupExpiredSlotLocks();
+  sendJobReminders();
+  sendHelperInviteReminders();
 
   setInterval(cancelStaleBookings, CHECK_INTERVAL_MS);
   setInterval(dispatchQueuedBookings, CHECK_INTERVAL_MS);
   setInterval(cleanupExpiredSlotLocks, SLOT_LOCK_CHECK_INTERVAL_MS);
+  setInterval(sendJobReminders, REMINDER_INTERVAL_MS);
+  setInterval(sendHelperInviteReminders, REMINDER_INTERVAL_MS);
 
   if (process.env.NODE_ENV !== "test") {
     console.log(
@@ -176,7 +356,16 @@ function initCronJobs() {
     console.log(
       `[cron] Slot lock cleanup active (checks every 5 min, expires ${require("./slotCapacity.service").SLOT_LOCK_MINUTES} min locks)`
     );
+    console.log(
+      `[cron] Job reminders active (checks every 5 min, reminds ${REMINDER_LEAD_MINUTES} min before service)`
+    );
   }
 }
 
-module.exports = { initCronJobs, dispatchQueuedBookings, cleanupExpiredSlotLocks };
+module.exports = {
+  initCronJobs,
+  dispatchQueuedBookings,
+  cleanupExpiredSlotLocks,
+  sendJobReminders,
+  sendHelperInviteReminders,
+};

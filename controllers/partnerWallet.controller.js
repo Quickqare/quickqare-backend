@@ -207,11 +207,42 @@ exports.creditWallet = async ({
     throw new Error("partnerId and amount are required");
   }
 
-  // Idempotency: Prevent double-payouts for the same job
-  if (bookingId && reason === "job_payment") {
-    const existingTxn = await WalletTransaction.findOne({ partnerId, bookingId, reason: "job_payment" });
-    if (existingTxn) {
-      return; // Already credited for this job
+  const walletBucket = String(bucket || "withdrawable").toLowerCase();
+  const txnStatus = walletBucket === "pending" ? "pending" : "success";
+  const isJobPayment = Boolean(bookingId) && reason === "job_payment";
+
+  /*
+   * Idempotency for job payments.
+   * The ledger row is written FIRST and the unique index
+   * { partnerId, bookingId, reason } makes a concurrent second credit fail here,
+   * before any balance is touched. The old order (balance first, ledger second)
+   * let two racing completeBooking calls both bump the balance — the findOne
+   * check-then-act could not stop a true concurrent double-tap.
+   */
+  if (isJobPayment) {
+    // Fast path: skip all work if this job was already credited.
+    const existingTxn = await WalletTransaction.findOne({
+      partnerId,
+      bookingId,
+      reason: "job_payment",
+    });
+    if (existingTxn) return;
+
+    try {
+      await WalletTransaction.create({
+        partnerId,
+        amount,
+        type: "credit",
+        reason,
+        bookingId,
+        status: txnStatus,
+        description,
+      });
+    } catch (err) {
+      // E11000 — a concurrent call already created this job_payment row.
+      // Another request is crediting the balance; do not double up.
+      if (err && err.code === 11000) return;
+      throw err;
     }
   }
 
@@ -220,8 +251,6 @@ exports.creditWallet = async ({
   if (!wallet) {
     wallet = await PartnerWallet.create({ partnerId, balance: 0, withdrawableBalance: 0, pendingBalance: 0, totalEarnings: 0, totalWithdrawn: 0 });
   }
-
-  const walletBucket = String(bucket || "withdrawable").toLowerCase();
 
   normalizeWallet(wallet);
 
@@ -237,15 +266,19 @@ exports.creditWallet = async ({
 
   await wallet.save();
 
-  await WalletTransaction.create({
-    partnerId,
-    amount,
-    type: "credit",
-    reason,
-    bookingId,
-    status: walletBucket === "pending" ? "pending" : "success",
-    description,
-  });
+  // Non-job-payment credits (bonus, adjustment, etc.) still need a ledger row.
+  // job_payment rows were already written above as the idempotency guard.
+  if (!isJobPayment) {
+    await WalletTransaction.create({
+      partnerId,
+      amount,
+      type: "credit",
+      reason,
+      bookingId,
+      status: txnStatus,
+      description,
+    });
+  }
 };
 
 /* =====================================================

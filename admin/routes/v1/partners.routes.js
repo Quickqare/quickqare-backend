@@ -56,6 +56,7 @@ router.get("/", async (req, res) => {
       name: partner.name,
       phone: partner.phone,
       serviceCategory: partner.serviceCategories?.[0] || "",
+      skillTier: partner.skillTier || 1,
       pincode: partner.currentPincode || "",
       status: partner.isBlocked ? "BLOCKED" : partner.approvalStatus || "PENDING",
       rating: partner.rating || 0,
@@ -118,7 +119,7 @@ router.get("/:id/stats", async (req, res) => {
     }
 
     const partner = await Partner.findById(partnerId)
-      .select("name phone email rating activeJobs maxJobsLimit currentPincode serviceAreas serviceCategories isOnline approvalStatus isBlocked plan commissionPercent subscriptionActive createdAt")
+      .select("name phone email rating activeJobs maxJobsLimit currentPincode serviceAreas serviceCategories skillTier isOnline approvalStatus isBlocked plan commissionPercent subscriptionActive createdAt")
       .lean();
     if (!partner) {
       return fail(res, 404, "NOT_FOUND", "Partner not found", null, { requestId: req.requestId });
@@ -349,32 +350,119 @@ router.patch("/:id/subscription", audit("admin.partners.subscription"), async (r
 router.delete("/:id", audit("admin.partners.delete"), async (req, res) => {
   try {
     const partnerId = asSingleString(req.params.id);
+    const force   = req.query.force   === "true";
+    const cascade = req.query.cascade === "true"; // also wipe all booking history
+
     if (!partnerId || !mongoose.Types.ObjectId.isValid(partnerId)) {
       return fail(res, 400, "INVALID_ID", "Invalid partner id", null, { requestId: req.requestId });
     }
 
     const pid = new mongoose.Types.ObjectId(partnerId);
-    const [partner, activeBookings] = await Promise.all([
+    const [partner, activeBookingDocs] = await Promise.all([
       Partner.findById(partnerId).lean(),
-      Booking.countDocuments({
+      Booking.find({
         $or: [{ partner: pid }, { additionalPartners: pid }],
         status: { $in: ACTIVE_STATUSES },
-      }),
+      }).select("_id user status").lean(),
     ]);
 
     if (!partner) {
       return fail(res, 404, "NOT_FOUND", "Partner not found", null, { requestId: req.requestId });
     }
 
-    if (activeBookings > 0) {
+    // cascade implies force — no soft-block needed
+    if (activeBookingDocs.length > 0 && !force && !cascade) {
       return fail(
         res,
         409,
         "PARTNER_HAS_ACTIVE_BOOKINGS",
-        "Cannot delete partner with active bookings. Complete, cancel, or reassign active jobs first.",
+        `Cannot delete: partner has ${activeBookingDocs.length} active booking(s). Use force=true to unassign them and delete, or cascade=true to wipe their full history.`,
         null,
-        { requestId: req.requestId, activeBookings }
+        { requestId: req.requestId, activeBookings: activeBookingDocs.length }
       );
+    }
+
+    // ── CASCADE: wipe every booking + related sub-documents for this partner ──
+    if (cascade) {
+      const allBookings = await Booking.find(
+        { $or: [{ partner: pid }, { additionalPartners: pid }] }
+      ).select("_id").lean();
+
+      const bookingIds = allBookings.map((b) => b._id);
+
+      if (bookingIds.length > 0) {
+        // Cancel any pending ACK timers first
+        try {
+          const { cancelAckTimeout } = require("../../../services/ackTimeout.service");
+          for (const b of allBookings) await cancelAckTimeout(b._id).catch(() => {});
+        } catch (_) { /* non-fatal */ }
+
+        // Notify affected customers their booking is gone
+        if (global.io) {
+          const bookingsWithUsers = await Booking.find(
+            { _id: { $in: bookingIds } }
+          ).select("_id user").lean();
+          for (const b of bookingsWithUsers) {
+            global.io.to(`user_${b.user}`).emit("booking_update", {
+              bookingId: b._id.toString(),
+              status: "CANCELLED",
+              cancelReason: "Partner account removed by admin",
+            });
+          }
+        }
+
+        // Pull complaint IDs so we can delete their timelines too
+        const Complaint       = require("../../../models/Complaint");
+        const complaints      = await Complaint.find({ bookingId: { $in: bookingIds } }).select("_id").lean();
+        const complaintIds    = complaints.map((c) => c._id);
+
+        const ComplaintTimeline = require("../../../models/ComplaintTimeline");
+        const Rating            = require("../../../models/Rating");
+        const UserWalletTx      = require("../../../models/UserWalletTransaction");
+        const WalletTx          = require("../../../models/WalletTransaction");
+        const SlotLock          = require("../../../models/SlotLock");
+        const SlotCapacity      = require("../../../models/SlotCapacity");
+        const Job               = require("../../../models/Job");
+
+        await Promise.all([
+          BookingTimeline.deleteMany({ bookingId: { $in: bookingIds } }),
+          BookingAssignment.deleteMany({
+            $or: [{ partnerId: pid }, { bookingId: { $in: bookingIds } }],
+          }),
+          Refund.deleteMany({ bookingId: { $in: bookingIds } }),
+          Rating.deleteMany({ bookingId: { $in: bookingIds } }),
+          Complaint.deleteMany({ bookingId: { $in: bookingIds } }),
+          complaintIds.length
+            ? ComplaintTimeline.deleteMany({ complaintId: { $in: complaintIds } })
+            : Promise.resolve(),
+          UserWalletTx.deleteMany({ bookingId: { $in: bookingIds } }),
+          WalletTx.deleteMany({ bookingId: { $in: bookingIds } }),
+          SlotLock.deleteMany({ bookingId: { $in: bookingIds } }),
+          SlotCapacity.deleteMany({ bookingId: { $in: bookingIds } }),
+          Job.deleteMany({ bookingId: { $in: bookingIds } }),
+        ]);
+
+        await Booking.deleteMany({ _id: { $in: bookingIds } });
+      }
+    } else if (force && activeBookingDocs.length > 0) {
+      // force only: unassign active bookings back to SEARCHING
+      const bookingIds = activeBookingDocs.map((b) => b._id);
+      await Booking.updateMany(
+        { _id: { $in: bookingIds } },
+        { $set: { status: "SEARCHING", partner: null }, $push: { rejectedPartners: pid } }
+      );
+      try {
+        const { cancelAckTimeout } = require("../../../services/ackTimeout.service");
+        for (const b of activeBookingDocs) await cancelAckTimeout(b._id).catch(() => {});
+      } catch (_) { /* non-fatal */ }
+      if (global.io) {
+        for (const b of activeBookingDocs) {
+          global.io.to(`user_${b.user}`).emit("booking_update", {
+            bookingId: b._id.toString(),
+            status: "SEARCHING",
+          });
+        }
+      }
     }
 
     await Promise.all([
@@ -388,15 +476,12 @@ router.delete("/:id", audit("admin.partners.delete"), async (req, res) => {
       });
     }
 
-    return success(
-      res,
-      {
-        deleted: true,
-        partnerId,
-        phone: partner.phone,
-      },
-      { requestId: req.requestId }
-    );
+    return success(res, {
+      deleted: true,
+      partnerId,
+      phone: partner.phone,
+      unassignedBookings: force && !cascade ? activeBookingDocs.length : 0,
+    }, { requestId: req.requestId });
   } catch (error) {
     return fail(res, 500, "PARTNER_DELETE_FAILED", "Unable to delete partner", error.message, {
       requestId: req.requestId,

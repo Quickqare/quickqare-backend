@@ -106,6 +106,29 @@ const partnerSchema = new mongoose.Schema(
     },
 
     /* =====================
+       AC SKILL TIER
+       1 = Non-Technician (cleaning, installation help)
+       2 = Technician (gas, PCB, advanced repairs)
+       The assignment engine gates AC Level 2+ jobs on this.
+       Mehendi / non-AC partners stay at the default 1 (never read for them).
+    ===================== */
+    skillTier: {
+      type: Number,
+      enum: [1, 2],
+      default: 1,
+    },
+
+    /* =====================
+       MEHENDI SPECIALIZATIONS
+       Subcategory names the partner can perform.
+       Populated at signup when serviceCategory = "Mehendi".
+    ===================== */
+    mehendiSpecializations: {
+      type: [String],
+      default: [],
+    },
+
+    /* =====================
        SERVICES (MULTI SERVICE SUPPORT)
        Stores capability snapshot
     ===================== */

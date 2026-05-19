@@ -151,7 +151,7 @@ exports.getCategories = async (_req, res) => {
 ===================================================== */
 exports.getSubCategories = async (req, res) => {
   try {
-    const { categoryId, includeInactive } = req.query;
+    const { categoryId, categoryName, includeInactive } = req.query;
     const query = {};
     const shouldIncludeInactive =
       String(includeInactive || "").toLowerCase() === "true" ||
@@ -163,7 +163,14 @@ exports.getSubCategories = async (req, res) => {
 
     if (categoryId) {
       query.category = categoryId;
+    } else if (categoryName) {
+      const cat = await Category.findOne({ name: new RegExp(`^${categoryName}$`, "i"), isActive: true }).lean();
+      if (cat) query.category = cat._id;
+      else {
+        return res.json({ success: true, count: 0, subCategories: [] });
+      }
     }
+
     const subCategories = await SubCategory.find(query).sort({ name: 1 });
     res.json({ success: true, count: subCategories.length, subCategories });
   } catch (err) {

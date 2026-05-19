@@ -12,6 +12,49 @@ const router = express.Router();
 
 router.use(authenticateAdmin, authorize(PERMISSIONS.ZONES_MANAGE));
 
+/* Clean + dedupe a list of 6-digit pincodes. */
+function cleanPincodes(values) {
+  return [
+    ...new Set(
+      (Array.isArray(values) ? values : [])
+        .map((v) => String(v || "").trim())
+        .filter((v) => /^\d{6}$/.test(v))
+    ),
+  ];
+}
+
+/* Returns any pincodes that already belong to another zone (as primary,
+   nearby, or extended). Each pincode must live in exactly one zone, or
+   resolveZoneForPincode becomes ambiguous. */
+async function findPincodeConflicts(pincodes, excludeZoneId) {
+  if (!pincodes.length) return [];
+  const query = {
+    $or: [
+      { pincode: { $in: pincodes } },
+      { nearbyPincodes: { $in: pincodes } },
+      { extendedPincodes: { $in: pincodes } },
+    ],
+  };
+  if (excludeZoneId) query._id = { $ne: excludeZoneId };
+
+  const zones = await Zone.find(query)
+    .select("pincode nearbyPincodes extendedPincodes")
+    .lean();
+
+  const wanted = new Set(pincodes);
+  const conflicts = new Set();
+  for (const zone of zones) {
+    for (const p of [
+      zone.pincode,
+      ...(zone.nearbyPincodes || []),
+      ...(zone.extendedPincodes || []),
+    ]) {
+      if (wanted.has(p)) conflicts.add(p);
+    }
+  }
+  return [...conflicts];
+}
+
 router.get("/", async (req, res) => {
   try {
     const { page, pageSize, skip, limit } = getPagination(req);
@@ -30,20 +73,34 @@ router.get("/", async (req, res) => {
 router.post("/", audit("admin.zones.create"), async (req, res) => {
   try {
     const pincode = String(req.body.pincode || "").trim();
-    if (!pincode) {
-      return fail(res, 400, "VALIDATION_ERROR", "pincode is required", null, { requestId: req.requestId });
+    if (!/^\d{6}$/.test(pincode)) {
+      return fail(res, 400, "VALIDATION_ERROR", "A valid 6-digit primary pincode is required", null, { requestId: req.requestId });
     }
 
-    const existing = await Zone.findOne({ pincode });
-    if (existing) {
-      return fail(res, 400, "DUPLICATE", "Zone already exists for this pincode", null, { requestId: req.requestId });
+    // Normalise the rest of the zone's pincodes and drop the primary if echoed.
+    const nearbyPincodes = cleanPincodes(req.body.nearbyPincodes).filter((p) => p !== pincode);
+    const extendedPincodes = cleanPincodes(req.body.extendedPincodes).filter(
+      (p) => p !== pincode && !nearbyPincodes.includes(p)
+    );
+
+    const allPincodes = [pincode, ...nearbyPincodes, ...extendedPincodes];
+    const conflicts = await findPincodeConflicts(allPincodes, null);
+    if (conflicts.length) {
+      return fail(
+        res,
+        400,
+        "PINCODE_CONFLICT",
+        `These pincodes already belong to another zone: ${conflicts.join(", ")}. Each pincode can be in only one zone.`,
+        null,
+        { requestId: req.requestId }
+      );
     }
 
     const s = req.body.services || {};
     const row = await Zone.create({
       pincode,
-      nearbyPincodes: Array.isArray(req.body.nearbyPincodes) ? req.body.nearbyPincodes : [],
-      extendedPincodes: Array.isArray(req.body.extendedPincodes) ? req.body.extendedPincodes : [],
+      nearbyPincodes,
+      extendedPincodes,
       isActive: req.body.isActive !== undefined ? Boolean(req.body.isActive) : true,
       customerAppEnabled:
         req.body.customerAppEnabled !== undefined ? Boolean(req.body.customerAppEnabled) : true,
@@ -74,10 +131,53 @@ router.patch("/:id", audit("admin.zones.update"), async (req, res) => {
       return fail(res, 400, "INVALID_ID", "Invalid zone id", null, { requestId: req.requestId });
     }
 
+    const pincodeFieldsTouched =
+      req.body.pincode !== undefined ||
+      req.body.nearbyPincodes !== undefined ||
+      req.body.extendedPincodes !== undefined;
+
+    let existingZone = null;
+    if (pincodeFieldsTouched) {
+      existingZone = await Zone.findById(zoneId).lean();
+      if (!existingZone) {
+        return fail(res, 404, "NOT_FOUND", "Zone not found", null, { requestId: req.requestId });
+      }
+    }
+
     const patch = {};
-    if (req.body.pincode !== undefined) patch.pincode = String(req.body.pincode || "").trim();
-    if (req.body.nearbyPincodes !== undefined) patch.nearbyPincodes = req.body.nearbyPincodes || [];
-    if (req.body.extendedPincodes !== undefined) patch.extendedPincodes = req.body.extendedPincodes || [];
+
+    if (pincodeFieldsTouched) {
+      const primary =
+        req.body.pincode !== undefined
+          ? String(req.body.pincode || "").trim()
+          : existingZone.pincode;
+      if (!/^\d{6}$/.test(primary)) {
+        return fail(res, 400, "VALIDATION_ERROR", "A valid 6-digit primary pincode is required", null, { requestId: req.requestId });
+      }
+      const nearby = cleanPincodes(
+        req.body.nearbyPincodes !== undefined ? req.body.nearbyPincodes : existingZone.nearbyPincodes
+      ).filter((p) => p !== primary);
+      const extended = cleanPincodes(
+        req.body.extendedPincodes !== undefined ? req.body.extendedPincodes : existingZone.extendedPincodes
+      ).filter((p) => p !== primary && !nearby.includes(p));
+
+      const conflicts = await findPincodeConflicts([primary, ...nearby, ...extended], zoneId);
+      if (conflicts.length) {
+        return fail(
+          res,
+          400,
+          "PINCODE_CONFLICT",
+          `These pincodes already belong to another zone: ${conflicts.join(", ")}. Each pincode can be in only one zone.`,
+          null,
+          { requestId: req.requestId }
+        );
+      }
+
+      patch.pincode = primary;
+      patch.nearbyPincodes = nearby;
+      patch.extendedPincodes = extended;
+    }
+
     if (req.body.isActive !== undefined) patch.isActive = Boolean(req.body.isActive);
     if (req.body.customerAppEnabled !== undefined)
       patch.customerAppEnabled = Boolean(req.body.customerAppEnabled);

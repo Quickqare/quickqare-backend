@@ -237,6 +237,11 @@ async function buildRequestContext({
     requestedCategories.some(isACCategory) ||
     isACCategory(booking?.serviceCategory || "");
 
+  // Determine if this is a Mehendi booking — used by the specialization gate.
+  const isMehendi =
+    requestedCategories.some((c) => c.includes("mehendi")) ||
+    normalizeText(booking?.serviceCategory || "").includes("mehendi");
+
   // For AC: derive the maximum required skill tier from the cart
   // Level 1 = general cleaning/filter wash
   // Level 2 = gas top-up, diagnosis
@@ -258,6 +263,7 @@ async function buildRequestContext({
     requestedSubCategories,
     serviceMap,
     isAC,
+    isMehendi,
     requiredSkillTier,
   };
 }
@@ -540,6 +546,7 @@ function getPartnerSkillMatchLevel(partner, requestContext) {
     requestedSubCategories,
     requestedCategories,
     isAC,
+    isMehendi,
     requiredSkillTier,
   } = requestContext;
 
@@ -549,6 +556,24 @@ function getPartnerSkillMatchLevel(partner, requestContext) {
   if (isAC && requiredSkillTier >= 2) {
     const partnerTier = Number(partner.skillTier || 1);
     if (partnerTier < requiredSkillTier) return 0;
+  }
+
+  // MEHENDI SPECIALIZATION GATE: a partner who declared which Mehendi types
+  // they perform (e.g. Bridal, Arabic) can only be matched to bookings within
+  // those subcategories — not every artist can do bridal work. Partners with
+  // no declared specializations (legacy signups) are not blocked here; they
+  // fall through to the service/subcategory matching below.
+  if (isMehendi) {
+    const declaredSpecializations = (partner.mehendiSpecializations || [])
+      .map(normalizeText)
+      .filter(Boolean);
+    if (declaredSpecializations.length > 0 && requestedSubCategories.length > 0) {
+      const declaredSet = new Set(declaredSpecializations);
+      const coversEveryRequestedType = requestedSubCategories.every((sc) =>
+        declaredSet.has(sc)
+      );
+      if (!coversEveryRequestedType) return 0;
+    }
   }
 
   const partnerServiceIds = collectPartnerServiceIds(partner);
@@ -758,32 +783,6 @@ function sortRankedPartners(a, b) {
 
 /*
 =====================================================
-REACHABILITY CHECK
-3-tier distance gate: ensures displayed partners
-can actually arrive in time.
-=====================================================
-*/
-function isPartnerReachable(distanceMeters, scheduledStartAt) {
-  // If either location is missing, distance is Infinity — can't compute reachability.
-  // Pincode/area filter already restricts the partner pool, so assume reachable.
-  if (!Number.isFinite(distanceMeters)) return true;
-
-  const distanceKm = distanceMeters / 1000;
-  const travelTimeMinutes = distanceKm * 3; // ~3 min/km — conservative for Indian traffic
-  const estimatedArrival = addMinutes(new Date(), travelTimeMinutes);
-
-  if (distanceKm <= 5) return true; // Primary radius — always reachable
-  if (distanceKm <= 15 && estimatedArrival <= scheduledStartAt) return true; // Extended + enough lead time
-  if (
-    distanceKm <= 25 &&
-    scheduledStartAt > addMinutes(new Date(), 120)
-  )
-    return true; // Max radius + future booking (>2 hr away)
-  return false;
-}
-
-/*
-=====================================================
 ELIGIBLE PARTNER FINDER
 =====================================================
 */
@@ -843,6 +842,19 @@ async function findEligiblePartnersForBooking(booking, pincodes = [], opts = {})
     query.serviceAreas = booking.pincode;
   }
 
+  // STAGED PINCODE EXPANSION
+  // assignBooking widens the partner search stage-by-stage: exact pincode →
+  // nearby → extended. Restrict the pool to partners who serve any pincode in
+  // the current stage — matched on their live currentPincode or their declared
+  // serviceAreas. When no pincodes are passed (slot-availability counting) this
+  // is skipped and the whole zone is considered, preserving slot-listing behaviour.
+  if (Array.isArray(pincodes) && pincodes.length) {
+    query.$or = [
+      { currentPincode: { $in: pincodes } },
+      { serviceAreas: { $in: pincodes } },
+    ];
+  }
+
   // For live assignment we require partners to be currently online + available.
   // For slot listing / pre-booking checks we DON'T — a partner that took a 1pm
   // job and went offline shouldn't make every other slot of the day vanish for
@@ -900,7 +912,6 @@ async function findEligiblePartnersForBooking(booking, pincodes = [], opts = {})
 
   let skillBlockCount = 0;
   let windowBlockCount = 0;
-  let reachabilityBlockCount = 0;
 
   const ranked = partners
     .map((partner) => {
@@ -925,19 +936,15 @@ async function findEligiblePartnersForBooking(booking, pincodes = [], opts = {})
         return null;
       }
 
+      // Distance is a ranking signal only — not a hard gate. A partner who
+      // declared this pincode (currentPincode / serviceAreas) is eligible
+      // regardless of GPS distance; calculatePartnerScore still ranks closer
+      // partners higher. Geographic reach is bounded by the zone's
+      // nearby/extended pincode config, not by a fixed kilometre cap.
       const distanceMeters = calculateDistanceMeters(
         booking.location,
         partner.location
       );
-      if (
-        !isPartnerReachable(
-          distanceMeters,
-          bookingWindow.scheduledStartAt
-        )
-      ) {
-        reachabilityBlockCount++;
-        return null;
-      }
 
       // Use real completed-jobs-today earnings if available; fall back to estimate
       const earningsToday =
@@ -975,7 +982,7 @@ async function findEligiblePartnersForBooking(booking, pincodes = [], opts = {})
 
   if (!ranked.length && partners.length) {
     console.warn(
-      `[assignment] Booking ${booking?._id}: ${partners.length} DB candidates all filtered out — skill:${skillBlockCount} window:${windowBlockCount} reachability:${reachabilityBlockCount}`
+      `[assignment] Booking ${booking?._id}: ${partners.length} DB candidates all filtered out — skill:${skillBlockCount} window:${windowBlockCount}`
     );
   }
 

@@ -44,6 +44,24 @@ const bookingSchema = new mongoose.Schema(
       },
     ],
 
+    // AC helpers the assigned technician brings for manpower (lifting, drilling).
+    // A frozen snapshot — helpers never go through the assignment engine and
+    // cannot accept/reject the job; the technician picks them post-assignment.
+    helpers: [
+      {
+        partnerId: {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: "Partner",
+        },
+        name: String,
+        phone: String,
+        addedAt: {
+          type: Date,
+          default: Date.now,
+        },
+      },
+    ],
+
     /* ======================
        SERVICES (PRODUCTION CART SYSTEM)
        Supports multiple services
@@ -321,6 +339,13 @@ const bookingSchema = new mongoose.Schema(
     },
 
     arrivedAt: {
+      type: Date,
+      default: null,
+    },
+
+    // Set by the reminder cron once the pre-job reminder push has gone out,
+    // so the partner / helpers / customer aren't reminded repeatedly.
+    preJobReminderSentAt: {
       type: Date,
       default: null,
     },
