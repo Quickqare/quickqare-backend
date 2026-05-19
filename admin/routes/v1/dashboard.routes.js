@@ -15,28 +15,35 @@ router.use(authenticateAdmin, authorize(PERMISSIONS.DASHBOARD_READ));
 router.get("/kpis", async (req, res) => {
   try {
     const now = new Date();
-    const start = new Date(now);
-    start.setHours(0, 0, 0, 0);
-    const end = new Date(start);
-    end.setDate(end.getDate() + 1);
+    let start, end;
+
+    if (req.query.start && req.query.end) {
+      start = new Date(req.query.start);
+      end   = new Date(req.query.end);
+    } else {
+      start = new Date(now); start.setHours(0, 0, 0, 0);
+      end   = new Date(now); end.setHours(23, 59, 59, 999);
+    }
+
+    const dateFilter = { createdAt: { $gte: start, $lte: end } };
 
     const [
-      totalBookingsToday,
+      totalBookings,
       activePartners,
       pendingJobs,
       completedJobs,
       cancelledJobs,
       newCustomerSignups,
-      revenueTodayRows,
+      revenueRows,
     ] = await Promise.all([
-      Booking.countDocuments({ createdAt: { $gte: start, $lt: end } }),
+      Booking.countDocuments(dateFilter),
       Partner.countDocuments({ isOnline: true, isBlocked: false }),
       Booking.countDocuments({ status: { $in: ["SEARCHING", "ASSIGNED", "PARTNER_ACCEPTED"] } }),
-      Booking.countDocuments({ status: "COMPLETED" }),
-      Booking.countDocuments({ status: "CANCELLED" }),
-      User.countDocuments({ createdAt: { $gte: start, $lt: end } }),
+      Booking.countDocuments({ status: "COMPLETED", ...dateFilter }),
+      Booking.countDocuments({ status: "CANCELLED", ...dateFilter }),
+      User.countDocuments(dateFilter),
       Booking.aggregate([
-        { $match: { createdAt: { $gte: start, $lt: end }, "payment.status": "PAID" } },
+        { $match: { ...dateFilter, "payment.status": "PAID" } },
         { $group: { _id: null, total: { $sum: "$totalAmount" } } },
       ]),
     ]);
@@ -44,8 +51,8 @@ router.get("/kpis", async (req, res) => {
     return success(
       res,
       {
-        totalBookingsToday,
-        totalRevenueToday: revenueTodayRows[0]?.total || 0,
+        totalBookings,
+        totalRevenue: revenueRows[0]?.total || 0,
         activePartners,
         pendingJobs,
         completedJobs,
@@ -63,13 +70,18 @@ router.get("/kpis", async (req, res) => {
 
 router.get("/revenue-trend", async (req, res) => {
   try {
-    const days = Math.max(1, Math.min(Number(asSingleString(req.query.days) || 14), 90));
-    const start = new Date();
-    start.setHours(0, 0, 0, 0);
-    start.setDate(start.getDate() - (days - 1));
+    let start, end;
+    if (req.query.start && req.query.end) {
+      start = new Date(req.query.start);
+      end   = new Date(req.query.end);
+    } else {
+      const days = Math.max(1, Math.min(Number(asSingleString(req.query.days) || 14), 90));
+      start = new Date(); start.setHours(0, 0, 0, 0); start.setDate(start.getDate() - (days - 1));
+      end   = new Date(); end.setHours(23, 59, 59, 999);
+    }
 
     const rows = await Booking.aggregate([
-      { $match: { createdAt: { $gte: start }, "payment.status": "PAID" } },
+      { $match: { createdAt: { $gte: start, $lte: end }, "payment.status": "PAID" } },
       {
         $group: {
           _id: {
@@ -93,13 +105,18 @@ router.get("/revenue-trend", async (req, res) => {
 
 router.get("/bookings-trend", async (req, res) => {
   try {
-    const days = Math.max(1, Math.min(Number(asSingleString(req.query.days) || 14), 90));
-    const start = new Date();
-    start.setHours(0, 0, 0, 0);
-    start.setDate(start.getDate() - (days - 1));
+    let start, end;
+    if (req.query.start && req.query.end) {
+      start = new Date(req.query.start);
+      end   = new Date(req.query.end);
+    } else {
+      const days = Math.max(1, Math.min(Number(asSingleString(req.query.days) || 14), 90));
+      start = new Date(); start.setHours(0, 0, 0, 0); start.setDate(start.getDate() - (days - 1));
+      end   = new Date(); end.setHours(23, 59, 59, 999);
+    }
 
     const rows = await Booking.aggregate([
-      { $match: { createdAt: { $gte: start } } },
+      { $match: { createdAt: { $gte: start, $lte: end } } },
       {
         $group: {
           _id: {
