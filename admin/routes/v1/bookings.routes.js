@@ -23,6 +23,14 @@ router.get("/", async (req, res) => {
     const where = {};
     if (status) where.status = status;
 
+    const { start, end } = req.query;
+    if (start || end) {
+      where.createdAt = {};
+      if (start) { const s = new Date(start); if (!isNaN(s)) where.createdAt.$gte = s; }
+      if (end)   { const e = new Date(end);   if (!isNaN(e)) where.createdAt.$lte = e; }
+      if (!Object.keys(where.createdAt).length) delete where.createdAt;
+    }
+
     const [rows, total] = await Promise.all([
       Booking.find(where)
         .populate("user")
