@@ -1,4 +1,5 @@
 const { reverseGeocode } = require("../services/geocode.service");
+const { trackApiCall } = require("../services/apiCallTracker.service");
 const GOOGLE_MAPS_SERVER_API_KEY =
   process.env.GOOGLE_MAPS_SERVER_API_KEY || process.env.GOOGLE_MAPS_API_KEY;
 
@@ -44,10 +45,11 @@ exports.reverseGeocode = async (req, res) => {
     const cacheKey = `revgeo_${latitude.toFixed(4)}_${longitude.toFixed(4)}`;
     const cached = mapsCache.get(cacheKey);
     if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+      trackApiCall("customer_reverse_geocode", { cacheHit: true });
       return res.json(cached.data);
     }
 
-    const resolved = await reverseGeocode(latitude, longitude);
+    const resolved = await reverseGeocode(latitude, longitude, "customer_reverse_geocode");
     if (!resolved.ok) {
       const status = resolved.error === "GOOGLE_MAPS_KEY_MISSING" ? 500 : 502;
       return res.status(status).json({
@@ -107,8 +109,10 @@ exports.searchAddress = async (req, res) => {
     const cacheKey = `search_${query.toLowerCase()}`;
     const cached = mapsCache.get(cacheKey);
     if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+      trackApiCall("customer_address_search", { cacheHit: true });
       return res.json(cached.data);
     }
+    trackApiCall("customer_address_search", { cacheHit: false });
 
     const response = await fetch(
       `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(

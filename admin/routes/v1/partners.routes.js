@@ -9,6 +9,7 @@ const audit = require("../../middleware/audit");
 const { PERMISSIONS } = require("../../constants/permissions");
 const { asSingleString, getPagination } = require("../../utils/common");
 const { success, fail } = require("../../utils/response");
+const { trackApiCall } = require("../../../services/apiCallTracker.service");
 
 const router = express.Router();
 
@@ -27,6 +28,15 @@ router.get("/", async (req, res) => {
     }
     if (status === "BLOCKED") {
       where.isBlocked = true;
+    }
+
+    const q = String(asSingleString(req.query.q) || "").trim();
+    if (q) {
+      where.$or = [
+        { name:  { $regex: q, $options: "i" } },
+        { phone: { $regex: q, $options: "i" } },
+        { email: { $regex: q, $options: "i" } },
+      ];
     }
 
     const [partners, total] = await Promise.all([
@@ -75,6 +85,72 @@ router.get("/", async (req, res) => {
     return fail(res, 500, "PARTNERS_LIST_FAILED", "Unable to fetch partners", error.message, {
       requestId: req.requestId,
     });
+  }
+});
+
+// GET /live-locations — all approved partners with their latest location data
+router.get("/live-locations", async (req, res) => {
+  try {
+    const partners = await Partner.find({ approvalStatus: "APPROVED", isBlocked: false })
+      .select("name phone isOnline isAvailable location currentPincode currentAddress lastLocationAt activeJobs rating")
+      .lean();
+
+    const now = Date.now();
+    const FRESH_MS = 5 * 60 * 1000; // 5 minutes
+
+    trackApiCall("admin_live_tracking", { cacheHit: false });
+    const data = partners.map((p) => {
+      const coords = p.location?.coordinates;
+      const hasLocation = Array.isArray(coords) && (coords[0] !== 0 || coords[1] !== 0);
+      const lastAt = p.lastLocationAt ? new Date(p.lastLocationAt).getTime() : 0;
+      const isFresh = lastAt > 0 && (now - lastAt) <= FRESH_MS;
+
+      return {
+        id: String(p._id),
+        name: p.name,
+        phone: p.phone,
+        isOnline: Boolean(p.isOnline),
+        isAvailable: Boolean(p.isAvailable),
+        activeJobs: p.activeJobs || 0,
+        rating: p.rating || 0,
+        latitude: hasLocation ? coords[1] : null,
+        longitude: hasLocation ? coords[0] : null,
+        currentPincode: p.currentPincode || "",
+        currentAddress: p.currentAddress || "",
+        lastLocationAt: p.lastLocationAt || null,
+        locationFresh: isFresh,
+      };
+    });
+
+    return success(res, data, { requestId: req.requestId });
+  } catch (error) {
+    return fail(res, 500, "LIVE_LOCATIONS_FAILED", "Unable to fetch live locations", error.message, { requestId: req.requestId });
+  }
+});
+
+// POST /request-locations — push a socket ping to all online partners asking for their current GPS
+router.post("/request-locations", async (req, res) => {
+  try {
+    if (!global.io) {
+      return fail(res, 503, "SOCKET_UNAVAILABLE", "Real-time server not available", null, { requestId: req.requestId });
+    }
+
+    const onlinePartners = await Partner.find({ approvalStatus: "APPROVED", isBlocked: false, isOnline: true })
+      .select("_id")
+      .lean();
+
+    trackApiCall("admin_location_ping", { cacheHit: false });
+    let pinged = 0;
+    for (const p of onlinePartners) {
+      global.io.to(`partner_${p._id}`).emit("request_location_update", {
+        requestedAt: new Date().toISOString(),
+      });
+      pinged++;
+    }
+
+    return success(res, { pinged }, { requestId: req.requestId });
+  } catch (error) {
+    return fail(res, 500, "REQUEST_LOCATIONS_FAILED", "Unable to request location updates", error.message, { requestId: req.requestId });
   }
 });
 
@@ -174,6 +250,7 @@ router.get("/:id/location", async (req, res) => {
       return fail(res, 404, "NOT_FOUND", "Partner not found", null, { requestId: req.requestId });
     }
 
+    trackApiCall("admin_partner_location", { cacheHit: false });
     return success(res, {
       isOnline: partner.isOnline,
       location: partner.location,

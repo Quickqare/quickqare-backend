@@ -21,6 +21,7 @@ const complaintsRoutes = require("./complaints.routes");
 const catalogRoutes = require("./catalog.routes");
 const policiesRoutes = require("./policies.routes");
 const testResetRoutes = require("./testReset.routes");
+const apiStatsRoutes = require("./apiStats.routes");
 const { success } = require("../../utils/response");
 
 const router = express.Router();
@@ -52,5 +53,6 @@ router.use("/complaints", complaintsRoutes);
 router.use("/catalog", catalogRoutes);
 router.use("/policies", policiesRoutes);
 router.use("/test-reset", testResetRoutes);
+router.use("/api-stats", apiStatsRoutes);
 
 module.exports = router;

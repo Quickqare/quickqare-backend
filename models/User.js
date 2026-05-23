@@ -72,6 +72,21 @@ const userSchema = new mongoose.Schema(
         default: {},
       },
     }],
+
+    // Account deletion (soft delete — data anonymised, not hard-deleted)
+    isDeleted: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+    deletedAt: {
+      type: Date,
+      default: null,
+    },
+    deleteReason: {
+      type: String,
+      default: "",
+    },
   }, { timestamps: true }
 );
 

@@ -17,7 +17,7 @@ const getAllComplaints = async (req, res) => {
     if (issueType) query.issueType = issueType;
 
     const complaints = await Complaint.find(query)
-      .populate("orderId", "serviceName scheduledDate status totalAmount")
+      .populate({ path: "orderId", select: "scheduledDate status totalAmount serviceSubCategory", populate: { path: "primaryService", select: "name" } })
       .populate("userId", "name phone")
       .sort({ createdAt: -1 })
       .limit(limit * 1)
@@ -30,8 +30,7 @@ const getAllComplaints = async (req, res) => {
       data: {
         complaints: complaints.map(c => ({
           id: c._id,
-          orderId: c.orderId,
-          userId: c.userId,
+          orderId: c.orderId?._id,
           issueType: c.issueType,
           description: c.description,
           status: c.status,
@@ -39,8 +38,17 @@ const getAllComplaints = async (req, res) => {
           refundAmount: c.refundAmount,
           reServiceScheduled: c.reServiceScheduled,
           createdAt: c.createdAt,
-          order: c.orderId,
-          user: c.userId,
+          order: {
+            serviceName: c.orderId?.primaryService?.name || c.orderId?.serviceSubCategory || "—",
+            scheduledDate: c.orderId?.scheduledDate,
+            status: c.orderId?.status,
+            totalAmount: c.orderId?.totalAmount,
+          },
+          user: {
+            name: c.userId?.name || "—",
+            phone: c.userId?.phone || "—",
+            email: c.userId?.email || "—",
+          },
         })),
         pagination: {
           page: parseInt(page),
@@ -67,7 +75,7 @@ const getComplaintDetailsAdmin = async (req, res) => {
     const { id } = req.params;
 
     const complaint = await Complaint.findById(id)
-      .populate("orderId")
+      .populate("orderId", "scheduledDate status totalAmount primaryService")
       .populate("userId", "name phone email");
 
     if (!complaint) {
@@ -78,37 +86,44 @@ const getComplaintDetailsAdmin = async (req, res) => {
     }
 
     const timeline = await ComplaintTimeline.find({ complaintId: id })
-      .sort({ createdAt: -1 })
+      .sort({ createdAt: 1 })
       .populate("updatedBy", "name");
 
+    // Flatten response so frontend can use res.data directly
     res.json({
       success: true,
       data: {
-        complaint: {
-          id: complaint._id,
-          orderId: complaint.orderId,
-          userId: complaint.userId,
-          issueType: complaint.issueType,
-          description: complaint.description,
-          images: complaint.images,
-          status: complaint.status,
-          resolution: complaint.resolution,
-          refundAmount: complaint.refundAmount,
-          reServiceScheduled: complaint.reServiceScheduled,
-          adminNotes: complaint.adminNotes,
-          createdAt: complaint.createdAt,
-          updatedAt: complaint.updatedAt,
-          order: complaint.orderId,
-          user: complaint.userId,
+        id: complaint._id,
+        orderId: complaint.orderId?._id,
+        issueType: complaint.issueType,
+        description: complaint.description,
+        images: complaint.images,
+        status: complaint.status,
+        resolution: complaint.resolution,
+        refundAmount: complaint.refundAmount,
+        reServiceScheduled: complaint.reServiceScheduled,
+        adminNotes: complaint.adminNotes,
+        createdAt: complaint.createdAt,
+        updatedAt: complaint.updatedAt,
+        order: {
+          serviceName: complaint.orderId?.primaryService?.name || complaint.orderId?.serviceSubCategory || "—",
+          scheduledDate: complaint.orderId?.scheduledDate,
+          status: complaint.orderId?.status,
+          totalAmount: complaint.orderId?.totalAmount,
+        },
+        user: {
+          name: complaint.userId?.name || "—",
+          phone: complaint.userId?.phone || "—",
+          email: complaint.userId?.email || "—",
         },
         timeline: timeline.map(t => ({
           id: t._id,
           status: t.status,
           previousStatus: t.previousStatus,
           notes: t.notes,
+          adminName: t.updatedBy?.name || "Admin",
           createdAt: t.createdAt,
-          updatedBy: t.updatedBy,
-        }))
+        })),
       }
     });
   } catch (error) {
@@ -127,7 +142,6 @@ const updateComplaintStatus = async (req, res) => {
   try {
     const { id } = req.params;
     const { status, notes } = req.body;
-    const adminId = req.admin.id;
 
     // Validate status
     const validStatuses = ["SUBMITTED", "UNDER_REVIEW", "IN_PROGRESS", "RESOLVED", "CLOSED"];
@@ -151,6 +165,7 @@ const updateComplaintStatus = async (req, res) => {
     await complaint.save();
 
     // Create timeline entry
+    const adminId = req.adminUser.id;
     const timeline = new ComplaintTimeline({
       complaintId: complaint._id,
       status,
@@ -200,7 +215,7 @@ const addComplaintResolution = async (req, res) => {
   try {
     const { id } = req.params;
     const { resolution, refundAmount, reServiceScheduled, adminNotes } = req.body;
-    const adminId = req.admin.id;
+    const adminId = req.adminUser.id;
 
     const complaint = await Complaint.findById(id).populate("userId", "fcmToken");
     if (!complaint) {
@@ -210,18 +225,22 @@ const addComplaintResolution = async (req, res) => {
       });
     }
 
-    // Update resolution details
+    const previousStatus = complaint.status;
+
+    // Update resolution details and mark as RESOLVED
     if (resolution) complaint.resolution = resolution;
     if (refundAmount !== undefined) complaint.refundAmount = refundAmount;
     if (reServiceScheduled !== undefined) complaint.reServiceScheduled = reServiceScheduled;
     if (adminNotes) complaint.adminNotes = adminNotes;
+    complaint.status = "RESOLVED";
 
     await complaint.save();
 
     // Create timeline entry
     const timeline = new ComplaintTimeline({
       complaintId: complaint._id,
-      status: complaint.status,
+      status: "RESOLVED",
+      previousStatus,
       updatedBy: adminId,
       notes: "Resolution added/updated",
     });

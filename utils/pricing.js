@@ -13,7 +13,25 @@
  * =====================================================
  */
 
-const GST_RATE = 0.18;
+const DEFAULT_TAX_PERCENT = 18;
+
+/*
+=====================================================
+LOAD PRICING SETTINGS FROM ADMIN
+Returns sane defaults (0 platform fee, 18% tax)
+when no settings document exists.
+=====================================================
+*/
+async function getPricingSettings() {
+  const AdminSetting = require("../admin/models/AdminSetting");
+  const settings = await AdminSetting.findOne().lean();
+  return {
+    platformFeePercent: Number(settings?.pricing?.platformFeePercent) || 0,
+    platformFeeFlatInr: Number(settings?.pricing?.platformFeeFlatInr) || 0,
+    taxPercent:         Number(settings?.pricing?.taxPercent ?? DEFAULT_TAX_PERCENT),
+  };
+}
+exports.getPricingSettings = getPricingSettings;
 
 function normalizeText(value = "") {
   return String(value).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
@@ -175,6 +193,7 @@ exports.calculatePricing = ({
   baseAmount = 0,
   services = [],
   discount = 0,
+  pricing = {},
 }) => {
   /*
   =====================================
@@ -206,27 +225,47 @@ exports.calculatePricing = ({
 
   /*
   =====================================
-  GST CALCULATION
+  PLATFORM FEE  (flat ₹ + % of taxable)
   =====================================
   */
-  const gstAmount = round(taxableAmount * GST_RATE);
+  const platformFeePercent = Number(pricing?.platformFeePercent) || 0;
+  const platformFeeFlatInr = Number(pricing?.platformFeeFlatInr) || 0;
+  const platformFeeAmount = round(
+    (taxableAmount * platformFeePercent) / 100 + platformFeeFlatInr
+  );
+
+  /*
+  =====================================
+  TAX  (% of taxable + platform fee)
+  Stored as `gstAmount` for backwards
+  compatibility — customer-facing
+  label is "Fees and Taxes".
+  =====================================
+  */
+  const taxPercent = Number(pricing?.taxPercent ?? DEFAULT_TAX_PERCENT);
+  const gstAmount = round(
+    ((taxableAmount + platformFeeAmount) * taxPercent) / 100
+  );
 
   /*
   =====================================
   FINAL TOTAL
   =====================================
   */
-  const totalAmount = round(taxableAmount + gstAmount);
+  const totalAmount = round(taxableAmount + platformFeeAmount + gstAmount);
 
   return {
     baseAmount: calculatedBase,
     discountAmount,
+    platformFeeAmount,
     gstAmount,
     totalAmount,
 
     breakdown: {
       taxableAmount,
-      gstRate: GST_RATE,
+      platformFeePercent,
+      platformFeeFlatInr,
+      taxPercent,
       itemCount: services?.length || 1,
     },
   };

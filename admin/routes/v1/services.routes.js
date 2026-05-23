@@ -452,4 +452,50 @@ router.patch("/:id/status", audit("admin.services.status"), async (req, res) => 
   }
 });
 
+// PATCH /:id/cancellation-policy — set per-service cancellation tiers
+// Body: { tiers: [{ minHoursBefore: 24, refundPercent: 100 }, ...] }
+// Send tiers: [] to reset service to global defaults.
+router.patch("/:id/cancellation-policy", audit("admin.services.cancellation"), async (req, res) => {
+  try {
+    const serviceId = asSingleString(req.params.id);
+    if (!serviceId || !mongoose.Types.ObjectId.isValid(serviceId)) {
+      return fail(res, 400, "INVALID_ID", "Invalid service id", null, { requestId: req.requestId });
+    }
+
+    const tiers = req.body.tiers;
+    if (!Array.isArray(tiers)) {
+      return fail(res, 400, "INVALID_TIERS", "tiers must be an array", null, { requestId: req.requestId });
+    }
+
+    for (const t of tiers) {
+      if (typeof t.minHoursBefore !== "number" || typeof t.refundPercent !== "number") {
+        return fail(res, 400, "INVALID_TIER", "Each tier must have numeric minHoursBefore and refundPercent", null, { requestId: req.requestId });
+      }
+      if (t.refundPercent < 0 || t.refundPercent > 100) {
+        return fail(res, 400, "INVALID_TIER", "refundPercent must be between 0 and 100", null, { requestId: req.requestId });
+      }
+      if (t.minHoursBefore < 0) {
+        return fail(res, 400, "INVALID_TIER", "minHoursBefore must be >= 0", null, { requestId: req.requestId });
+      }
+    }
+
+    const sorted = [...tiers].sort((a, b) => b.minHoursBefore - a.minHoursBefore);
+    const row = await Service.findByIdAndUpdate(
+      serviceId,
+      { $set: { cancellationTiers: sorted } },
+      { new: true }
+    ).lean();
+
+    if (!row) {
+      return fail(res, 404, "NOT_FOUND", "Service not found", null, { requestId: req.requestId });
+    }
+
+    return success(res, { cancellationTiers: row.cancellationTiers }, { requestId: req.requestId });
+  } catch (error) {
+    return fail(res, 500, "CANCELLATION_POLICY_FAILED", "Unable to update cancellation policy", error.message, {
+      requestId: req.requestId,
+    });
+  }
+});
+
 module.exports = router;

@@ -31,6 +31,19 @@ router.get("/", async (req, res) => {
       if (!Object.keys(where.createdAt).length) delete where.createdAt;
     }
 
+    const q = String(asSingleString(req.query.q) || "").trim();
+    if (q) {
+      // Search by booking ID (exact), customer phone, or customer name
+      const isObjectId = mongoose.Types.ObjectId.isValid(q);
+      const userMatches = await require("../../../models/User")
+        .find({ $or: [{ phone: { $regex: q, $options: "i" } }, { name: { $regex: q, $options: "i" } }] })
+        .select("_id").lean();
+      const userIds = userMatches.map((u) => u._id);
+      const orClauses = [{ user: { $in: userIds } }];
+      if (isObjectId) orClauses.push({ _id: new mongoose.Types.ObjectId(q) });
+      where.$or = orClauses;
+    }
+
     const [rows, total] = await Promise.all([
       Booking.find(where)
         .populate("user")

@@ -17,6 +17,17 @@ const getWithdrawableBalance = (wallet) =>
 ===================================================== */
 exports.requestWithdrawal = async (req, res) => {
   try {
+    const AdminSetting = require("../admin/models/AdminSetting");
+    const settings = await AdminSetting.findOne().lean();
+    if (settings?.emergencyLockdown || settings?.payoutsFreezed) {
+      return res.status(503).json({
+        success: false,
+        message: settings?.emergencyLockdown
+          ? "Service temporarily unavailable. Please try again later."
+          : "Payouts are temporarily frozen. Please try again later.",
+      });
+    }
+
     const { amount } = req.body;
     const partnerId = req.partner._id;
 

@@ -3,11 +3,36 @@
 GEOCODE SERVICE
 Reverse-geocodes lat/lng to a pincode + address
 using Google Maps Geocoding API (India).
+
+COST CONTROLS:
+  1. In-memory cache keyed by coords rounded to 3 decimal
+     places (~100m grid). TTL = 24 hours. Multiple partners
+     or users in the same area share one cached result.
+  2. Cache is cleared of expired entries every 6 hours to
+     prevent unbounded memory growth.
 =====================================================
 */
 
 const GOOGLE_MAPS_SERVER_API_KEY =
   process.env.GOOGLE_MAPS_SERVER_API_KEY || process.env.GOOGLE_MAPS_API_KEY;
+
+const { trackApiCall } = require("./apiCallTracker.service");
+
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours — pincodes rarely change
+const geocodeCache = new Map();
+
+// Round to 3 decimal places ≈ 100m grid precision
+function coordCacheKey(lat, lng) {
+  return `${lat.toFixed(3)},${lng.toFixed(3)}`;
+}
+
+// Evict expired entries every 6 hours so the Map doesn't grow forever
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of geocodeCache) {
+    if (now - entry.ts > CACHE_TTL_MS) geocodeCache.delete(key);
+  }
+}, 6 * 60 * 60 * 1000);
 
 const PINCODE_REGEX = /\b\d{6}\b/;
 
@@ -32,13 +57,20 @@ function extractPincodeFromResult(result) {
   return normalizePincode(String(result?.formatted_address || ""));
 }
 
-async function reverseGeocode(latitude, longitude) {
+async function reverseGeocode(latitude, longitude, source = "unknown") {
   if (!GOOGLE_MAPS_SERVER_API_KEY) {
     return {
       ok: false,
       error: "GOOGLE_MAPS_KEY_MISSING",
       message: "Google Maps API key not configured",
     };
+  }
+
+  const cacheKey = coordCacheKey(latitude, longitude);
+  const cached = geocodeCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < CACHE_TTL_MS) {
+    trackApiCall(source, { cacheHit: true });
+    return cached.result;
   }
 
   const response = await fetch(
@@ -76,12 +108,15 @@ async function reverseGeocode(latitude, longitude) {
     };
   }
 
-  return {
+  const result = {
     ok: true,
     pincode: extractPincodeFromResult(first),
     address: String(first?.formatted_address || "").trim(),
     google: { status: googleStatus || "OK", errorMessage: googleErrorMessage || "" },
   };
+  geocodeCache.set(cacheKey, { result, ts: Date.now() });
+  trackApiCall(source, { cacheHit: false });
+  return result;
 }
 
 module.exports = { reverseGeocode };

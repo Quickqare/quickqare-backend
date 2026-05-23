@@ -323,14 +323,46 @@ exports.updateLocation = async (req, res) => {
       });
     }
 
-    const resolved = await reverseGeocode(latitude, longitude);
+    // Only call Google Maps Geocoding if partner has moved more than 500m
+    // from the last geocoded position AND at least 5 minutes have elapsed
+    // since their last geocode. This caps cost for partners moving continuously.
+    const GEOCODE_THRESHOLD_M = 500;
+    const GEOCODE_MIN_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+    const lastGeocodedAt = req.partner.lastGeocodedAt
+      ? new Date(req.partner.lastGeocodedAt).getTime()
+      : 0;
+    const geocodeCooledDown = Date.now() - lastGeocodedAt > GEOCODE_MIN_INTERVAL_MS;
+    const prevCoords = req.partner.location?.coordinates;
+    const hasPrev = Array.isArray(prevCoords) && prevCoords.length === 2
+      && Number.isFinite(prevCoords[0]) && Number.isFinite(prevCoords[1])
+      && (prevCoords[0] !== 0 || prevCoords[1] !== 0);
+
+    let movedFarEnough = !hasPrev;
+    if (hasPrev) {
+      const [prevLng, prevLat] = prevCoords;
+      const R = 6371000;
+      const dLat = ((latitude - prevLat) * Math.PI) / 180;
+      const dLng = ((longitude - prevLng) * Math.PI) / 180;
+      const a =
+        Math.sin(dLat / 2) ** 2 +
+        Math.cos((prevLat * Math.PI) / 180) *
+          Math.cos((latitude * Math.PI) / 180) *
+          Math.sin(dLng / 2) ** 2;
+      const distanceMeters = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      movedFarEnough = distanceMeters > GEOCODE_THRESHOLD_M;
+    }
+
+    if (movedFarEnough && geocodeCooledDown) {
+      const resolved = await reverseGeocode(latitude, longitude, "partner_heartbeat");
+      req.partner.currentPincode = resolved?.ok ? resolved.pincode || "" : "";
+      req.partner.currentAddress = resolved?.ok ? resolved.address || "" : "";
+      req.partner.lastGeocodedAt = new Date();
+    }
 
     req.partner.location = {
       type: "Point",
       coordinates: [longitude, latitude],
     };
-    req.partner.currentPincode = resolved?.ok ? resolved.pincode || "" : "";
-    req.partner.currentAddress = resolved?.ok ? resolved.address || "" : "";
     req.partner.lastLocationAt = new Date();
     req.partner.lastOnlineAt = new Date();
     await req.partner.save();
@@ -397,7 +429,7 @@ exports.getAvailableServicesForLocation = async (req, res) => {
       });
     }
 
-    const resolved = await reverseGeocode(latitude, longitude);
+    const resolved = await reverseGeocode(latitude, longitude, "partner_available_svc");
     if (!resolved.ok) {
       return res.status(502).json({
         success: false,
@@ -679,5 +711,66 @@ exports.getPartnerBookings = async (req, res) => {
       success: false,
       message: "Server error",
     });
+  }
+};
+
+/**
+ * Delete partner account (soft delete — anonymise PII)
+ * Blocked if partner has an active job in progress.
+ * DELETE /api/partner/me
+ */
+exports.deletePartnerAccount = async (req, res) => {
+  try {
+    const partnerId = req.partner?._id;
+    if (!partnerId) {
+      return res.status(401).json({ success: false, message: "Partner auth required" });
+    }
+
+    const partner = await Partner.findById(partnerId);
+    if (!partner) {
+      return res.status(404).json({ success: false, message: "Partner not found" });
+    }
+    if (partner.isDeleted) {
+      return res.status(400).json({ success: false, message: "Account already deleted" });
+    }
+
+    // Block if an active job exists
+    const activeJobStatuses = [
+      "ASSIGNED",
+      "CONFIRMED",
+      "PARTNER_ACCEPTED",
+      "ON_THE_WAY",
+      "ARRIVED",
+      "IN_PROGRESS",
+    ];
+    const activeJob = await Booking.findOne({
+      $or: [{ partner: partnerId }, { additionalPartners: partnerId }],
+      status: { $in: activeJobStatuses },
+    }).lean();
+
+    if (activeJob) {
+      return res.status(400).json({
+        success: false,
+        code: "ACTIVE_JOB",
+        message: "You have an active job in progress. Please complete it before deleting your account.",
+      });
+    }
+
+    const { reason = "" } = req.body;
+
+    partner.name = "Deleted Partner";
+    partner.phone = `deleted_${partnerId}`;
+    partner.email = "";
+    partner.fcmToken = "";
+    partner.isBlocked = true;
+    partner.isDeleted = true;
+    partner.deletedAt = new Date();
+    partner.deleteReason = reason;
+    await partner.save();
+
+    res.json({ success: true, message: "Account deleted successfully" });
+  } catch (err) {
+    console.error("deletePartnerAccount error:", err);
+    res.status(500).json({ success: false, message: "Failed to delete account" });
   }
 };

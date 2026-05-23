@@ -1,6 +1,7 @@
+# ── API server ──────────────────────────────────────────────────────────────
 server {
     listen 80;
-    server_name api.yourdomain.com;
+    server_name api.quickqare.in;
 
     client_max_body_size 20M;
 
@@ -13,5 +14,29 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+
+# ── Customer web app (www.quickqare.in) ─────────────────────────────────────
+# Serves the Vite-built React SPA from /var/www/quickqare-web/dist
+# IMPORTANT: The try_files line is required so that React Router routes
+# (/privacy-policy, /bookings, etc.) work on direct load or page refresh.
+server {
+    listen 80;
+    server_name quickqare.in www.quickqare.in;
+
+    root /var/www/quickqare-web/dist;
+    index index.html;
+
+    # Serve static assets with long cache headers
+    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|map)$ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+        try_files $uri =404;
+    }
+
+    # SPA catch-all: any path that isn't a real file falls back to index.html
+    location / {
+        try_files $uri $uri/ /index.html;
     }
 }

@@ -1,4 +1,6 @@
 const User = require("../models/User");
+const Booking = require("../models/Booking");
+const Complaint = require("../models/Complaint");
 
 /**
  * Update user profile (name and gender)
@@ -137,8 +139,87 @@ const updateFcmToken = async (req, res) => {
   }
 };
 
+/**
+ * Delete account (soft delete — anonymise PII)
+ * Blocked if user has active bookings or open complaints.
+ * DELETE /api/user/me
+ */
+const deleteAccount = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { reason = "" } = req.body;
+
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ success: false, message: "User not found" });
+    }
+    if (user.isDeleted) {
+      return res.status(400).json({ success: false, message: "Account already deleted" });
+    }
+
+    // Block if active/upcoming bookings exist
+    const activeBookingStatuses = [
+      "PENDING_PAYMENT",
+      "PENDING_ASSIGNMENT",
+      "QUEUED",
+      "SEARCHING",
+      "ASSIGNING_LOCK",
+      "ASSIGNED",
+      "CONFIRMED",
+      "NO_PARTNER_AVAILABLE",
+      "PARTNER_ACCEPTED",
+      "ON_THE_WAY",
+      "ARRIVED",
+      "IN_PROGRESS",
+    ];
+    const activeBooking = await Booking.findOne({
+      user: userId,
+      status: { $in: activeBookingStatuses },
+    }).lean();
+    if (activeBooking) {
+      return res.status(400).json({
+        success: false,
+        code: "ACTIVE_BOOKING",
+        message: "You have an active or upcoming booking. Please cancel or wait for it to complete before deleting your account.",
+      });
+    }
+
+    // Block if open complaints/disputes exist
+    const openComplaint = await Complaint.findOne({
+      userId,
+      status: { $in: ["SUBMITTED", "UNDER_REVIEW", "IN_PROGRESS"] },
+    }).lean();
+    if (openComplaint) {
+      return res.status(400).json({
+        success: false,
+        code: "OPEN_COMPLAINT",
+        message: "You have an open complaint that is being reviewed. Please wait for it to be resolved before deleting your account.",
+      });
+    }
+
+    // Anonymise PII so the phone number is freed for re-registration
+    user.name = "Deleted User";
+    user.gender = "";
+    user.email = "";
+    user.fcmToken = "";
+    user.referralCode = undefined;
+    user.phone = `deleted_${userId}`;
+    user.status = "BLOCKED";
+    user.isDeleted = true;
+    user.deletedAt = new Date();
+    user.deleteReason = reason;
+    await user.save();
+
+    res.json({ success: true, message: "Account deleted successfully" });
+  } catch (error) {
+    console.error("Delete account error:", error);
+    res.status(500).json({ success: false, message: "Failed to delete account" });
+  }
+};
+
 module.exports = {
   updateProfile,
   getProfileEditHistory,
   updateFcmToken,
+  deleteAccount,
 };

@@ -281,6 +281,11 @@ const partnerSchema = new mongoose.Schema(
       default: null,
     },
 
+    lastGeocodedAt: {
+      type: Date,
+      default: null,
+    },
+
     /* =====================
        BANK DETAILS
     ===================== */
@@ -334,6 +339,15 @@ partnerSchema.post("save", async function (doc) {
   } catch (err) {
     console.error("Wallet creation error:", err.message);
   }
+});
+
+/* =====================
+   ACCOUNT DELETION
+===================== */
+partnerSchema.add({
+  isDeleted: { type: Boolean, default: false, index: true },
+  deletedAt: { type: Date, default: null },
+  deleteReason: { type: String, default: "" },
 });
 
 /* =====================

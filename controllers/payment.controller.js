@@ -8,6 +8,17 @@ const { releaseSlotCapacityByBookingId } = require("../services/slotCapacity.ser
 ===================================================== */
 exports.createOrder = async (req, res) => {
   try {
+    const AdminSetting = require("../admin/models/AdminSetting");
+    const settings = await AdminSetting.findOne().lean();
+    if (settings?.emergencyLockdown || settings?.paymentsFreezed) {
+      return res.status(503).json({
+        success: false,
+        message: settings?.emergencyLockdown
+          ? "Service temporarily unavailable. Please try again later."
+          : "Payments are temporarily frozen. Please try again later.",
+      });
+    }
+
     if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) {
       return res.status(500).json({
         success: false,
@@ -103,6 +114,7 @@ exports.createOrder = async (req, res) => {
       pricing: {
         baseAmount: booking.baseAmount,
         discountAmount: booking.discountAmount,
+        platformFeeAmount: booking.platformFeeAmount,
         gstAmount: booking.gstAmount,
         totalAmount: booking.totalAmount,
       },

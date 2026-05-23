@@ -40,6 +40,19 @@ router.patch("/settings", audit("admin.settings.update"), async (req, res) => {
     if (req.body.partnerSelfieRequired !== undefined) {
       settings.partnerSelfieRequired = Boolean(req.body.partnerSelfieRequired);
     }
+    if (req.body.useLiveLocation !== undefined) {
+      settings.useLiveLocation = Boolean(req.body.useLiveLocation);
+    }
+
+    // Pricing (platform fee + tax). Clamped to sane ranges.
+    if (req.body.pricing !== undefined && typeof req.body.pricing === "object") {
+      const p = req.body.pricing;
+      const clampPct = (v) => Math.max(0, Math.min(100, Number(v) || 0));
+      const clampFlat = (v) => Math.max(0, Number(v) || 0);
+      if (p.platformFeePercent !== undefined) settings.pricing.platformFeePercent = clampPct(p.platformFeePercent);
+      if (p.platformFeeFlatInr !== undefined) settings.pricing.platformFeeFlatInr = clampFlat(p.platformFeeFlatInr);
+      if (p.taxPercent         !== undefined) settings.pricing.taxPercent         = clampPct(p.taxPercent);
+    }
 
     // Home theme (festival / campaign UI)
     if (req.body.homeTheme !== undefined && typeof req.body.homeTheme === "object") {
@@ -103,6 +116,23 @@ router.patch("/settings", audit("admin.settings.update"), async (req, res) => {
     return success(res, settings, { requestId: req.requestId });
   } catch (error) {
     return fail(res, 500, "SETTINGS_UPDATE_FAILED", "Unable to update settings", error.message, {
+      requestId: req.requestId,
+    });
+  }
+});
+
+router.patch("/emergency", audit("admin.emergency.update"), async (req, res) => {
+  try {
+    const settings = await getOrCreateSettings();
+    const allowed = ["bookingsDisabled", "paymentsFreezed", "payoutsFreezed", "emergencyLockdown"];
+    for (const key of allowed) {
+      if (req.body[key] !== undefined) settings[key] = Boolean(req.body[key]);
+    }
+    settings.updatedByAdminId = req.adminUser.id;
+    await settings.save();
+    return success(res, settings, { requestId: req.requestId });
+  } catch (error) {
+    return fail(res, 500, "EMERGENCY_UPDATE_FAILED", "Unable to update emergency controls", error.message, {
       requestId: req.requestId,
     });
   }

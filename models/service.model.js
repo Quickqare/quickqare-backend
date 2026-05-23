@@ -86,6 +86,19 @@ const serviceSchema = new mongoose.Schema(
       max: 100,
     },
 
+    // Cancellation refund tiers — sorted by minHoursBefore descending.
+    // If empty, the global default tiers apply.
+    // e.g. [{ minHoursBefore: 24, refundPercent: 100 }, { minHoursBefore: 4, refundPercent: 75 }, ...]
+    cancellationTiers: {
+      type: [
+        {
+          minHoursBefore: { type: Number, required: true, min: 0 },
+          refundPercent:  { type: Number, required: true, min: 0, max: 100 },
+        },
+      ],
+      default: [],
+    },
+
     duration: {
       type: Number, // minutes
       default: 60,

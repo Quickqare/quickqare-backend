@@ -150,6 +150,11 @@ const bookingSchema = new mongoose.Schema(
       default: 0,
     },
 
+    platformFeeAmount: {
+      type: Number,
+      default: 0,
+    },
+
     gstAmount: {
       type: Number,
       default: 0,
@@ -309,6 +314,19 @@ const bookingSchema = new mongoose.Schema(
       type: String,
       default: "",
       trim: true,
+    },
+
+    // Snapshot of cancellation tiers at booking creation time.
+    // Protects customer from retroactive policy changes by admin.
+    // Uses most lenient tiers across all booked services.
+    cancellationTiersSnapshot: {
+      type: [
+        {
+          minHoursBefore: { type: Number },
+          refundPercent:  { type: Number },
+        },
+      ],
+      default: [],
     },
 
     /* ======================

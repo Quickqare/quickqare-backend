@@ -146,4 +146,10 @@ router.get("/wallet", partnerAuth, walletController.getWallet);
 router.get("/wallet/history", partnerAuth, walletController.getWalletHistory);
 router.post("/wallet/withdraw", partnerAuth, walletController.requestWithdrawal);
 
+/**
+ * Delete partner account (soft delete)
+ * DELETE /api/partner/me
+ */
+router.delete("/me", partnerAuth, partnerController.deletePartnerAccount);
+
 module.exports = router;

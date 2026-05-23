@@ -21,6 +21,32 @@ const adminSettingSchema = new mongoose.Schema(
     },
 
     /* =============================================
+       LIVE LOCATION & ASSIGNMENT
+    ============================================= */
+    useLiveLocation: { type: Boolean, default: false },
+
+    /* =============================================
+       PRICING (platform fee + tax)
+       Shown to the customer as a single combined
+       "Fees and Taxes" line. Backend remains
+       the source of truth for money.
+    ============================================= */
+    pricing: {
+      platformFeePercent: { type: Number, default: 0 },   // % of taxable amount
+      platformFeeFlatInr: { type: Number, default: 0 },   // flat ₹ added per booking
+      taxPercent:         { type: Number, default: 18 },  // % of (taxable + platform fee)
+    },
+
+    /* =============================================
+       EMERGENCY SAFETY CONTROLS
+       All default false — must be explicitly enabled.
+    ============================================= */
+    bookingsDisabled:  { type: Boolean, default: false },
+    paymentsFreezed:   { type: Boolean, default: false },
+    payoutsFreezed:    { type: Boolean, default: false },
+    emergencyLockdown: { type: Boolean, default: false },
+
+    /* =============================================
        HOME SCREEN THEME  (festival / campaign UI)
        All color values are CSS hex strings.
        isActive = false  →  app uses its default

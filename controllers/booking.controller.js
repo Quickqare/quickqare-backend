@@ -18,7 +18,7 @@ const {
   AC_MAX_CAPACITY_MINUTES,
   AC_CATEGORY_SLUGS,
 } = require("../services/scheduling_service");
-const { calculatePricing } = require("../utils/pricing");
+const { calculatePricing, getPricingSettings } = require("../utils/pricing");
 const { validateCouponForAmount } = require("../services/coupon.service");
 const {
   SLOT_LOCK_MINUTES,
@@ -111,6 +111,17 @@ const calculatePartnerSettlement = async (booking, partner) => {
 ======================= */
 exports.createBooking = async (req, res) => {
   try {
+    const AdminSetting = require("../admin/models/AdminSetting");
+    const settings = await AdminSetting.findOne().lean();
+    if (settings?.emergencyLockdown || settings?.bookingsDisabled) {
+      return res.status(503).json({
+        success: false,
+        message: settings?.emergencyLockdown
+          ? "Service temporarily unavailable. Please try again later."
+          : "New bookings are temporarily disabled. Please try again later.",
+      });
+    }
+
     const {
       services, // NEW (array)
       primaryService, // NEW
@@ -168,6 +179,7 @@ exports.createBooking = async (req, res) => {
     let finalPrimaryService = primaryService;
     const categorySlugCache = new Map();
     let totalDurationMinutes = 0;
+    const allServiceCancellationTiers = [];
     const mehendiRestrictedFeetOnly = new Set(["feet", "basic feet", "ankle", "above ankle"]);
     const mehendiAllFeetOptions = new Set([
       "feet",
@@ -263,6 +275,11 @@ exports.createBooking = async (req, res) => {
           category: categoryValue,
           subCategory: subCategoryValue,
         });
+
+        // Collect cancellation tiers from each service for snapshot
+        if (Array.isArray(service.cancellationTiers) && service.cancellationTiers.length > 0) {
+          allServiceCancellationTiers.push(service.cancellationTiers);
+        }
       }
 
       // if primary service not provided → take first service
@@ -418,9 +435,11 @@ exports.createBooking = async (req, res) => {
       /* =====================
          PRICE CALCULATION
       ===================== */
+      const pricingSettings = await getPricingSettings();
       const pricing = calculatePricing({
       baseAmount,
       discount: discountAmount,
+      pricing: pricingSettings,
     });
 
     const scheduledStartAt = buildDateTime(scheduledDate, scheduledTime);
@@ -449,6 +468,10 @@ exports.createBooking = async (req, res) => {
        The reservation is written before payment starts so two customers cannot
        both pay for the same limited slot.
     ===================== */
+    // Compute cancellation tiers snapshot — most lenient refundPercent at each threshold
+    // across all booked services. Falls back to [] (global defaults apply at cancel time).
+    const cancellationTiersSnapshot = mergeCancellationTiers(allServiceCancellationTiers);
+
     const bookingPayload = {
       user: req.user._id,
       services: bookingServices,
@@ -465,6 +488,7 @@ exports.createBooking = async (req, res) => {
       couponDiscountAmount: discountAmount,
       baseAmount: pricing.baseAmount,
       discountAmount: pricing.discountAmount,
+      platformFeeAmount: pricing.platformFeeAmount,
       gstAmount: pricing.gstAmount,
       totalAmount: pricing.totalAmount,
       scheduledDate: new Date(scheduledDate),
@@ -477,6 +501,7 @@ exports.createBooking = async (req, res) => {
       lockedCapacityMinutes: estimatedDurationMinutes,
       payment: { status: "PENDING" },
       status: "PENDING_PAYMENT",
+      cancellationTiersSnapshot,
     };
 
     const session = await mongoose.startSession();
@@ -548,52 +573,25 @@ exports.afterPaymentSuccess = async (req, res) => {
       ? new Date(booking.scheduledStartAt) 
       : buildDateTime(booking.scheduledDate, booking.scheduledTime);
 
-    const timeToServiceMs = scheduledStart.getTime() - Date.now();
-    const hoursToService = timeToServiceMs / (1000 * 60 * 60);
+    // Always try instant assignment. If no partner is found right now, assignBooking
+    // falls back to QUEUED (via queueOnFailure) so the cron retries automatically.
+    booking.status = "SEARCHING";
+    await booking.save();
 
-    if (hoursToService > 24) {
-      booking.status = "QUEUED";
-      await booking.save();
-
-      // Tell the customer their booking is confirmed and queued — without this the
-      // BookingStatusScreen sits on PENDING_PAYMENT until partner assignment runs
-      // hours later, which looks like the payment failed.
-      if (global.io) {
-        global.io.to(`user_${booking.user}`).emit("booking_update", {
-          bookingId: booking._id.toString(),
-          status: "QUEUED",
-          paymentConfirmed: true,
-        });
-      }
-
-      res.json({
-        success: true,
-        message: "Payment verified. Booking queued for partner assignment closer to the service date.",
-      });
-    } else {
-      // Use SEARCHING (a public-facing status the BookingStatusScreen timeline
-      // recognises) so the customer immediately sees "Searching for Partner".
-      // assignBooking's atomic lock will flip this through ASSIGNING_LOCK → ASSIGNED
-      // within a moment; we still emit the SEARCHING update first for instant feedback.
-      booking.status = "SEARCHING";
-      await booking.save();
-
-      if (global.io) {
-        global.io.to(`user_${booking.user}`).emit("booking_update", {
-          bookingId: booking._id.toString(),
-          status: "SEARCHING",
-          paymentConfirmed: true,
-        });
-      }
-
-      // 🚀 QUEUE ASSIGNMENT (Simulating batch dispatch)
-      await assignBooking(booking._id);
-
-      res.json({
-        success: true,
-        message: "Payment verified. Searching for partner.",
+    if (global.io) {
+      global.io.to(`user_${booking.user}`).emit("booking_update", {
+        bookingId: booking._id.toString(),
+        status: "SEARCHING",
+        paymentConfirmed: true,
       });
     }
+
+    await assignBooking(booking._id, { queueOnFailure: true });
+
+    res.json({
+      success: true,
+      message: "Payment verified. Searching for partner.",
+    });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
@@ -1221,12 +1219,43 @@ exports.cancelBooking = async (req, res) => {
  *
  * Refunds are recorded as PENDING; back-office reconciliation pushes them to PROCESSED.
  */
-function calculateRefund(totalAmount, hoursToService) {
-  if (hoursToService < 0) return { percent: 0, amount: 0 }; // service already past
-  if (hoursToService > 24) return { percent: 100, amount: totalAmount };
-  if (hoursToService > 4)  return { percent: 75,  amount: Math.round(totalAmount * 0.75) };
-  if (hoursToService > 1)  return { percent: 50,  amount: Math.round(totalAmount * 0.50) };
-  return { percent: 25, amount: Math.round(totalAmount * 0.25) };
+// Default tiers used when no service-level policy is configured.
+const DEFAULT_CANCELLATION_TIERS = [
+  { minHoursBefore: 24, refundPercent: 100 },
+  { minHoursBefore: 4,  refundPercent: 75  },
+  { minHoursBefore: 1,  refundPercent: 50  },
+  { minHoursBefore: 0,  refundPercent: 25  },
+];
+
+// Merges tiers from multiple services — takes the most lenient (highest refundPercent)
+// at each minHoursBefore threshold. Returns [] if no service has tiers configured.
+function mergeCancellationTiers(tiersArrays) {
+  const flat = tiersArrays.flat();
+  if (!flat.length) return [];
+  const map = new Map();
+  for (const t of flat) {
+    const key = t.minHoursBefore;
+    if (!map.has(key) || t.refundPercent > map.get(key)) {
+      map.set(key, t.refundPercent);
+    }
+  }
+  return [...map.entries()]
+    .map(([minHoursBefore, refundPercent]) => ({ minHoursBefore, refundPercent }))
+    .sort((a, b) => b.minHoursBefore - a.minHoursBefore);
+}
+
+// Resolves refund percent from tiers sorted descending by minHoursBefore.
+function calculateRefund(totalAmount, hoursToService, tiers) {
+  if (hoursToService < 0) return { percent: 0, amount: 0 };
+  const activeTiers = (tiers && tiers.length > 0) ? tiers : DEFAULT_CANCELLATION_TIERS;
+  const sorted = [...activeTiers].sort((a, b) => b.minHoursBefore - a.minHoursBefore);
+  for (const tier of sorted) {
+    if (hoursToService >= tier.minHoursBefore) {
+      const percent = tier.refundPercent;
+      return { percent, amount: Math.round(totalAmount * percent / 100) };
+    }
+  }
+  return { percent: 0, amount: 0 };
 }
 
 exports.cancelBookingByUser = async (req, res) => {
@@ -1255,7 +1284,11 @@ exports.cancelBookingByUser = async (req, res) => {
 
     let refund = { percent: 100, amount: 0 };
     if (booking.payment?.status === "PAID") {
-      refund = calculateRefund(Number(booking.totalAmount || 0), hoursToService);
+      refund = calculateRefund(
+        Number(booking.totalAmount || 0),
+        hoursToService,
+        booking.cancellationTiersSnapshot
+      );
     }
 
     // ATOMIC STATE TRANSITION: Prevents race condition where partner completes 
@@ -1467,13 +1500,18 @@ exports.getEstimate = async (req, res) => {
       return res.status(404).json({ success: false, message: "No estimate available for this booking" });
     }
 
-    const estimatePricing = calculatePricing({ baseAmount: booking.estimateTotal });
+    const estimatePricingSettings = await getPricingSettings();
+    const estimatePricing = calculatePricing({
+      baseAmount: booking.estimateTotal,
+      pricing: estimatePricingSettings,
+    });
 
     return res.json({
       success: true,
       estimate: {
         items: booking.estimateItems,
         baseAmount: estimatePricing.baseAmount,
+        platformFeeAmount: estimatePricing.platformFeeAmount,
         gstAmount: estimatePricing.gstAmount,
         totalAmount: estimatePricing.totalAmount,
         status: booking.estimateStatus,

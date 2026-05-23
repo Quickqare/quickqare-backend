@@ -471,7 +471,28 @@ async function assignBooking(bookingId, opts = {}) {
       return primaryPartner;
     }
 
-    // All 3 stages exhausted — escalate
+    // All 3 stages exhausted — queue for retry if caller requested, else escalate
+    if (opts.queueOnFailure) {
+      booking.status = "QUEUED";
+      booking.assignmentAudit.push({
+        stage: booking.assignmentStage || 3,
+        event: "QUEUED",
+        searchedPincodes: [],
+        notes: "No partner available at booking time — queued for cron retry",
+        candidates: [],
+      });
+      await booking.save();
+
+      if (global.io) {
+        global.io.to(`user_${booking.user}`).emit("booking_update", {
+          bookingId: booking._id.toString(),
+          status: "QUEUED",
+        });
+      }
+
+      return null;
+    }
+
     booking.status = "NO_PARTNER_AVAILABLE";
     booking.assignmentAudit.push({
       stage: booking.assignmentStage || 3,
@@ -498,11 +519,6 @@ async function assignBooking(bookingId, opts = {}) {
       });
     }
 
-    // Escalation: notify ops dashboard + customer
-    // The escalation service handles:
-    //   1. Admin dashboard flag
-    //   2. Customer WhatsApp/SMS "finding your partner" message
-    //   3. Auto free-rescheduling offer 30 min before scheduled time
     await escalateUnassignedBooking(booking._id);
 
     return null;

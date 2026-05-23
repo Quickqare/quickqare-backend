@@ -941,10 +941,15 @@ async function findEligiblePartnersForBooking(booking, pincodes = [], opts = {})
       // regardless of GPS distance; calculatePartnerScore still ranks closer
       // partners higher. Geographic reach is bounded by the zone's
       // nearby/extended pincode config, not by a fixed kilometre cap.
-      const distanceMeters = calculateDistanceMeters(
-        booking.location,
-        partner.location
-      );
+      const LIVE_FRESH_MS = 5 * 60 * 1000; // 5 minutes
+      const locationFresh = partner.lastLocationAt &&
+        (Date.now() - new Date(partner.lastLocationAt).getTime()) <= LIVE_FRESH_MS;
+      // When useLiveLocation is on, online partners without a fresh GPS ping in the
+      // last 5 minutes get Infinity distance — they score 0 on distance and are
+      // deprioritized vs partners who have sent a recent location update.
+      const distanceMeters = (settings?.useLiveLocation && partner.isOnline && !locationFresh)
+        ? Infinity
+        : calculateDistanceMeters(booking.location, partner.location);
 
       // Use real completed-jobs-today earnings if available; fall back to estimate
       const earningsToday =
