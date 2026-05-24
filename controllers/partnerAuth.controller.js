@@ -34,6 +34,7 @@ exports.registerPartner = async (req, res) => {
       mehendiSpecializations, // Mehendi subcategory names partner can perform
       latitude,
       longitude,
+      accessToken, // MSG91 access token — phone must be verified before account is created
     } = req.body;
 
     if (!name || !phone || !password) {
@@ -41,6 +42,21 @@ exports.registerPartner = async (req, res) => {
         success: false,
         message: "name, phone and password are required",
       });
+    }
+
+    // Phone OTP verification is mandatory — account cannot be created without it
+    if (!accessToken) {
+      return res.status(400).json({
+        success: false,
+        message: "Phone verification is required. Please verify your phone number with OTP before creating an account.",
+      });
+    }
+
+    const skipServerVerify =
+      String(process.env.SKIP_MSG91_SERVER_VERIFY || "").toLowerCase() === "true";
+
+    if (!skipServerVerify) {
+      await verifyMsg91AccessToken(accessToken);
     }
 
     const existing = await Partner.findOne({ phone });
@@ -392,6 +408,39 @@ exports.resetPartnerPasswordWithMsg91 = async (req, res) => {
     });
   } catch (error) {
     return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || "Unable to reset password",
+    });
+  }
+};
+
+exports.resetPartnerPassword = async (req, res) => {
+  try {
+    const { newPassword } = req.body;
+
+    if (!newPassword) {
+      return res.status(400).json({
+        success: false,
+        message: "New password is required",
+      });
+    }
+
+    if (String(newPassword).length < 6) {
+      return res.status(400).json({
+        success: false,
+        message: "Password must be at least 6 characters long",
+      });
+    }
+
+    req.partner.password = String(newPassword);
+    await req.partner.save();
+
+    return res.json({
+      success: true,
+      message: "Password updated successfully",
+    });
+  } catch (error) {
+    return res.status(500).json({
       success: false,
       message: error.message || "Unable to reset password",
     });

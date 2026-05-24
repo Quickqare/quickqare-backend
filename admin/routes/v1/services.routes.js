@@ -13,7 +13,7 @@ const defaultServices = require("../../data/defaultServices");
 
 const router = express.Router();
 
-router.use(authenticateAdmin, authorize(PERMISSIONS.PARTNERS_APPROVE));
+router.use(authenticateAdmin, authorize(PERMISSIONS.SERVICES_MANAGE));
 
 router.get("/", async (req, res) => {
   try {

@@ -8,7 +8,7 @@ const { PERMISSIONS } = require("../../constants/permissions");
 const { success, fail } = require("../../utils/response");
 
 const router = express.Router();
-router.use(authenticateAdmin, authorize(PERMISSIONS.PARTNERS_APPROVE));
+router.use(authenticateAdmin, authorize(PERMISSIONS.SERVICES_MANAGE));
 
 /* ── List all ── */
 router.get("/", async (req, res) => {

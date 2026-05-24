@@ -109,7 +109,10 @@ exports.createOrder = async (req, res) => {
 
     return res.json({
       success: true,
-      order,
+      order: {
+        ...order,
+        key_id: process.env.RAZORPAY_KEY_ID, // expose key so client never needs to hardcode it
+      },
       booking,
       pricing: {
         baseAmount: booking.baseAmount,

@@ -9,6 +9,7 @@ const {
   verifyPartnerOtp,
   exchangePartnerMsg91AccessToken,
   resetPartnerPasswordWithMsg91,
+  resetPartnerPassword,
 } = require("../controllers/partnerAuth.controller");
 
 const partnerAuth = require("../middlewares/partnerAuth");
@@ -49,6 +50,7 @@ router.post("/send-otp", authLimiter, sendPartnerOtp);
 router.post("/verify-otp", authLimiter, verifyPartnerOtp);
 router.post("/msg91/exchange", authLimiter, exchangePartnerMsg91AccessToken);
 router.post("/reset-password-msg91", authLimiter, resetPartnerPasswordWithMsg91);
+router.post("/reset-password", authLimiter, partnerAuth, resetPartnerPassword);
 
 /**
  * ======================================
