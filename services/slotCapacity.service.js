@@ -55,9 +55,6 @@ function buildBookingWindow(booking) {
 async function getEligibleUnitsForWindow(booking, slotStart, slotEnd, session) {
   const { findEligiblePartnersForBooking } = getSchedulingService();
 
-  const serviceIds = (booking.services || []).map((s) => String(s?.serviceId || "")).filter(Boolean);
-  console.log(`[slotReserve] getEligibleUnits pincode=${booking.pincode} serviceCategory=${booking.serviceCategory} serviceIds=[${serviceIds.join(",")}] slotStart=${slotStart} slotEnd=${slotEnd}`);
-
   const candidates = await findEligiblePartnersForBooking(
     {
       services: booking.services || [],
@@ -79,7 +76,6 @@ async function getEligibleUnitsForWindow(booking, slotStart, slotEnd, session) {
     { requireOnline: false, session }
   );
 
-  console.log(`[slotReserve] getEligibleUnits → ${candidates.length} candidates`);
   return candidates.length;
 }
 
@@ -126,10 +122,7 @@ async function reserveSlotCapacityForBooking(booking, { session } = {}) {
   const requiredCount = Math.max(Number((await computeRequiredPartners(booking))?.requiredCount) || 1, 1);
   const slotWindows = buildSlotWindows(startAt, endAt);
 
-  console.log(`[slotReserve] booking=${booking._id} pincode=${booking.pincode} date=${booking.scheduledDate} time=${booking.scheduledTime} startAt=${startAt} endAt=${endAt} requiredCount=${requiredCount} slotWindows=${slotWindows.length}`);
-
   if (!slotWindows.length) {
-    console.error(`[slotReserve] FAIL: slotWindows is empty — startAt=${startAt} endAt=${endAt}`);
     const error = new Error("Selected slot is no longer available");
     error.statusCode = 409;
     throw error;
@@ -139,9 +132,7 @@ async function reserveSlotCapacityForBooking(booking, { session } = {}) {
 
   for (const window of slotWindows) {
     const snapshot = await getSlotAvailabilitySnapshot(booking, window.slotStart, window.slotEnd, session);
-    console.log(`[slotReserve] window ${window.time}: eligibleUnits=${snapshot.eligibleUnits} requiredCount=${requiredCount} reservedUnits=${snapshot.capacity?.reservedUnits} totalUnits=${snapshot.capacity?.totalUnits}`);
     if (snapshot.eligibleUnits < requiredCount) {
-      console.error(`[slotReserve] FAIL: eligibleUnits(${snapshot.eligibleUnits}) < requiredCount(${requiredCount}) for slot ${window.time}`);
       const error = new Error("Selected slot is no longer available");
       error.statusCode = 409;
       throw error;

@@ -9,7 +9,7 @@ const Category = require("../models/Category");
 ============================= */
 exports.updatePartnerServices = async (req, res) => {
   try {
-    const { serviceIds, serviceAreas } = req.body;
+    const { serviceIds, serviceAreas, skillTier, mehendiSpecializations } = req.body;
 
     /* =============================
        VALIDATE INPUT
@@ -103,6 +103,44 @@ exports.updatePartnerServices = async (req, res) => {
     }));
 
     /* =============================
+       AC SKILL TIER
+       1 = Non-Technician, 2 = Technician
+    ============================= */
+    const isAcCategory = /\bac\b/i.test(serviceCategoryName);
+    const skillTierUpdate = {};
+
+    if (isAcCategory) {
+      const tier = Number(skillTier);
+      if (tier !== 1 && tier !== 2) {
+        return res.status(400).json({
+          success: false,
+          message: "skillTier is required for AC category (1 = Non-Technician, 2 = Technician)",
+        });
+      }
+      skillTierUpdate.skillTier = tier;
+    }
+
+    /* =============================
+       MEHENDI SPECIALIZATIONS
+       Array of subcategory names e.g. ["Bridal", "Arabic"]
+    ============================= */
+    const isMehendiCategory = /mehendi/i.test(serviceCategoryName);
+    const mehendiUpdate = {};
+
+    if (isMehendiCategory) {
+      const specs = Array.isArray(mehendiSpecializations)
+        ? mehendiSpecializations.map((s) => String(s).trim()).filter(Boolean)
+        : [];
+      if (specs.length === 0) {
+        return res.status(400).json({
+          success: false,
+          message: "Select at least one Mehendi specialization (e.g. Bridal, Arabic)",
+        });
+      }
+      mehendiUpdate.mehendiSpecializations = specs;
+    }
+
+    /* =============================
        UPDATE PARTNER
     ============================= */
     const partner = await Partner.findByIdAndUpdate(
@@ -111,6 +149,8 @@ exports.updatePartnerServices = async (req, res) => {
         services,
         serviceAreas,
         serviceCategories: [serviceCategoryName],
+        ...skillTierUpdate,
+        ...mehendiUpdate,
       },
       { new: true }
     )
