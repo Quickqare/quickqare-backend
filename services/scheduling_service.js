@@ -225,8 +225,16 @@ async function buildRequestContext({
     ),
   ]).map(normalizeText);
 
+  // Skip raw MongoDB ObjectId strings (24-char hex) — booking.services stores
+  // subCategory as an unpopulated ObjectId. Only keep human-readable names so
+  // the Mehendi specialization gate doesn't compare "69b06b..." against "bridal".
+  const isMongoId = (v) => /^[0-9a-f]{24}$/i.test(String(v || ""));
+
   const requestedSubCategories = uniqueStrings([
-    ...requestServices.map((item) => item?.subCategory),
+    ...requestServices.map((item) => {
+      const sc = item?.subCategory;
+      return isMongoId(sc) ? "" : (sc || "");
+    }),
     ...Array.from(serviceMap.values()).map(
       (service) => service?.subCategory?.name || ""
     ),
