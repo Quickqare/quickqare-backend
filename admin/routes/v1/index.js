@@ -22,6 +22,7 @@ const catalogRoutes = require("./catalog.routes");
 const policiesRoutes = require("./policies.routes");
 const testResetRoutes = require("./testReset.routes");
 const apiStatsRoutes = require("./apiStats.routes");
+const offersRoutes = require("./offers.routes");
 const { success } = require("../../utils/response");
 
 const router = express.Router();
@@ -54,5 +55,6 @@ router.use("/catalog", catalogRoutes);
 router.use("/policies", policiesRoutes);
 router.use("/test-reset", testResetRoutes);
 router.use("/api-stats", apiStatsRoutes);
+router.use("/offers", offersRoutes);
 
 module.exports = router;

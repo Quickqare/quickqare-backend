@@ -406,6 +406,8 @@ async function assignBooking(bookingId, opts = {}) {
           customerName: user?.name || "Customer",
           customerPhone: user?.phone || "",
           address: booking.address?.trim() || "",
+          houseDetails: booking.houseDetails?.trim() || null,
+          landmark: booking.landmark?.trim() || null,
           pincode: booking.pincode || "",
           customerLatitude,
           customerLongitude,

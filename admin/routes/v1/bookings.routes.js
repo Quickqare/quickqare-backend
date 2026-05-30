@@ -446,4 +446,66 @@ router.post(
   }
 );
 
+// POST /:id/request-reschedule — admin manually flags a booking for rescheduling
+router.post("/:id/request-reschedule", audit("admin.bookings.request_reschedule"), async (req, res) => {
+  try {
+    const bookingId = asSingleString(req.params.id);
+    if (!bookingId || !mongoose.Types.ObjectId.isValid(bookingId)) {
+      return fail(res, 400, "INVALID_ID", "Invalid booking id", null, { requestId: req.requestId });
+    }
+
+    const VALID_REASONS = [
+      "Due to an unforeseen emergency with your assigned professional",
+      "Due to a scheduling conflict on our end",
+      "Due to adverse weather conditions in your area",
+      "Due to a technical issue with our operations",
+      "Due to high service demand in your area",
+    ];
+
+    const reason = String(req.body.reason || "").trim();
+    if (!VALID_REASONS.includes(reason)) {
+      return fail(res, 400, "INVALID_REASON", "Please select a valid reason", null, { requestId: req.requestId });
+    }
+
+    const booking = await Booking.findById(bookingId);
+    if (!booking) {
+      return fail(res, 404, "NOT_FOUND", "Booking not found", null, { requestId: req.requestId });
+    }
+
+    const ELIGIBLE = ["PARTNER_ACCEPTED", "ON_THE_WAY", "ARRIVED", "ASSIGNED", "CONFIRMED", "SEARCHING"];
+    if (!ELIGIBLE.includes(booking.status)) {
+      return fail(res, 400, "NOT_ELIGIBLE",
+        `Cannot request reschedule for a booking in "${booking.status}" status`, null, { requestId: req.requestId });
+    }
+
+    booking.status = "NEEDS_RESCHEDULING";
+    booking.rescheduleReason = reason;
+    booking.rescheduleRequestedAt = new Date();
+    await booking.save();
+
+    // Notify customer
+    if (global.io) {
+      global.io.to(`user_${booking.user}`).emit("booking_update", {
+        bookingId: booking._id.toString(),
+        status: "NEEDS_RESCHEDULING",
+        rescheduleReason: reason,
+      });
+    }
+
+    const { notifyCustomerOfBookingStatus } = require("../../../services/pushNotification.service");
+    notifyCustomerOfBookingStatus(booking.user, "NEEDS_RESCHEDULING", booking._id);
+
+    await BookingTimeline.create({
+      bookingId,
+      eventType: "RESCHEDULE_REQUESTED",
+      payload: JSON.stringify({ reason, adminId: req.adminUser.id }),
+      createdByAdminId: req.adminUser.id,
+    });
+
+    return success(res, { bookingId: booking._id, status: "NEEDS_RESCHEDULING" }, { requestId: req.requestId });
+  } catch (error) {
+    return fail(res, 500, "RESCHEDULE_REQUEST_FAILED", "Unable to request reschedule", error.message, { requestId: req.requestId });
+  }
+});
+
 module.exports = router;

@@ -54,6 +54,10 @@ router.post("/", audit("admin.coupons.create"), async (req, res) => {
       });
     }
 
+    const applicableServices = Array.isArray(req.body.applicableServices)
+      ? req.body.applicableServices.filter((id) => mongoose.Types.ObjectId.isValid(String(id)))
+      : [];
+
     const row = await Coupon.create({
       code,
       discountType,
@@ -64,6 +68,7 @@ router.post("/", audit("admin.coupons.create"), async (req, res) => {
       perUserLimit: Number(req.body.perUserLimit || 1),
       expiresAt: new Date(expiresAtRaw),
       isActive: true,
+      applicableServices,
     });
 
     return success(res, row, { requestId: req.requestId });
@@ -94,6 +99,11 @@ router.patch("/:id", audit("admin.coupons.update"), async (req, res) => {
     if (req.body.minAmount !== undefined) patch.minAmount = Number(req.body.minAmount);
     if (req.body.minOrder !== undefined) patch.minAmount = Number(req.body.minOrder);
     if (req.body.isActive !== undefined) patch.isActive = Boolean(req.body.isActive);
+    if (req.body.applicableServices !== undefined) {
+      patch.applicableServices = Array.isArray(req.body.applicableServices)
+        ? req.body.applicableServices.filter((id) => mongoose.Types.ObjectId.isValid(String(id)))
+        : [];
+    }
 
     const row = await Coupon.findByIdAndUpdate(couponId, { $set: patch }, { new: true }).lean();
     if (!row) {

@@ -18,7 +18,9 @@ router.get("/available", async (req, res) => {
       });
     }
 
-    const coupons = await listApplicableCoupons({ amount });
+    const rawServiceIds = req.query.serviceIds || "";
+    const serviceIds = rawServiceIds ? String(rawServiceIds).split(",").filter(Boolean) : [];
+    const coupons = await listApplicableCoupons({ amount, serviceIds });
 
     return res.json({
       success: true,
@@ -44,8 +46,9 @@ router.post("/apply", async (req, res) => {
     const code = String(req.body.code || "").trim();
     const amount = Number(req.body.amount || 0);
     const customerId = req.body.customerId || null;
+    const serviceIds = Array.isArray(req.body.serviceIds) ? req.body.serviceIds : [];
 
-    const result = await validateCouponForAmount({ code, amount, customerId });
+    const result = await validateCouponForAmount({ code, amount, customerId, serviceIds });
 
     return res.json({
       success: true,

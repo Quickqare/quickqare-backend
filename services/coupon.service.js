@@ -53,7 +53,7 @@ const serializeCoupon = (coupon, amount) => {
   };
 };
 
-const validateCouponForAmount = async ({ code, amount, customerId = null }) => {
+const validateCouponForAmount = async ({ code, amount, customerId = null, serviceIds = [] }) => {
   const normalizedCode = normalizeCode(code);
   const baseAmount = Number(amount || 0);
 
@@ -101,6 +101,23 @@ const validateCouponForAmount = async ({ code, amount, customerId = null }) => {
     throw err;
   }
 
+  // Service restriction check — only runs if coupon targets specific services
+  if (
+    Array.isArray(coupon.applicableServices) &&
+    coupon.applicableServices.length > 0 &&
+    Array.isArray(serviceIds) &&
+    serviceIds.length > 0
+  ) {
+    const allowed = coupon.applicableServices.map((id) => String(id));
+    const booked = serviceIds.map((id) => String(id));
+    const hasMatch = booked.some((id) => allowed.includes(id));
+    if (!hasMatch) {
+      const err = new Error("This coupon is not valid for the selected services");
+      err.statusCode = 400;
+      throw err;
+    }
+  }
+
   if (customerId && coupon.perUserLimit) {
     const usedByCustomer = await CouponRedemption.countDocuments({
       couponId: coupon._id,
@@ -124,7 +141,7 @@ const validateCouponForAmount = async ({ code, amount, customerId = null }) => {
   };
 };
 
-const listApplicableCoupons = async ({ amount }) => {
+const listApplicableCoupons = async ({ amount, serviceIds = [] }) => {
   const baseAmount = Number(amount || 0);
 
   if (!Number.isFinite(baseAmount) || baseAmount <= 0) {
@@ -143,6 +160,14 @@ const listApplicableCoupons = async ({ amount }) => {
         !coupon.usageLimit ||
         Number(coupon.usedCount || 0) < Number(coupon.usageLimit || 0)
     )
+    .filter((coupon) => {
+      // No service restriction → show for all
+      if (!Array.isArray(coupon.applicableServices) || coupon.applicableServices.length === 0) return true;
+      // No serviceIds provided → show all (e.g. browse mode before cart finalised)
+      if (!serviceIds || serviceIds.length === 0) return true;
+      const allowed = coupon.applicableServices.map((id) => String(id));
+      return serviceIds.some((id) => allowed.includes(String(id)));
+    })
     .map((coupon) => serializeCoupon(coupon, baseAmount))
     .sort((a, b) => {
       const discountDiff = Number(b.estimatedDiscount || 0) - Number(a.estimatedDiscount || 0);

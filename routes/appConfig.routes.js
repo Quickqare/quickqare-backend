@@ -51,6 +51,7 @@ router.get("/", async (_req, res) => {
       razorpayKeyId: process.env.RAZORPAY_KEY_ID || "",
       homeTheme: {
         isActive:        Boolean(theme.isActive),
+        targetPlatform:  theme.targetPlatform  || "both",
         themeName:       theme.themeName       || DEFAULT_THEME.themeName,
         primaryColor:    theme.primaryColor    || DEFAULT_THEME.primaryColor,
         accentColor:     theme.accentColor     || DEFAULT_THEME.accentColor,

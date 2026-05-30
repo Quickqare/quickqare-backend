@@ -21,9 +21,9 @@ const { trackApiCall } = require("./apiCallTracker.service");
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours — pincodes rarely change
 const geocodeCache = new Map();
 
-// Round to 3 decimal places ≈ 100m grid precision
+// Round to 4 decimal places ≈ 11m grid precision
 function coordCacheKey(lat, lng) {
-  return `${lat.toFixed(3)},${lng.toFixed(3)}`;
+  return `${lat.toFixed(4)},${lng.toFixed(4)}`;
 }
 
 // Evict expired entries every 6 hours so the Map doesn't grow forever
@@ -74,7 +74,7 @@ async function reverseGeocode(latitude, longitude, source = "unknown") {
   }
 
   const response = await fetch(
-    `https://maps.googleapis.com/maps/api/geocode/json?latlng=${latitude},${longitude}&key=${GOOGLE_MAPS_SERVER_API_KEY}&language=en&region=IN`
+    `https://maps.googleapis.com/maps/api/geocode/json?latlng=${latitude},${longitude}&key=${GOOGLE_MAPS_SERVER_API_KEY}&language=en&region=IN&result_type=street_address|premise|subpremise|route|sublocality`
   );
 
   if (!response.ok) {

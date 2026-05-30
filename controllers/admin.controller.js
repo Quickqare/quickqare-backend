@@ -24,14 +24,23 @@ const normalizeWallet = (wallet) => {
 ===================================================== */
 exports.getAllBookings = async (req, res) => {
   try {
-    const bookings = await Booking.find()
-      .populate("user")
-      .populate("partner")
-      .populate("primaryService") // NEW
-      .populate("services.serviceId") // NEW
-      .sort({ createdAt: -1 });
+    const page  = Math.max(1, parseInt(req.query.page)  || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
+    const skip  = (page - 1) * limit;
 
-    res.json({ success: true, bookings });
+    const [bookings, total] = await Promise.all([
+      Booking.find()
+        .populate("user")
+        .populate("partner")
+        .populate("primaryService")
+        .populate("services.serviceId")
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit),
+      Booking.countDocuments(),
+    ]);
+
+    res.json({ success: true, bookings, total, page, pages: Math.ceil(total / limit) });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
@@ -132,8 +141,16 @@ exports.forceAssignPartner = async (req, res) => {
 ===================================================== */
 exports.getAllPartners = async (req, res) => {
   try {
-    const partners = await Partner.find().sort({ createdAt: -1 });
-    res.json({ success: true, partners });
+    const page  = Math.max(1, parseInt(req.query.page)  || 1);
+    const limit = Math.min(200, Math.max(1, parseInt(req.query.limit) || 100));
+    const skip  = (page - 1) * limit;
+
+    const [partners, total] = await Promise.all([
+      Partner.find().sort({ createdAt: -1 }).skip(skip).limit(limit),
+      Partner.countDocuments(),
+    ]);
+
+    res.json({ success: true, partners, total, page, pages: Math.ceil(total / limit) });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
@@ -243,14 +260,20 @@ exports.adjustWallet = async (req, res) => {
 ===================================================== */
 exports.getWithdrawals = async (req, res) => {
   try {
-    const withdrawals = await Withdrawal.find()
-      .populate("partnerId")
-      .sort({ createdAt: -1 });
+    const page  = Math.max(1, parseInt(req.query.page)  || 1);
+    const limit = Math.min(200, Math.max(1, parseInt(req.query.limit) || 100));
+    const skip  = (page - 1) * limit;
 
-    res.json({
-      success: true,
-      withdrawals,
-    });
+    const [withdrawals, total] = await Promise.all([
+      Withdrawal.find()
+        .populate("partnerId")
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit),
+      Withdrawal.countDocuments(),
+    ]);
+
+    res.json({ success: true, withdrawals, total, page, pages: Math.ceil(total / limit) });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }

@@ -132,6 +132,8 @@ exports.createBooking = async (req, res) => {
       location,
       pincode,
       address,
+      houseDetails,
+      landmark,
       couponCode,
     } = req.body;
 
@@ -426,6 +428,7 @@ exports.createBooking = async (req, res) => {
           code: couponCodeClean,
           amount: baseAmount,
           customerId: req.user?._id || null,
+          serviceIds: bookingServices.map((s) => String(s.serviceId)),
         });
 
         discountAmount = couponResult.discount;
@@ -483,6 +486,8 @@ exports.createBooking = async (req, res) => {
       serviceId: serviceId ?? finalPrimaryService ?? null,
       pincode,
       address: String(address || "").trim(),
+      houseDetails: houseDetails ? String(houseDetails).trim() : null,
+      landmark: landmark ? String(landmark).trim() : null,
       couponCode: appliedCoupon ? appliedCoupon.code : null,
       couponId: appliedCoupon ? appliedCoupon._id : null,
       couponDiscountAmount: discountAmount,
@@ -967,6 +972,8 @@ exports.completeBooking = async (req, res) => {
             completedAt: new Date(),
             isPaidToPartner: false,
             requiresRating: true,
+            // "pending" until all wallet credits confirm — cron retries if process crashes here
+            payoutStatus: "pending",
             partnerSettlement: {
               grossAmount: settlement.grossAmount,
               commissionAmount: settlement.commissionAmount,
@@ -1027,6 +1034,9 @@ exports.completeBooking = async (req, res) => {
       const { processReferralReward } = require("../utils/referral");
       await processReferralReward(booking.user, booking._id);
 
+      // All credits succeeded — mark so the retry cron skips this booking
+      await Booking.findByIdAndUpdate(bookingId, { $set: { payoutStatus: "credited" } });
+
       if (global.io) {
         global.io.to(`user_${booking.user}`).emit("jobCompleted", {
           bookingId: booking._id,
@@ -1052,6 +1062,8 @@ exports.completeBooking = async (req, res) => {
           completedAt: new Date(),
           isPaidToPartner: false,
           requiresRating: true,
+          // Individual credits already completed above — mark as credited immediately
+          payoutStatus: "credited",
           partnerSettlement: {
             grossAmount: settlement.grossAmount,
             commissionAmount: settlement.commissionAmount,
@@ -1585,5 +1597,71 @@ exports.getBookingById = async (req, res) => {
   } catch (err) {
     console.error("getBookingById error:", err);
     return res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
+/* =======================
+   CUSTOMER RESCHEDULES BOOKING
+   Only allowed when status is NEEDS_RESCHEDULING
+======================= */
+exports.rescheduleBooking = async (req, res) => {
+  try {
+    const { bookingId } = req.params;
+    const { scheduledDate, scheduledTime } = req.body;
+
+    if (!scheduledDate || !scheduledTime) {
+      return res.status(400).json({ success: false, message: "scheduledDate and scheduledTime are required" });
+    }
+
+    const booking = await Booking.findOne({ _id: bookingId, user: req.user._id });
+    if (!booking) return res.status(404).json({ success: false, message: "Booking not found" });
+
+    if (booking.status !== "NEEDS_RESCHEDULING") {
+      return res.status(400).json({ success: false, message: "This booking does not need rescheduling" });
+    }
+
+    // Validate the new slot is in the future
+    let newStart;
+    try {
+      newStart = buildDateTime(scheduledDate, scheduledTime);
+    } catch (dtErr) {
+      return res.status(400).json({ success: false, message: dtErr.message });
+    }
+    if (newStart.getTime() < Date.now() - 5 * 60 * 1000) {
+      return res.status(400).json({ success: false, message: "Please select a future time slot" });
+    }
+
+    // Save old slot for reference, update to new slot, move back to SEARCHING
+    booking.rescheduledFromDate = booking.scheduledDate ? new Date(booking.scheduledDate).toISOString().slice(0, 10) : null;
+    booking.rescheduledFromTime = booking.scheduledTime || null;
+    booking.scheduledDate = new Date(scheduledDate);
+    booking.scheduledTime = scheduledTime;
+    booking.scheduledStartAt = newStart;
+    booking.scheduledEndAt = new Date(newStart.getTime() + (booking.estimatedDurationMinutes || 60) * 60 * 1000);
+    booking.status = "SEARCHING";
+    booking.partner = null;
+    booking.ackReceivedAt = null;
+    await booking.save();
+
+    // Clear slot cache for both old and new pincode/date
+    const { clearSlotCache } = require("../services/scheduling_service");
+    clearSlotCache(booking.pincode, scheduledDate);
+
+    // Notify customer
+    if (global.io) {
+      global.io.to(`user_${booking.user}`).emit("booking_update", {
+        bookingId: booking._id.toString(),
+        status: "SEARCHING",
+      });
+    }
+
+    // Trigger assignment for the new slot
+    const { assignBooking } = require("../services/assignmentEngine");
+    assignBooking(booking._id, { queueOnFailure: true }).catch(() => {});
+
+    return res.json({ success: true, message: "Booking rescheduled. We are finding a partner for your new slot." });
+  } catch (err) {
+    console.error("rescheduleBooking error:", err);
+    return res.status(500).json({ success: false, message: "Reschedule failed" });
   }
 };

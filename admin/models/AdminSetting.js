@@ -54,6 +54,8 @@ const adminSettingSchema = new mongoose.Schema(
     ============================================= */
     homeTheme: {
       isActive:         { type: Boolean, default: false },
+      // "both" = app + web, "app" = mobile only, "web" = web only
+      targetPlatform:   { type: String, enum: ["both", "app", "web"], default: "both" },
       themeName:        { type: String,  default: "default" },
       primaryColor:     { type: String,  default: "#0A0A0A" },
       accentColor:      { type: String,  default: "#FFFFFF" },

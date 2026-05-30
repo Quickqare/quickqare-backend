@@ -3,6 +3,26 @@
  */
 require("dotenv").config();
 
+const logger = require("./utils/logger");
+
+/**
+ * Process-level safety nets — must be registered before any async code.
+ * Prevents Node.js 15+ from crashing the entire process on an unhandled
+ * promise rejection (e.g. from a cron job, socket handler, or service).
+ * PM2 autorestart is a last resort, not a substitute for catching these.
+ */
+process.on("unhandledRejection", (reason, promise) => {
+  logger.error("Unhandled Promise Rejection", { reason: String(reason), stack: reason?.stack });
+  // Do NOT call process.exit() — log and keep the server alive.
+});
+
+process.on("uncaughtException", (err) => {
+  logger.error("Uncaught Exception — exiting for clean PM2 restart", { error: err.message, stack: err.stack });
+  // Uncaught exceptions leave the process in an undefined state.
+  // Exit so PM2 can restart cleanly rather than running corrupted.
+  process.exit(1);
+});
+
 const express = require("express");
 const http = require("http");
 const mongoose = require("mongoose");
@@ -98,16 +118,16 @@ app.get("/health", async (_req, res) => {
 mongoose
   .connect(process.env.MONGO_URI)
   .then(async () => {
-    console.log("MongoDB connected");
+    logger.info("MongoDB connected");
     try {
       await ensureBootstrapAdmin();
     } catch (error) {
-      console.error("[admin-bootstrap] failed:", error);
+      logger.error("[admin-bootstrap] failed", { error: error.message, stack: error.stack });
     }
     initCronJobs();
   })
   .catch((err) => {
-    console.error("MongoDB connection error:", err);
+    logger.error("MongoDB connection error — exiting", { error: err.message, stack: err.stack });
     process.exit(1);
   });
 
@@ -133,6 +153,8 @@ app.use("/api/banners", require("./routes/banner.routes"));
 app.use("/api/policies", require("./routes/policy.routes"));
 app.use("/api/ratings", require("./routes/rating.routes"));
 app.use("/api/app-config", require("./routes/appConfig.routes"));
+app.use("/api/addresses", require("./routes/address.routes"));
+app.use("/api/offers", require("./routes/offer.routes"));
 app.use("/api/v1/admin", require("./admin/routes/v1"));
 
 /* ======================
@@ -237,9 +259,9 @@ io.on("connection", (socket) => {
         partnerAcknowledged: true,
       });
 
-      console.log(`[ack] Booking ${bookingId} acknowledged by partner ${pid}`);
+      logger.info("[ack] Booking acknowledged", { bookingId, partnerId: pid });
     } catch (err) {
-      console.error("acknowledgeJob error:", err);
+      logger.error("acknowledgeJob error", { error: err.message, stack: err.stack });
     }
   });
 
@@ -313,9 +335,9 @@ io.on("connection", (socket) => {
         bookingId: accepted._id.toString(),
       });
 
-      console.log(`[socket] Booking ${bookingId} accepted by partner ${pid}`);
+      logger.info("[socket] Booking accepted by partner", { bookingId, partnerId: pid });
     } catch (err) {
-      console.error("acceptJob error:", err);
+      logger.error("acceptJob error", { error: err.message, stack: err.stack });
     }
   });
 
@@ -363,14 +385,14 @@ io.on("connection", (socket) => {
       const { reassignBooking } = require("./services/assignmentEngine");
       await reassignBooking(bookingId, socket.partnerId);
 
-      console.log(`[socket] Booking ${bookingId} rejected by partner ${pid}, reassigning`);
+      logger.info("[socket] Booking rejected by partner, reassigning", { bookingId, partnerId: pid });
     } catch (err) {
-      console.error("rejectJob error:", err);
+      logger.error("rejectJob error", { error: err.message, stack: err.stack });
     }
   });
 
   socket.on("disconnect", () => {
-    console.log("❌ Client disconnected:", socket.id);
+    logger.debug("Socket disconnected", { socketId: socket.id });
   });
 });
 
@@ -381,5 +403,5 @@ io.on("connection", (socket) => {
 const PORT = process.env.PORT || 4000;
 
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  logger.info(`Server started`, { port: PORT, env: process.env.NODE_ENV || "development" });
 });

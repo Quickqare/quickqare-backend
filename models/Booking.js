@@ -223,6 +223,18 @@ const bookingSchema = new mongoose.Schema(
       trim: true,
     },
 
+    houseDetails: {
+      type: String,
+      default: null,
+      trim: true,
+    },
+
+    landmark: {
+      type: String,
+      default: null,
+      trim: true,
+    },
+
     /* ======================
        PAYMENT
     ====================== */
@@ -295,6 +307,7 @@ const bookingSchema = new mongoose.Schema(
         "IN_PROGRESS",
         "COMPLETED",
         "CANCELLED",
+        "NEEDS_RESCHEDULING",
       ],
       default: "PENDING_PAYMENT",
     },
@@ -304,6 +317,14 @@ const bookingSchema = new mongoose.Schema(
       enum: ["user", "partner", "system"],
       default: null,
     },
+
+    /* ======================
+       RESCHEDULE
+    ====================== */
+    rescheduleReason: { type: String, trim: true, default: null },
+    rescheduleRequestedAt: { type: Date, default: null },
+    rescheduledFromDate: { type: String, default: null },
+    rescheduledFromTime: { type: String, default: null },
 
     cancelledAt: {
       type: Date,
@@ -543,6 +564,16 @@ const bookingSchema = new mongoose.Schema(
     estimateRejectedAt: {
       type: Date,
       default: null,
+    },
+
+    // Tracks whether wallet credits ran after COMPLETED status was set.
+    // "pending"  → booking marked COMPLETED but credits not yet confirmed
+    // "credited" → all partner wallet credits succeeded
+    // "failed"   → credit retry exhausted; needs manual admin intervention
+    // Absent     → pre-feature booking (ignore in cron)
+    payoutStatus: {
+      type: String,
+      enum: ["pending", "credited", "failed"],
     },
   },
   { timestamps: true }

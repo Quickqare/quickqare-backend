@@ -1,0 +1,97 @@
+const Address = require("../models/Address");
+
+const VALID_LABELS = ["Home", "Work", "Other"];
+
+exports.getAddresses = async (req, res) => {
+  try {
+    const addresses = await Address.find({ user: req.user._id })
+      .sort({ isDefault: -1, createdAt: -1 })
+      .lean();
+
+    res.json({ success: true, addresses });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Failed to fetch addresses" });
+  }
+};
+
+exports.saveAddress = async (req, res) => {
+  try {
+    const {
+      label,
+      address,
+      pincode,
+      latitude,
+      longitude,
+      houseDetails,
+      landmark,
+    } = req.body;
+
+    if (!address || !pincode || !latitude || !longitude) {
+      return res.status(400).json({ success: false, message: "address, pincode, latitude and longitude are required" });
+    }
+
+    const normalizedLabel = VALID_LABELS.includes(label) ? label : "Home";
+
+    // If this is the user's first address, make it default
+    const existingCount = await Address.countDocuments({ user: req.user._id });
+    const isDefault = existingCount === 0;
+
+    const saved = await Address.create({
+      user: req.user._id,
+      label: normalizedLabel,
+      address: String(address).trim(),
+      pincode: String(pincode).trim(),
+      latitude: Number(latitude),
+      longitude: Number(longitude),
+      houseDetails: houseDetails ? String(houseDetails).trim() : null,
+      landmark: landmark ? String(landmark).trim() : null,
+      isDefault,
+    });
+
+    res.status(201).json({ success: true, address: saved });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Failed to save address" });
+  }
+};
+
+exports.deleteAddress = async (req, res) => {
+  try {
+    const deleted = await Address.findOneAndDelete({
+      _id: req.params.id,
+      user: req.user._id,
+    });
+
+    if (!deleted) {
+      return res.status(404).json({ success: false, message: "Address not found" });
+    }
+
+    // If we deleted the default, promote the newest remaining one
+    if (deleted.isDefault) {
+      const next = await Address.findOne({ user: req.user._id }).sort({ createdAt: -1 });
+      if (next) await Address.findByIdAndUpdate(next._id, { isDefault: true });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Failed to delete address" });
+  }
+};
+
+exports.setDefaultAddress = async (req, res) => {
+  try {
+    await Address.updateMany({ user: req.user._id }, { isDefault: false });
+    const updated = await Address.findOneAndUpdate(
+      { _id: req.params.id, user: req.user._id },
+      { isDefault: true },
+      { new: true }
+    );
+
+    if (!updated) {
+      return res.status(404).json({ success: false, message: "Address not found" });
+    }
+
+    res.json({ success: true, address: updated });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Failed to update default address" });
+  }
+};

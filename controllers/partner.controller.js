@@ -57,6 +57,8 @@ function toPartnerJobPayload(booking, partnerId) {
     customerName: booking?.user?.name || "Customer",
     customerPhone: booking?.user?.phone || "",
     address: String(booking?.address || "").trim(),
+    houseDetails: booking?.houseDetails ? String(booking.houseDetails).trim() : null,
+    landmark: booking?.landmark ? String(booking.landmark).trim() : null,
     pincode: booking?.pincode ? String(booking.pincode) : "",
     customerLatitude: Number.isFinite(customerLatitude) ? customerLatitude : null,
     customerLongitude: Number.isFinite(customerLongitude) ? customerLongitude : null,
@@ -670,7 +672,11 @@ exports.getPartnerBookings = async (req, res) => {
       });
     }
 
-    const bookings = await Booking.find({
+    const page  = Math.max(1, parseInt(req.query.page)  || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
+    const skip  = (page - 1) * limit;
+
+    const query = {
       $or: [{ partner: partnerId }, { additionalPartners: partnerId }],
       status: {
         $in: [
@@ -683,13 +689,20 @@ exports.getPartnerBookings = async (req, res) => {
           "COMPLETED",
         ],
       },
-    })
-      .populate("user", "name phone")
-      .sort({ createdAt: -1 })
-      .lean();
+    };
+
+    const [bookingDocs, total] = await Promise.all([
+      Booking.find(query)
+        .populate("user", "name phone")
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      Booking.countDocuments(query),
+    ]);
 
     const payloads = [];
-    for (const booking of bookings) {
+    for (const booking of bookingDocs) {
       try {
         payloads.push(toPartnerJobPayload(booking, partnerId));
       } catch (itemErr) {
@@ -703,6 +716,9 @@ exports.getPartnerBookings = async (req, res) => {
     return res.json({
       success: true,
       count: payloads.length,
+      total,
+      page,
+      pages: Math.ceil(total / limit),
       bookings: payloads,
     });
   } catch (err) {

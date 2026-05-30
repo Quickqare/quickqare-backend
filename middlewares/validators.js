@@ -19,6 +19,21 @@ exports.registerUserValidator = [
 ];
 
 /* =====================================================
+   USER PROFILE UPDATE VALIDATOR
+===================================================== */
+exports.updateProfileValidator = [
+  body("name")
+    .trim()
+    .notEmpty().withMessage("Name is required")
+    .isLength({ max: 100 }).withMessage("Name must be 100 characters or fewer"),
+
+  body("gender")
+    .trim()
+    .notEmpty().withMessage("Gender is required")
+    .isIn(["Male", "Female", "Other"]).withMessage("Gender must be Male, Female or Other"),
+];
+
+/* =====================================================
    PARTNER VALIDATORS (UPDATED FOR PRODUCTION)
    Supports multi-service system
 ===================================================== */

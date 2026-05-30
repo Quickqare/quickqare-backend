@@ -124,4 +124,11 @@ router.patch(
   bookingController.cancelBookingByUser
 );
 
+// User reschedule (only when status is NEEDS_RESCHEDULING)
+router.patch(
+  "/user/reschedule/:bookingId",
+  userAuth,
+  bookingController.rescheduleBooking
+);
+
 module.exports = router;

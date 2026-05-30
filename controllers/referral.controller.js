@@ -75,14 +75,28 @@ exports.getReferralStats = async (req, res) => {
 // Get referral history
 exports.getReferralHistory = async (req, res) => {
   try {
-    const referrals = await Referral.find({ referrerId: req.user.id })
-      .populate("referredId", "name phone")
-      .populate("couponId", "code discountValue expiryDate")
-      .sort({ createdAt: -1 });
+    const page  = Math.max(1, parseInt(req.query.page)  || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
+    const skip  = (page - 1) * limit;
+
+    const filter = { referrerId: req.user.id };
+
+    const [referrals, total] = await Promise.all([
+      Referral.find(filter)
+        .populate("referredId", "name phone")
+        .populate("couponId", "code discountValue expiryDate")
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit),
+      Referral.countDocuments(filter),
+    ]);
 
     res.json({
       success: true,
       referrals,
+      total,
+      page,
+      pages: Math.ceil(total / limit),
     });
   } catch (error) {
     console.error("Get referral history error:", error);

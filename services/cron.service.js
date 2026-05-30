@@ -8,6 +8,21 @@ No external scheduler library required.
 
 const STALE_HOURS = 48;
 const CHECK_INTERVAL_MS = 30 * 60 * 1000; // every 30 minutes
+
+// No-show thresholds: how many hours past scheduled time before we flag a booking
+const NO_SHOW_ACCEPTED_HOURS  = 2; // PARTNER_ACCEPTED but didn't show up
+const NO_SHOW_ON_THE_WAY_HOURS = 3; // ON_THE_WAY but never arrived
+const NO_SHOW_ARRIVED_HOURS   = 4; // ARRIVED but never started
+
+// Professional reasons shown to customer (auto-selected by cron)
+const RESCHEDULE_REASON = {
+  NO_SHOW:      "Due to an unforeseen emergency with your assigned professional",
+  ON_THE_WAY:   "Due to an unforeseen circumstance during transit",
+  ARRIVED:      "Due to an operational issue on our end",
+};
+const PAYOUT_RETRY_INTERVAL_MS = 10 * 60 * 1000; // every 10 minutes
+// Only retry payouts that have been pending for at least this long (process crash window)
+const PAYOUT_RETRY_AFTER_MS = 5 * 60 * 1000; // 5 minutes
 const SLOT_LOCK_CHECK_INTERVAL_MS = 5 * 60 * 1000; // every 5 minutes
 
 // QUEUED bookings are dispatched when they are this many hours before service.
@@ -329,6 +344,190 @@ async function sendHelperInviteReminders() {
 
 /*
 =====================================================
+RETRY ORPHANED PAYOUTS
+Catches COMPLETED bookings whose wallet credits never
+ran (e.g. process crash between status flip and credit).
+creditWallet is idempotent via unique WalletTransaction
+index, so retrying an already-credited booking is safe.
+=====================================================
+*/
+async function retryPendingPayouts() {
+  try {
+    const Booking = require("../models/Booking");
+    const { creditWallet } = require("../controllers/partnerWallet.controller");
+    const { syncPartnerOperationalState } = require("./scheduling_service");
+    const { processReferralReward } = require("../utils/referral");
+
+    const roundAmount = (v) => Math.round((Number(v || 0) + Number.EPSILON) * 100) / 100;
+
+    const cutoff = new Date(Date.now() - PAYOUT_RETRY_AFTER_MS);
+
+    const orphaned = await Booking.find({
+      status: "COMPLETED",
+      payoutStatus: "pending",
+      completedAt: { $lt: cutoff },
+    })
+      .select("_id partner additionalPartners partnerSettlement user")
+      .lean();
+
+    if (!orphaned.length) return;
+
+    console.log(`[cron] Retrying payouts for ${orphaned.length} orphaned booking(s)`);
+
+    for (const booking of orphaned) {
+      try {
+        const settlement = booking.partnerSettlement;
+
+        if (!settlement?.partnerEarningAmount || !booking.partner) {
+          console.error(`[cron] Booking ${booking._id} missing settlement or partner — marking failed`);
+          await Booking.findByIdAndUpdate(booking._id, { $set: { payoutStatus: "failed" } });
+          continue;
+        }
+
+        const additionalPartners = booking.additionalPartners || [];
+        const totalCount = 1 + additionalPartners.length;
+        const splitAmount = roundAmount(settlement.partnerEarningAmount / totalCount);
+
+        for (const additionalPartnerId of additionalPartners) {
+          await creditWallet({
+            partnerId: additionalPartnerId,
+            amount: splitAmount,
+            reason: "job_payment",
+            bookingId: booking._id,
+            description: `Earning from booking #${booking._id} (Pending 48h Settlement)`,
+            bucket: "pending",
+          });
+          await syncPartnerOperationalState(additionalPartnerId);
+        }
+
+        const mainShare =
+          additionalPartners.length > 0
+            ? roundAmount(settlement.partnerEarningAmount - splitAmount * additionalPartners.length)
+            : settlement.partnerEarningAmount;
+
+        await creditWallet({
+          partnerId: booking.partner,
+          amount: mainShare,
+          reason: "job_payment",
+          bookingId: booking._id,
+          description: `Earning from booking #${booking._id} (Pending 48h Settlement)`,
+          bucket: "pending",
+        });
+        await syncPartnerOperationalState(booking.partner);
+
+        await processReferralReward(booking.user, booking._id);
+
+        await Booking.findByIdAndUpdate(booking._id, { $set: { payoutStatus: "credited" } });
+
+        console.log(`[cron] Payout retry succeeded for booking ${booking._id}`);
+      } catch (err) {
+        console.error(`[cron] Payout retry failed for booking ${booking._id}:`, err.message);
+        await Booking.findByIdAndUpdate(booking._id, { $set: { payoutStatus: "failed" } });
+      }
+    }
+  } catch (err) {
+    console.error("[cron] retryPendingPayouts error:", err.message);
+  }
+}
+
+/*
+=====================================================
+DETECT NO-SHOW PARTNERS
+Flags bookings where the partner accepted but failed
+to attend. Moves them to NEEDS_RESCHEDULING and
+gives the partner a cancellation strike.
+
+Triggers (hours past scheduledStartAt):
+  PARTNER_ACCEPTED → 2h
+  ON_THE_WAY       → 3h
+  ARRIVED          → 4h
+=====================================================
+*/
+async function detectNoShowPartners() {
+  try {
+    const Booking = require("../models/Booking");
+    const Partner = require("../models/Partner");
+    const { notifyCustomerOfBookingStatus } = require("./pushNotification.service");
+    const now = new Date();
+
+    const checks = [
+      {
+        status: "PARTNER_ACCEPTED",
+        cutoffHours: NO_SHOW_ACCEPTED_HOURS,
+        reason: RESCHEDULE_REASON.NO_SHOW,
+      },
+      {
+        status: "ON_THE_WAY",
+        cutoffHours: NO_SHOW_ON_THE_WAY_HOURS,
+        reason: RESCHEDULE_REASON.ON_THE_WAY,
+      },
+      {
+        status: "ARRIVED",
+        cutoffHours: NO_SHOW_ARRIVED_HOURS,
+        reason: RESCHEDULE_REASON.ARRIVED,
+      },
+    ];
+
+    for (const { status, cutoffHours, reason } of checks) {
+      const cutoff = new Date(now.getTime() - cutoffHours * 60 * 60 * 1000);
+
+      const bookings = await Booking.find({
+        status,
+        scheduledStartAt: { $lt: cutoff },
+        rescheduleRequestedAt: null, // not already flagged
+        partner: { $ne: null },
+      }).select("_id user partner weeklyCancelCount");
+
+      for (const booking of bookings) {
+        // Atomically move to NEEDS_RESCHEDULING
+        const updated = await Booking.findOneAndUpdate(
+          { _id: booking._id, status, rescheduleRequestedAt: null },
+          {
+            $set: {
+              status: "NEEDS_RESCHEDULING",
+              rescheduleReason: reason,
+              rescheduleRequestedAt: now,
+            },
+          },
+          { new: true }
+        );
+        if (!updated) continue; // race condition — already handled
+
+        // Partner cancellation strike
+        if (booking.partner) {
+          const partner = await Partner.findById(booking.partner);
+          if (partner) {
+            partner.weeklyCancelCount = (partner.weeklyCancelCount || 0) + 1;
+            if (partner.weeklyCancelCount >= 5) {
+              partner.isBlocked = true;
+              console.warn(`[no-show] Auto-suspended partner ${partner._id} after no-show strike`);
+            }
+            await partner.save();
+          }
+        }
+
+        // Notify customer via push
+        notifyCustomerOfBookingStatus(booking.user, "NEEDS_RESCHEDULING", booking._id);
+
+        // Notify customer via socket
+        if (global.io) {
+          global.io.to(`user_${booking.user}`).emit("booking_update", {
+            bookingId: booking._id.toString(),
+            status: "NEEDS_RESCHEDULING",
+            rescheduleReason: reason,
+          });
+        }
+
+        console.log(`[no-show] Booking ${booking._id} (was ${status}) → NEEDS_RESCHEDULING. Partner ${booking.partner} struck.`);
+      }
+    }
+  } catch (err) {
+    console.error("[cron] detectNoShowPartners error:", err.message);
+  }
+}
+
+/*
+=====================================================
 INIT — called once after MongoDB connects
 =====================================================
 */
@@ -339,12 +538,16 @@ function initCronJobs() {
   cleanupExpiredSlotLocks();
   sendJobReminders();
   sendHelperInviteReminders();
+  retryPendingPayouts();
+  detectNoShowPartners();
 
   setInterval(cancelStaleBookings, CHECK_INTERVAL_MS);
   setInterval(dispatchQueuedBookings, CHECK_INTERVAL_MS);
   setInterval(cleanupExpiredSlotLocks, SLOT_LOCK_CHECK_INTERVAL_MS);
   setInterval(sendJobReminders, REMINDER_INTERVAL_MS);
   setInterval(sendHelperInviteReminders, REMINDER_INTERVAL_MS);
+  setInterval(retryPendingPayouts, PAYOUT_RETRY_INTERVAL_MS);
+  setInterval(detectNoShowPartners, CHECK_INTERVAL_MS);
 
   if (process.env.NODE_ENV !== "test") {
     console.log(
@@ -368,4 +571,6 @@ module.exports = {
   cleanupExpiredSlotLocks,
   sendJobReminders,
   sendHelperInviteReminders,
+  retryPendingPayouts,
+  detectNoShowPartners,
 };

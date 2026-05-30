@@ -11,12 +11,14 @@ reduce API billing costs drastically.
 =====================================================
 */
 const mapsCache = new Map();
-const CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+const REVGEO_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours — reverse geocode should stay fresh
+const SEARCH_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days — search results rarely change
 
 setInterval(() => {
   const now = Date.now();
   for (const [key, value] of mapsCache.entries()) {
-    if (now - value.timestamp > CACHE_TTL_MS) {
+    const ttl = value.ttl || SEARCH_CACHE_TTL_MS;
+    if (now - value.timestamp > ttl) {
       mapsCache.delete(key);
     }
   }
@@ -44,7 +46,7 @@ exports.reverseGeocode = async (req, res) => {
     // Check Cache (round coordinate precision to ~11m)
     const cacheKey = `revgeo_${latitude.toFixed(4)}_${longitude.toFixed(4)}`;
     const cached = mapsCache.get(cacheKey);
-    if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+    if (cached && Date.now() - cached.timestamp < REVGEO_CACHE_TTL_MS) {
       trackApiCall("customer_reverse_geocode", { cacheHit: true });
       return res.json(cached.data);
     }
@@ -75,6 +77,7 @@ exports.reverseGeocode = async (req, res) => {
 
     mapsCache.set(cacheKey, {
       timestamp: Date.now(),
+      ttl: REVGEO_CACHE_TTL_MS,
       data: responsePayload,
     });
 
@@ -108,7 +111,7 @@ exports.searchAddress = async (req, res) => {
 
     const cacheKey = `search_${query.toLowerCase()}`;
     const cached = mapsCache.get(cacheKey);
-    if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+    if (cached && Date.now() - cached.timestamp < SEARCH_CACHE_TTL_MS) {
       trackApiCall("customer_address_search", { cacheHit: true });
       return res.json(cached.data);
     }

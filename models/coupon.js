@@ -70,12 +70,13 @@ const couponSchema = new mongoose.Schema(
 
     /* =====================
        APPLICABLE SERVICES (OPTIONAL)
-       Example: only beauty category
     ===================== */
-    applicableCategories: [
-      {
-        type: String,
-      },
+    applicableCategories: [{ type: String }],
+
+    // If populated, coupon is valid ONLY for these specific services.
+    // Empty = valid for all services (default).
+    applicableServices: [
+      { type: mongoose.Schema.Types.ObjectId, ref: "Service" },
     ],
 
     /* =====================

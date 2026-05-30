@@ -7,12 +7,14 @@ const {
   deleteAccount,
 } = require("../controllers/user.controller");
 const userAuth = require("../middlewares/userAuth");
+const validate = require("../middlewares/validate");
+const { updateProfileValidator } = require("../middlewares/validators");
 
 /**
  * Update user profile
  * PATCH /api/user/profile
  */
-router.patch("/profile", userAuth, updateProfile);
+router.patch("/profile", userAuth, updateProfileValidator, validate, updateProfile);
 
 /**
  * Get profile edit history
