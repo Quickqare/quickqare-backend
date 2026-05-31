@@ -47,6 +47,19 @@ exports.createOrder = async (req, res) => {
     }
 
     /* =====================
+       OWNERSHIP CHECK
+       The booking must belong to the authenticated user. Without this, any
+       authenticated user could create/overwrite a Razorpay order against
+       someone else's booking (IDOR) and disrupt their checkout.
+    ===================== */
+    if (String(booking.user) !== String(req.user._id)) {
+      return res.status(403).json({
+        success: false,
+        message: "Not authorized for this booking",
+      });
+    }
+
+    /* =====================
        PREVENT DOUBLE PAYMENT
     ===================== */
     if (booking.payment?.status === "PAID") {

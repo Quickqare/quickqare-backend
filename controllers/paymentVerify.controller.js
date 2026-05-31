@@ -1,9 +1,8 @@
 const crypto = require("crypto");
 const Booking = require("../models/Booking");
-const { assignBooking } = require("../services/assignmentEngine");
 const { buildDateTime } = require("../services/scheduling_service");
-const { releaseSlotCapacityByBookingId, markSlotLockPaid } = require("../services/slotCapacity.service");
-const { recordCouponRedemption } = require("../services/coupon.service");
+const { releaseSlotCapacityByBookingId } = require("../services/slotCapacity.service");
+const { finalizePaidBooking } = require("../services/paymentFinalize.service");
 
 /* =====================================================
    VERIFY RAZORPAY PAYMENT → AUTO ASSIGN PARTNER
@@ -41,6 +40,19 @@ exports.verifyRazorpayPayment = async (req, res) => {
       return res.status(404).json({
         success: false,
         message: "Booking not found",
+      });
+    }
+
+    /* =====================
+       OWNERSHIP CHECK
+       The booking must belong to the authenticated user. The signature check
+       below already binds the order to the payment, but scoping by user closes
+       the IDOR where one user submits verification against another's booking.
+    ===================== */
+    if (String(booking.user) !== String(req.user._id)) {
+      return res.status(403).json({
+        success: false,
+        message: "Not authorized for this booking",
       });
     }
 
@@ -118,31 +130,15 @@ exports.verifyRazorpayPayment = async (req, res) => {
       });
     }
 
-    const scheduledStart = booking.scheduledStartAt 
-      ? new Date(booking.scheduledStartAt) 
-      : buildDateTime(booking.scheduledDate, booking.scheduledTime);
+    // Finalize via the shared service so client verify and the Razorpay webhook
+    // always run identical logic. Idempotent — whichever path arrives first wins.
+    const { outcome } = await finalizePaidBooking(booking, {
+      razorpay_payment_id,
+      razorpay_order_id,
+      razorpay_signature,
+    });
 
-    const timeToServiceMs = scheduledStart.getTime() - Date.now();
-    const hoursToService = timeToServiceMs / (1000 * 60 * 60);
-
-    const newStatus = hoursToService > 24 ? "QUEUED" : "PENDING_ASSIGNMENT";
-
-    // ATOMIC UPDATE: Prevent duplicate webhook & client requests from running assignment twice
-    const updatedBooking = await Booking.findOneAndUpdate(
-      { _id: bookingId, "payment.status": { $ne: "PAID" } },
-      {
-        $set: {
-          status: newStatus,
-          "payment.razorpay_payment_id": razorpay_payment_id,
-          "payment.razorpay_order_id": razorpay_order_id,
-          "payment.razorpay_signature": razorpay_signature,
-          "payment.status": "PAID"
-        }
-      },
-      { new: true }
-    );
-
-    if (!updatedBooking) {
+    if (outcome === "already_paid") {
       return res.json({
         success: true,
         message: "Payment already verified",
@@ -150,69 +146,19 @@ exports.verifyRazorpayPayment = async (req, res) => {
       });
     }
 
-    await markSlotLockPaid(updatedBooking._id);
-    updatedBooking.lockedUntil = null;
-    updatedBooking.slotReservationExpiresAt = null;
-    await updatedBooking.save();
-
-    // Record coupon redemption — previously only the dead verifyPayment in
-    // payment.controller.js did this, so production was paying through coupons
-    // without ever marking them used. Fail-soft: a redemption-tracking error
-    // must not undo a successful payment.
-    if (updatedBooking.couponId && updatedBooking.couponCode) {
-      try {
-        await recordCouponRedemption({
-          couponId: updatedBooking.couponId,
-          bookingId: updatedBooking._id,
-          customerId: updatedBooking.user,
-          discountAmountInr:
-            updatedBooking.discountAmount ||
-            updatedBooking.couponDiscountAmount ||
-            0,
-        });
-      } catch (couponErr) {
-        console.error(
-          "[payment-verify] recordCouponRedemption failed (non-fatal):",
-          couponErr.message
-        );
-      }
-    }
-
-    // Notify the customer so BookingStatusScreen flips off PENDING_PAYMENT
-    // immediately instead of waiting for the next poll.
-    if (global.io) {
-      global.io.to(`user_${updatedBooking.user}`).emit("booking_update", {
-        bookingId: updatedBooking._id.toString(),
-        status: hoursToService > 24 ? "QUEUED" : "SEARCHING",
-        paymentConfirmed: true,
-      });
-    }
-
-    if (hoursToService > 24) {
+    if (outcome === "queued") {
       return res.json({
         success: true,
         message: "Payment verified. Booking queued for partner assignment closer to the service date.",
         bookingId: booking._id,
       });
-    } else {
-      // Set the public-facing SEARCHING status before assignBooking flips it to
-      // ASSIGNING_LOCK → ASSIGNED — gives the customer instant visible feedback.
-      await Booking.updateOne(
-        { _id: updatedBooking._id, status: "PENDING_ASSIGNMENT" },
-        { $set: { status: "SEARCHING" } }
-      );
-
-      /* =====================
-         AUTO ASSIGN PARTNER
-      ===================== */
-      await assignBooking(booking._id);
-
-      return res.json({
-        success: true,
-        message: "Payment verified & searching for partner",
-        bookingId: booking._id,
-      });
     }
+
+    return res.json({
+      success: true,
+      message: "Payment verified & searching for partner",
+      bookingId: booking._id,
+    });
   } catch (error) {
     console.error("Payment verification error:", error);
 

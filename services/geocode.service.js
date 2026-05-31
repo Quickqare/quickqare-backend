@@ -57,6 +57,28 @@ function extractPincodeFromResult(result) {
   return normalizePincode(String(result?.formatted_address || ""));
 }
 
+function extractCity(components = []) {
+  const order = ["administrative_area_level_2", "locality", "administrative_area_level_1"];
+  for (const type of order) {
+    const c = components.find((x) => Array.isArray(x?.types) && x.types.includes(type));
+    if (c) return String(c.long_name || c.short_name || "").trim();
+  }
+  return "";
+}
+
+function extractArea(components = []) {
+  const types = ["sublocality_level_1", "sublocality", "neighborhood", "route"];
+  const parts = [];
+  for (const type of types) {
+    const c = components.find((x) => Array.isArray(x?.types) && x.types.includes(type));
+    if (c) {
+      const name = String(c.long_name || c.short_name || "").trim();
+      if (name && !parts.includes(name)) parts.push(name);
+    }
+  }
+  return parts.join(", ");
+}
+
 async function reverseGeocode(latitude, longitude, source = "unknown") {
   if (!GOOGLE_MAPS_SERVER_API_KEY) {
     return {
@@ -108,10 +130,13 @@ async function reverseGeocode(latitude, longitude, source = "unknown") {
     };
   }
 
+  const components = first?.address_components || [];
   const result = {
     ok: true,
     pincode: extractPincodeFromResult(first),
     address: String(first?.formatted_address || "").trim(),
+    city: extractCity(components),
+    area: extractArea(components),
     google: { status: googleStatus || "OK", errorMessage: googleErrorMessage || "" },
   };
   geocodeCache.set(cacheKey, { result, ts: Date.now() });

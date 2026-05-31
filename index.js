@@ -92,6 +92,17 @@ app.set("trust proxy", 1); // important for rate limit + deployment
 
 app.use(helmet());
 app.use(cors(corsOptions));
+
+// Razorpay webhook MUST be mounted before express.json() so its handler
+// receives the raw request body — signature verification runs over the exact
+// bytes Razorpay sent, which a JSON re-serialize would break.
+const { handleRazorpayWebhook } = require("./controllers/razorpayWebhook.controller");
+app.post(
+  "/api/payment/webhook",
+  express.raw({ type: "application/json", limit: "1mb" }),
+  handleRazorpayWebhook
+);
+
 app.use(express.json({ limit: "1mb" }));
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 

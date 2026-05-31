@@ -71,6 +71,8 @@ exports.reverseGeocode = async (req, res) => {
         longitude,
         pincode: resolved.pincode || "",
         address: resolved.address || "",
+        city: resolved.city || "",
+        area: resolved.area || "",
       },
       google: resolved.google || null,
     };

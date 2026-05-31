@@ -17,6 +17,25 @@ const adminAuth = require("../middlewares/adminAuth");
  * ======================================
  */
 
+/* PUBLIC PINCODE SERVICEABILITY CHECK — no auth required
+   GET /api/zones/check?pincode=500001
+   Returns { serviceable: true/false, zoneName }
+*/
+router.get("/check", async (req, res) => {
+  try {
+    const { resolveZoneForPincode } = require("../services/zone.service");
+    const pincode = String(req.query.pincode || "").trim();
+    if (!/^\d{6}$/.test(pincode)) {
+      return res.status(400).json({ success: false, serviceable: false, message: "Invalid pincode" });
+    }
+    const zone = await resolveZoneForPincode(pincode);
+    const serviceable = !!(zone && zone.isActive !== false && zone.customerAppEnabled !== false);
+    return res.json({ success: true, serviceable, zoneName: zone?.name || null });
+  } catch (err) {
+    return res.status(500).json({ success: false, serviceable: false });
+  }
+});
+
 /* GET ALL ZONES
    GET /api/zones
 */

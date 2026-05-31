@@ -31,6 +31,16 @@ const addressSchema = new mongoose.Schema(
       type: Number,
       required: true,
     },
+    city: {
+      type: String,
+      trim: true,
+      default: null,
+    },
+    area: {
+      type: String,
+      trim: true,
+      default: null,
+    },
     houseDetails: {
       type: String,
       trim: true,

@@ -22,6 +22,8 @@ exports.saveAddress = async (req, res) => {
       pincode,
       latitude,
       longitude,
+      city,
+      area,
       houseDetails,
       landmark,
     } = req.body;
@@ -31,8 +33,37 @@ exports.saveAddress = async (req, res) => {
     }
 
     const normalizedLabel = VALID_LABELS.includes(label) ? label : "Home";
+    const lat = Number(latitude);
+    const lng = Number(longitude);
 
-    // If this is the user's first address, make it default
+    // Upsert: if the user already has an address at the same pincode within ~100m, update it
+    const COORD_TOLERANCE = 0.001; // ~111 m per 0.001 degree
+    const existing = await Address.findOne({
+      user: req.user._id,
+      pincode: String(pincode).trim(),
+      latitude:  { $gte: lat - COORD_TOLERANCE, $lte: lat + COORD_TOLERANCE },
+      longitude: { $gte: lng - COORD_TOLERANCE, $lte: lng + COORD_TOLERANCE },
+    });
+
+    if (existing) {
+      const updated = await Address.findByIdAndUpdate(
+        existing._id,
+        {
+          label: normalizedLabel,
+          address: String(address).trim(),
+          latitude: lat,
+          longitude: lng,
+          city:         city         ? String(city).trim()         : null,
+          area:         area         ? String(area).trim()         : null,
+          houseDetails: houseDetails ? String(houseDetails).trim() : null,
+          landmark:     landmark     ? String(landmark).trim()     : null,
+        },
+        { new: true }
+      );
+      return res.status(200).json({ success: true, address: updated });
+    }
+
+    // No nearby duplicate — create new entry
     const existingCount = await Address.countDocuments({ user: req.user._id });
     const isDefault = existingCount === 0;
 
@@ -41,10 +72,12 @@ exports.saveAddress = async (req, res) => {
       label: normalizedLabel,
       address: String(address).trim(),
       pincode: String(pincode).trim(),
-      latitude: Number(latitude),
-      longitude: Number(longitude),
+      latitude: lat,
+      longitude: lng,
+      city:         city         ? String(city).trim()         : null,
+      area:         area         ? String(area).trim()         : null,
       houseDetails: houseDetails ? String(houseDetails).trim() : null,
-      landmark: landmark ? String(landmark).trim() : null,
+      landmark:     landmark     ? String(landmark).trim()     : null,
       isDefault,
     });
 

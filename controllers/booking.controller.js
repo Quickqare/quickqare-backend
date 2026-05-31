@@ -242,10 +242,11 @@ exports.createBooking = async (req, res) => {
 
         const categorySlug = await resolveServiceCategorySlug(service);
         const quantity = Math.max(Number(item.quantity || 1), 1);
-        const configuredPrice = Number(service.price || 0);
-        const fallbackClientPrice = Number(item.price || 0);
-        const price =
-          configuredPrice > 0 ? configuredPrice : fallbackClientPrice;
+        // Pricing is ALWAYS taken from the server-side Service record. The
+        // client-supplied price is never trusted — a tampered request could
+        // otherwise set an arbitrary amount. A service with no valid configured
+        // price is rejected outright rather than falling back to client input.
+        const price = Number(service.price || 0);
         const durationMinutes = Math.max(
           Number(service.duration || 0) || 0,
           1
