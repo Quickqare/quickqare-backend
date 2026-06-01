@@ -98,6 +98,8 @@ router.patch("/:id", audit("admin.coupons.update"), async (req, res) => {
     if (req.body.usageLimit !== undefined) patch.usageLimit = Number(req.body.usageLimit);
     if (req.body.minAmount !== undefined) patch.minAmount = Number(req.body.minAmount);
     if (req.body.minOrder !== undefined) patch.minAmount = Number(req.body.minOrder);
+    if (req.body.maxDiscount !== undefined) patch.maxDiscount = req.body.maxDiscount !== null ? Number(req.body.maxDiscount) : null;
+    if (req.body.perUserLimit !== undefined) patch.perUserLimit = Number(req.body.perUserLimit);
     if (req.body.isActive !== undefined) patch.isActive = Boolean(req.body.isActive);
     if (req.body.applicableServices !== undefined) {
       patch.applicableServices = Array.isArray(req.body.applicableServices)
@@ -113,6 +115,34 @@ router.patch("/:id", audit("admin.coupons.update"), async (req, res) => {
     return success(res, row, { requestId: req.requestId });
   } catch (error) {
     return fail(res, 500, "COUPON_UPDATE_FAILED", "Unable to update coupon", error.message, {
+      requestId: req.requestId,
+    });
+  }
+});
+
+router.delete("/:id", audit("admin.coupons.delete"), async (req, res) => {
+  try {
+    const couponId = asSingleString(req.params.id);
+    if (!couponId || !mongoose.Types.ObjectId.isValid(couponId)) {
+      return fail(res, 400, "INVALID_ID", "Invalid coupon id", null, { requestId: req.requestId });
+    }
+
+    const usageCount = await CouponRedemption.countDocuments({ couponId });
+    if (usageCount > 0) {
+      return fail(res, 409, "COUPON_HAS_REDEMPTIONS",
+        `Cannot delete — this coupon has been redeemed ${usageCount} time(s). Disable it instead.`,
+        null, { requestId: req.requestId }
+      );
+    }
+
+    const deleted = await Coupon.findByIdAndDelete(couponId);
+    if (!deleted) {
+      return fail(res, 404, "NOT_FOUND", "Coupon not found", null, { requestId: req.requestId });
+    }
+
+    return success(res, { deleted: true }, { requestId: req.requestId });
+  } catch (error) {
+    return fail(res, 500, "COUPON_DELETE_FAILED", "Unable to delete coupon", error.message, {
       requestId: req.requestId,
     });
   }

@@ -1,6 +1,6 @@
 const Address = require("../models/Address");
 
-const VALID_LABELS = ["Home", "Work", "Other"];
+const VALID_LABELS = ["Home", "Work", "Hotel", "Other"];
 
 exports.getAddresses = async (req, res) => {
   try {
@@ -84,6 +84,45 @@ exports.saveAddress = async (req, res) => {
     res.status(201).json({ success: true, address: saved });
   } catch (err) {
     res.status(500).json({ success: false, message: "Failed to save address" });
+  }
+};
+
+exports.updateAddress = async (req, res) => {
+  try {
+    const {
+      label, address, pincode, latitude, longitude,
+      city, area, houseDetails, landmark,
+    } = req.body;
+
+    if (!address || !pincode || !latitude || !longitude) {
+      return res.status(400).json({ success: false, message: "address, pincode, latitude and longitude are required" });
+    }
+
+    const normalizedLabel = ["Home", "Work", "Hotel", "Other"].includes(label) ? label : "Home";
+
+    const updated = await Address.findOneAndUpdate(
+      { _id: req.params.id, user: req.user._id },
+      {
+        label: normalizedLabel,
+        address:      String(address).trim(),
+        pincode:      String(pincode).trim(),
+        latitude:     Number(latitude),
+        longitude:    Number(longitude),
+        city:         city         ? String(city).trim()         : null,
+        area:         area         ? String(area).trim()         : null,
+        houseDetails: houseDetails ? String(houseDetails).trim() : null,
+        landmark:     landmark     ? String(landmark).trim()     : null,
+      },
+      { new: true }
+    );
+
+    if (!updated) {
+      return res.status(404).json({ success: false, message: "Address not found" });
+    }
+
+    res.json({ success: true, address: updated });
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Failed to update address" });
   }
 };
 
