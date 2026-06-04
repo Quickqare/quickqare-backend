@@ -1588,7 +1588,10 @@ exports.getBookingById = async (req, res) => {
     const booking = await Booking.findOne({
       _id: req.params.bookingId,
       user: req.user._id,
-    }).lean();
+    })
+      .populate("partner", "name phone rating")
+      .populate("additionalPartners", "name phone rating")
+      .lean();
 
     if (!booking) {
       return res.status(404).json({ success: false, message: "Booking not found" });

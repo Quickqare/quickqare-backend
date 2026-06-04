@@ -2,11 +2,38 @@ const Booking = require("../models/Booking");
 const SlotCapacity = require("../models/SlotCapacity");
 const SlotLock = require("../models/SlotLock");
 const { computeRequiredPartners } = require("./assignmentEngine");
+const { resolveZoneForPincode, getZoneCoveragePincodes } = require("./zone.service");
 
 const SLOT_LOCK_MINUTES = 10;
 
 function getSchedulingService() {
   return require("./scheduling_service");
+}
+
+/*
+=====================================================
+CAPACITY SCOPE
+Partners are shared across every pincode a zone covers, so capacity must be
+counted and reserved per ZONE — not per raw pincode. Keying by pincode let each
+pincode reserve the full shared pool independently, oversubscribing the zone.
+
+Returns a stable per-zone key (so all pincodes in the zone share one counter)
+plus the zone's coverage pincodes (used to count only partners who actually
+serve this zone). Unzoned pincodes — which cannot take bookings anyway — fall
+back to per-pincode scope, preserving the previous behaviour.
+=====================================================
+*/
+async function resolveCapacityScope(pincode) {
+  const raw = String(pincode || "").trim();
+  const zone = await resolveZoneForPincode(raw);
+  if (!zone) {
+    return { scopeKey: raw, coveragePincodes: raw ? [raw] : [] };
+  }
+  const coveragePincodes = getZoneCoveragePincodes(zone);
+  return {
+    scopeKey: `zone:${String(zone._id)}`,
+    coveragePincodes: coveragePincodes.length ? coveragePincodes : raw ? [raw] : [],
+  };
 }
 
 function normalizeDateKey(dateInput) {
@@ -52,7 +79,7 @@ function buildBookingWindow(booking) {
   return { startAt, endAt, durationMinutes };
 }
 
-async function getEligibleUnitsForWindow(booking, slotStart, slotEnd, session) {
+async function getEligibleUnitsForWindow(booking, slotStart, slotEnd, coveragePincodes, session) {
   const { findEligiblePartnersForBooking } = getSchedulingService();
 
   const candidates = await findEligiblePartnersForBooking(
@@ -69,10 +96,11 @@ async function getEligibleUnitsForWindow(booking, slotStart, slotEnd, session) {
       pincode: booking.pincode,
       rejectedPartners: booking.rejectedPartners || [],
     },
-    // 2nd arg is the pincode-stage filter. Pass [] (no filter) so slot-capacity
-    // counting considers the whole zone — matching the previous behaviour.
+    // 2nd arg is the pincode-stage filter. Pass the zone's coverage pincodes so
+    // the count reflects partners who actually serve THIS zone (the same reach
+    // as the assignment engine's widest stage) — not every partner in the system.
     // rejectedPartners is read from the booking object above, not from here.
-    [],
+    coveragePincodes,
     { requireOnline: false, session }
   );
 
@@ -81,10 +109,14 @@ async function getEligibleUnitsForWindow(booking, slotStart, slotEnd, session) {
 
 async function getSlotAvailabilitySnapshot(booking, slotStart, slotEnd, session) {
   const requiredCount = Math.max(Number((await computeRequiredPartners(booking))?.requiredCount) || 1, 1);
-  const eligibleUnits = await getEligibleUnitsForWindow(booking, slotStart, slotEnd, session);
+  const { scopeKey, coveragePincodes } = await resolveCapacityScope(booking.pincode);
+  const eligibleUnits = await getEligibleUnitsForWindow(booking, slotStart, slotEnd, coveragePincodes, session);
   const dateKey = normalizeDateKey(slotStart);
   const time = getTimeLabel(slotStart);
-  const slotKey = buildSlotKey(booking.pincode, dateKey, time);
+  // Key capacity by zone (not raw pincode) so every pincode the zone covers
+  // shares ONE counter — otherwise each pincode reserves the full shared pool
+  // independently and the slot is oversold.
+  const slotKey = buildSlotKey(scopeKey, dateKey, time);
 
   const capacity = await SlotCapacity.findOneAndUpdate(
     { slotKey },

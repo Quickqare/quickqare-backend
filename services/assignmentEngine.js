@@ -1,5 +1,6 @@
 const Booking = require("../models/Booking");
 const User = require("../models/User");
+const Partner = require("../models/Partner");
 const {
   findEligiblePartnersForBooking,
   syncPartnerOperationalState,
@@ -276,16 +277,71 @@ async function assignBooking(bookingId, opts = {}) {
         continue;
       }
 
-      const selectedPartners = rankedPartners
-        .slice(0, requiredCount)
-        .map((r) => r.partner);
+      // ── ATOMIC PARTNER CLAIM ──────────────────────────────────────────
+      // Walk the ranked candidates and atomically claim each partner for this
+      // exact slot via a guarded $push. MongoDB serialises writes to a single
+      // document, so when two bookings race for the same partner (e.g. a
+      // "tatkal" rush on one slot) only the first claim's guard passes — the
+      // second sees the slot already present, returns null, and that booking
+      // moves on to the next candidate. This is what prevents one partner being
+      // handed two overlapping jobs; the per-booking ASSIGNING_LOCK cannot,
+      // because it locks the booking, not the partner.
+      const claimDate = booking.scheduledDate;
+      const claimTime = booking.scheduledTime;
+      const selectedPartners = [];
+      const claimedIds = new Set();
+
+      for (const entry of rankedPartners) {
+        if (selectedPartners.length >= requiredCount) break;
+        const candidateId = entry.partner._id;
+        if (claimedIds.has(String(candidateId))) continue;
+
+        const claimed = await Partner.findOneAndUpdate(
+          {
+            _id: candidateId,
+            busySlots: {
+              $not: { $elemMatch: { date: claimDate, time: claimTime } },
+            },
+          },
+          { $push: { busySlots: { date: claimDate, time: claimTime } } },
+          { new: true }
+        );
+
+        if (claimed) {
+          selectedPartners.push(claimed);
+          claimedIds.add(String(candidateId));
+        }
+      }
+
+      // Couldn't lock enough distinct partners — parallel assignments won the
+      // race for the rest. Release whatever we did grab (sync rebuilds busySlots
+      // from committed bookings, dropping our uncommitted claim) and widen to the
+      // next stage. A half-staffed team is worse than retrying.
+      if (selectedPartners.length < requiredCount) {
+        for (const claimedPartner of selectedPartners) {
+          await syncPartnerOperationalState(claimedPartner._id);
+        }
+        booking.assignmentAudit.push({
+          stage,
+          event: "CLAIM_CONTENTION",
+          searchedPincodes: pincodesToSearch,
+          notes: `Claimed ${selectedPartners.length}/${requiredCount} partner(s) before parallel assignments took the rest — retrying wider`,
+          candidates: rankedPartners
+            .slice(0, 5)
+            .map((e) => ({ partnerId: e.partner._id, score: e.score })),
+        });
+        await booking.save();
+        continue;
+      }
+
       const primaryPartner = selectedPartners[0];
       const additionalPartners = selectedPartners.slice(1);
 
-      // Identify standby partners (up to 3 next best candidates)
+      // Identify standby partners (up to 3 next best candidates we didn't claim)
       const standbyCandidates = rankedPartners
-        .slice(requiredCount, requiredCount + 3)
-        .map((r) => r.partner._id);
+        .filter((e) => !claimedIds.has(String(e.partner._id)))
+        .slice(0, 3)
+        .map((e) => e.partner._id);
 
       // Build proportional workload + payout mapping.
       // The last partner absorbs the rounding remainder so the ratios sum to
@@ -365,15 +421,17 @@ async function assignBooking(bookingId, opts = {}) {
         }
       }
 
-      // Update all assigned partners' state
+      // Reconcile each claimed partner's operational state now that the booking
+      // is persisted with them attached. The slot was already locked by the
+      // atomic claim above; here we stamp the fairness timestamp and let
+      // syncPartnerOperationalState recompute activeJobs/busySlots from committed
+      // bookings so the live counts are exact. A targeted $set (not a full-doc
+      // save) avoids clobbering any concurrent update to the partner.
       for (const teamPartner of selectedPartners) {
-        teamPartner.activeJobs += 1;
-        teamPartner.lastAssignedAt = new Date();
-        teamPartner.busySlots = [
-          ...(teamPartner.busySlots || []),
-          { date: booking.scheduledDate, time: booking.scheduledTime },
-        ];
-        await teamPartner.save();
+        await Partner.updateOne(
+          { _id: teamPartner._id },
+          { $set: { lastAssignedAt: new Date() } }
+        );
         await syncPartnerOperationalState(teamPartner._id);
       }
 

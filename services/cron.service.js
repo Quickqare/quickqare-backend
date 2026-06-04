@@ -150,9 +150,16 @@ async function dispatchQueuedBookings() {
 
       // requireOnline:false — partner may not be online 3 h before service but
       // will be by the time the job starts. Assignment locks them in now.
-      assignBooking(b._id, { requireOnline: false }).catch((err) => {
+      //
+      // Await sequentially: dispatching one booking at a time serialises partner
+      // selection so a batch of same-slot bookings doesn't stampede the same
+      // partner. The atomic claim inside assignBooking is the hard guarantee;
+      // this just avoids needless write contention from firing them in parallel.
+      try {
+        await assignBooking(b._id, { requireOnline: false });
+      } catch (err) {
         console.error(`[cron] assignBooking failed for ${b._id}:`, err.message);
-      });
+      }
     }
   } catch (err) {
     console.error("[cron] dispatchQueuedBookings error:", err.message);
