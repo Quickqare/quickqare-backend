@@ -160,6 +160,31 @@ const partnerSchema = new mongoose.Schema(
     },
 
     /* =====================
+       H3 GEOSPATIAL
+       h3Cell: live GPS cell (res 7) — updated on every heartbeat, used for distance scoring
+       h3ServiceCells: derived from serviceAreas pincodes — best-effort
+       assignedHubId: admin-assigned Hub (Urban-Company-style) — used for assignment matching
+    ===================== */
+    h3Cell: {
+      type: String,
+      default: null,
+      index: true,
+    },
+
+    h3ServiceCells: {
+      type: [String],
+      default: [],
+      index: true,
+    },
+
+    assignedHubId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Hub",
+      default: null,
+      index: true,
+    },
+
+    /* =====================
        AVAILABILITY
     ===================== */
     isOnline: {
@@ -213,6 +238,17 @@ const partnerSchema = new mongoose.Schema(
     lastCancelReset: {
       type: Date,
       default: Date.now,
+    },
+
+    // Daily cancel limit tracking (1 cancellation allowed per calendar day)
+    dailyCancelCount: {
+      type: Number,
+      default: 0,
+    },
+
+    lastDailyCancelDate: {
+      type: String, // YYYY-MM-DD
+      default: null,
     },
 
     // Set when partner is auto-suspended (>= 5 weekly cancellations or admin action).

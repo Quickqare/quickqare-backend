@@ -1,6 +1,7 @@
 const Booking = require("../models/Booking");
 const User = require("../models/User");
 const Partner = require("../models/Partner");
+const AdminSetting = require("../admin/models/AdminSetting");
 const {
   findEligiblePartnersForBooking,
   syncPartnerOperationalState,
@@ -8,9 +9,70 @@ const {
   AC_CATEGORY_SLUGS,
   AC_MAX_CAPACITY_MINUTES,
 } = require("./scheduling_service");
-const { resolveZoneForPincode, getZoneCoveragePincodes } = require("./zone.service");
+const { resolveZoneForPincode, getZoneCoveragePincodes, resolveHubsForCells } = require("./zone.service");
 const { escalateUnassignedBooking } = require("./escalation.service");
 const { sendJobAssignedPush } = require("./pushNotification.service");
+const { getH3CellsForStage } = require("../utils/h3");
+
+// Cached AdminSetting flag — refreshed every 60 s to avoid a DB hit per booking.
+let _useH3Cache = { value: false, expiresAt: 0 };
+
+async function getUseH3Flag() {
+  if (Date.now() < _useH3Cache.expiresAt) return _useH3Cache.value;
+  try {
+    const setting = await AdminSetting.findOne().select("useH3Zones").lean();
+    _useH3Cache = { value: Boolean(setting?.useH3Zones), expiresAt: Date.now() + 60_000 };
+  } catch {
+    _useH3Cache.expiresAt = Date.now() + 10_000; // retry sooner on error
+  }
+  return _useH3Cache.value;
+}
+
+/*
+=====================================================
+HUB SHADOW LOOKUP
+Runs silently alongside pincode assignment (Stage 3).
+Logs whether the Hub (H3) path would have found the
+same partners. Never throws — fire-and-forget.
+=====================================================
+*/
+async function runH3ShadowLookup(booking, stage, pincodePartnerIds) {
+  try {
+    if (!booking.h3Cell) return;
+    const h3Cells = getH3CellsForStage(booking.h3Cell, stage);
+    if (!h3Cells.length) return;
+
+    const hubIds = await resolveHubsForCells(h3Cells);
+    if (!hubIds.length) {
+      console.log(
+        `[Hub Shadow] booking=${booking._id} stage=${stage} ` +
+        `pincode=${pincodePartnerIds.length} hubs=0 (no hub covers this cell)`
+      );
+      return;
+    }
+
+    const hubPartners = await Partner.find({
+      isBlocked: false,
+      approvalStatus: "approved",
+      assignedHubId: { $in: hubIds },
+    }).select("_id").lean();
+
+    const hubPartnerIds = new Set(hubPartners.map((p) => String(p._id)));
+    const pinIds = new Set(pincodePartnerIds.map(String));
+
+    const onlyInPincode = [...pinIds].filter((id) => !hubPartnerIds.has(id));
+    const onlyInHub     = [...hubPartnerIds].filter((id) => !pinIds.has(id));
+    const matched       = [...pinIds].filter((id) => hubPartnerIds.has(id));
+
+    console.log(
+      `[Hub Shadow] booking=${booking._id} stage=${stage} ` +
+      `pincode=${pinIds.size} hub=${hubPartnerIds.size} ` +
+      `matched=${matched.length} onlyPincode=${onlyInPincode.length} onlyHub=${onlyInHub.length}`
+    );
+  } catch (err) {
+    console.error("[Hub Shadow] error:", err.message);
+  }
+}
 
 /*
 =====================================================
@@ -230,13 +292,27 @@ async function assignBooking(bookingId, opts = {}) {
       booking.assignmentStage = stage;
       await booking.save();
 
-      const pincodesToSearch = await getPincodesForStage(booking);
+      // Hub (H3) path is active only when the flag is on AND this booking has a
+      // derived h3Cell. A booking without an h3Cell (e.g. created before H3
+      // rollout, or with no coordinates) safely falls back to the pincode path.
+      const hubMode = (await getUseH3Flag()) && Boolean(booking.h3Cell);
+
+      // ── Stage cell/pincode expansion ──────────────────────────────────────
+      let pincodesToSearch;
+      if (hubMode) {
+        pincodesToSearch = getH3CellsForStage(booking.h3Cell, stage);
+      } else {
+        pincodesToSearch = await getPincodesForStage(booking);
+      }
+
       if (!pincodesToSearch.length) {
         booking.assignmentAudit.push({
           stage,
           event: "NO_PINCODES_TO_SEARCH",
           searchedPincodes: [],
-          notes: "Zone expansion returned no searchable pincodes",
+          notes: hubMode
+            ? "H3 ring expansion returned no cells"
+            : "Zone expansion returned no searchable pincodes",
         });
         await booking.save();
         continue;
@@ -245,8 +321,14 @@ async function assignBooking(bookingId, opts = {}) {
       const rankedPartners = await findEligiblePartnersForBooking(
         booking,
         pincodesToSearch,
-        { requireOnline }
+        { requireOnline, useH3: hubMode }
       );
+
+      // ── Shadow log (Stage 3 — only when running on pincode path) ─────────
+      if (!hubMode) {
+        const pincodePartnerIds = rankedPartners.map((e) => e.partner._id);
+        runH3ShadowLookup(booking, stage, pincodePartnerIds).catch(() => {});
+      }
 
       if (!rankedPartners.length) {
         booking.assignmentAudit.push({
@@ -742,4 +824,5 @@ module.exports = {
   reassignBooking,
   isACBooking,
   computeRequiredPartners,
+  getUseH3Flag,
 };

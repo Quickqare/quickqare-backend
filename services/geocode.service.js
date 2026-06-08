@@ -19,6 +19,7 @@ const GOOGLE_MAPS_SERVER_API_KEY =
 const { trackApiCall } = require("./apiCallTracker.service");
 
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours — pincodes rarely change
+const GEOCODE_REQUEST_TIMEOUT_MS = 5000; // give up on a slow/hung Google call after 5s
 const geocodeCache = new Map();
 
 // Round to 4 decimal places ≈ 11m grid precision
@@ -95,9 +96,29 @@ async function reverseGeocode(latitude, longitude, source = "unknown") {
     return cached.result;
   }
 
-  const response = await fetch(
-    `https://maps.googleapis.com/maps/api/geocode/json?latlng=${latitude},${longitude}&key=${GOOGLE_MAPS_SERVER_API_KEY}&language=en&region=IN&result_type=street_address|premise|subpremise|route|sublocality`
-  );
+  // Network call is wrapped so a Google outage / DNS failure / timeout returns
+  // a graceful ok:false instead of throwing. Callers (e.g. the partner location
+  // heartbeat) must still be able to save GPS coordinates when Google is down.
+  let response;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), GEOCODE_REQUEST_TIMEOUT_MS);
+  try {
+    response = await fetch(
+      `https://maps.googleapis.com/maps/api/geocode/json?latlng=${latitude},${longitude}&key=${GOOGLE_MAPS_SERVER_API_KEY}&language=en&region=IN&result_type=street_address|premise|subpremise|route|sublocality`,
+      { signal: controller.signal }
+    );
+  } catch (err) {
+    const timedOut = err?.name === "AbortError";
+    return {
+      ok: false,
+      error: timedOut ? "GOOGLE_REQUEST_TIMEOUT" : "GOOGLE_REQUEST_ERROR",
+      message: timedOut
+        ? "Google Maps geocode request timed out"
+        : "Google Maps geocode request failed to reach the server",
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
 
   if (!response.ok) {
     return {
@@ -107,7 +128,16 @@ async function reverseGeocode(latitude, longitude, source = "unknown") {
     };
   }
 
-  const data = await response.json();
+  let data;
+  try {
+    data = await response.json();
+  } catch (err) {
+    return {
+      ok: false,
+      error: "GOOGLE_BAD_RESPONSE",
+      message: "Google Maps returned an unreadable response",
+    };
+  }
   const googleStatus = String(data?.status || "");
   const googleErrorMessage = String(data?.error_message || "");
 
@@ -144,4 +174,81 @@ async function reverseGeocode(latitude, longitude, source = "unknown") {
   return result;
 }
 
-module.exports = { reverseGeocode };
+/*
+=====================================================
+FORWARD GEOCODE
+Turns a free-text query (e.g. a 6-digit pincode) into
+lat/lng coordinates. Used as a fallback when a client
+(e.g. the web app on desktop) submits a booking with a
+pincode but no GPS. Same cost controls + graceful
+failure handling as reverseGeocode.
+=====================================================
+*/
+async function forwardGeocode(query, source = "forward_geocode") {
+  const q = String(query || "").trim();
+  if (!q) return { ok: false, error: "EMPTY_QUERY" };
+  if (!GOOGLE_MAPS_SERVER_API_KEY) {
+    return { ok: false, error: "GOOGLE_MAPS_KEY_MISSING" };
+  }
+
+  const cacheKey = `fwd:${q.toLowerCase()}`;
+  const cached = geocodeCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < CACHE_TTL_MS) {
+    trackApiCall(source, { cacheHit: true });
+    return cached.result;
+  }
+
+  let response;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), GEOCODE_REQUEST_TIMEOUT_MS);
+  try {
+    response = await fetch(
+      `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(
+        q
+      )}&key=${GOOGLE_MAPS_SERVER_API_KEY}&language=en&region=IN&components=country:IN`,
+      { signal: controller.signal }
+    );
+  } catch (err) {
+    const timedOut = err?.name === "AbortError";
+    return {
+      ok: false,
+      error: timedOut ? "GOOGLE_REQUEST_TIMEOUT" : "GOOGLE_REQUEST_ERROR",
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  if (!response.ok) return { ok: false, error: "GOOGLE_REQUEST_FAILED" };
+
+  let data;
+  try {
+    data = await response.json();
+  } catch (err) {
+    return { ok: false, error: "GOOGLE_BAD_RESPONSE" };
+  }
+
+  const googleStatus = String(data?.status || "");
+  if (googleStatus && googleStatus !== "OK") {
+    return { ok: false, error: "GOOGLE_STATUS_NOT_OK", google: { status: googleStatus } };
+  }
+
+  const first = Array.isArray(data?.results) ? data.results[0] : null;
+  const lat = Number(first?.geometry?.location?.lat);
+  const lng = Number(first?.geometry?.location?.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+    return { ok: false, error: "NO_COORDS" };
+  }
+
+  const result = {
+    ok: true,
+    lat,
+    lng,
+    pincode: extractPincodeFromResult(first),
+    address: String(first?.formatted_address || "").trim(),
+  };
+  geocodeCache.set(cacheKey, { result, ts: Date.now() });
+  trackApiCall(source, { cacheHit: false });
+  return result;
+}
+
+module.exports = { reverseGeocode, forwardGeocode };

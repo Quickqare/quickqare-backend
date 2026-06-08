@@ -212,6 +212,12 @@ const bookingSchema = new mongoose.Schema(
     },
 
     // Territory control
+    h3Cell: {
+      type: String,
+      default: null,
+      index: true,
+    },
+
     pincode: {
       type: String,
       required: true,
@@ -329,6 +335,19 @@ const bookingSchema = new mongoose.Schema(
     cancelledAt: {
       type: Date,
       default: null,
+    },
+
+    // Each entry records a partner who cancelled this booking (before reassignment)
+    partnerCancellations: {
+      type: [
+        {
+          partner:     { type: mongoose.Schema.Types.ObjectId, ref: "Partner" },
+          reason:      { type: String, trim: true },
+          cancelledAt: { type: Date },
+          _id:         false,
+        },
+      ],
+      default: [],
     },
 
     cancelReason: {

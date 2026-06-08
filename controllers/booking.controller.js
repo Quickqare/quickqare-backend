@@ -6,11 +6,15 @@ const Category = require("../models/Category");
 const { creditWallet } = require("./partnerWallet.controller");
 const { getAvailableSlots } = require("../services/slotAvailability_service");
 const { assignBooking, reassignBooking } = require("../services/assignmentEngine");
+const { deriveH3Cell } = require("../utils/h3");
+const { forwardGeocode } = require("../services/geocode.service");
 const {
   getZoneServiceKeysFromValues,
   isZoneServiceEnabled,
   resolveZoneForPincode,
+  resolveHubForLocation,
 } = require("../services/zone.service");
+const { getUseH3Flag } = require("../services/assignmentEngine");
 const {
   buildDateTime,
   clearSlotCache,
@@ -156,24 +160,85 @@ exports.createBooking = async (req, res) => {
       return res.status(400).json({ success: false, message: "Cannot book a slot that is already in the past" });
     }
 
-    const zone = await resolveZoneForPincode(pincode);
-    if (!zone || zone.isActive === false) {
-      return res.status(403).json({
-        success: false,
-        message: "Service not available in this pincode",
-      });
-    }
-    if (zone.customerAppEnabled === false) {
-      return res.status(403).json({
-        success: false,
-        message: "Bookings are currently paused for this pincode",
-      });
-    }
-    if (zone.partnerAppEnabled === false) {
-      return res.status(403).json({
-        success: false,
-        message: "Service is currently unavailable in this pincode",
-      });
+    // When H3 mode resolves coordinates from a pincode (no client GPS), we reuse
+    // them for the booking's stored location + h3Cell so assignment routes correctly.
+    let effectiveCoords = null; // [lng, lat]
+
+    const useH3 = await getUseH3Flag();
+    if (useH3) {
+      const coords = location?.coordinates;
+      const hasClientGps =
+        Array.isArray(coords) &&
+        coords.length === 2 &&
+        Number.isFinite(Number(coords[0])) &&
+        Number.isFinite(Number(coords[1])) &&
+        (Number(coords[0]) !== 0 || Number(coords[1]) !== 0);
+
+      let lat;
+      let lng;
+      let ringFallback = false;
+      if (hasClientGps) {
+        // Precise GPS — strict exact-cell gate.
+        lng = Number(coords[0]);
+        lat = Number(coords[1]);
+      } else {
+        // No GPS (e.g. web pincode-only) — geocode the pincode to a centroid and
+        // use the lenient ring gate to absorb pincode-boundary fuzz.
+        const geo = await forwardGeocode(pincode, "booking_pincode_fallback");
+        if (geo.ok) {
+          lat = geo.lat;
+          lng = geo.lng;
+          ringFallback = true;
+        }
+      }
+
+      const hub =
+        Number.isFinite(lat) && Number.isFinite(lng)
+          ? await resolveHubForLocation(lat, lng, { ringFallback })
+          : null;
+
+      if (!hub || hub.isActive === false) {
+        return res.status(403).json({
+          success: false,
+          message: "Service not available in this area",
+        });
+      }
+      if (hub.customerAppEnabled === false) {
+        return res.status(403).json({
+          success: false,
+          message: "Bookings are currently paused for this area",
+        });
+      }
+      if (hub.partnerAppEnabled === false) {
+        return res.status(403).json({
+          success: false,
+          message: "Service is currently unavailable in this area",
+        });
+      }
+
+      if (Number.isFinite(lat) && Number.isFinite(lng)) {
+        effectiveCoords = [lng, lat];
+      }
+    } else {
+      const zone = await resolveZoneForPincode(pincode);
+      if (!zone || zone.isActive === false) {
+        return res.status(403).json({
+          success: false,
+          message: "Service not available in this pincode",
+        });
+      }
+      if (zone.customerAppEnabled === false) {
+        return res.status(403).json({
+          success: false,
+          message: "Bookings are currently paused for this pincode",
+        });
+      }
+      if (zone.partnerAppEnabled === false) {
+        return res.status(403).json({
+          success: false,
+          message: "Service is currently unavailable in this pincode",
+        });
+      }
     }
 
     let bookingServices = [];
@@ -486,6 +551,13 @@ exports.createBooking = async (req, res) => {
           : bookingServices[0]?.category || "general",
       serviceId: serviceId ?? finalPrimaryService ?? null,
       pincode,
+      h3Cell: (() => {
+        const coords = effectiveCoords || location?.coordinates;
+        if (Array.isArray(coords) && coords.length === 2) {
+          return deriveH3Cell(coords[1], coords[0]); // GeoJSON is [lng, lat]
+        }
+        return null;
+      })(),
       address: String(address || "").trim(),
       houseDetails: houseDetails ? String(houseDetails).trim() : null,
       landmark: landmark ? String(landmark).trim() : null,
@@ -502,7 +574,11 @@ exports.createBooking = async (req, res) => {
       scheduledStartAt,
       scheduledEndAt,
       estimatedDurationMinutes,
-      location,
+      // Use the pincode-geocoded coords when the client sent none, so the stored
+      // location matches the h3Cell used for assignment.
+      location: effectiveCoords
+        ? { type: "Point", coordinates: effectiveCoords }
+        : location,
       lockedUntil: new Date(Date.now() + PAYMENT_LOCK_MINUTES * 60 * 1000),
       lockedCapacityMinutes: estimatedDurationMinutes,
       payment: { status: "PENDING" },
@@ -1111,10 +1187,28 @@ exports.completeBooking = async (req, res) => {
    (MAX 5 PER ROLLING WEEK + AUTO-SUSPEND AT LIMIT)
 ======================= */
 const PARTNER_WEEKLY_CANCEL_LIMIT = 5;
+const PARTNER_DAILY_CANCEL_LIMIT  = 1;
+
+const PARTNER_CANCEL_REASONS = [
+  "Emergency / personal issue",
+  "Vehicle breakdown",
+  "Customer not reachable",
+  "Location too far",
+  "Job scope changed",
+  "Health issue",
+];
 
 exports.cancelBooking = async (req, res) => {
   try {
     const { bookingId } = req.params;
+    const { reason } = req.body || {};
+
+    if (!reason || !PARTNER_CANCEL_REASONS.includes(reason)) {
+      return res.status(400).json({
+        message: "A valid cancellation reason is required.",
+        validReasons: PARTNER_CANCEL_REASONS,
+      });
+    }
 
     const booking = await Booking.findById(bookingId);
     const partner = await Partner.findById(req.partner._id);
@@ -1130,11 +1224,27 @@ exports.cancelBooking = async (req, res) => {
       return res.status(403).json({ message: "Unauthorized cancellation" });
     }
 
-    /* =====================
-       ROLLING 7-DAY CANCEL WINDOW
-    ===================== */
     const now = new Date();
-    const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+
+    /* =====================
+       DAILY CANCEL LIMIT (1 per calendar day)
+    ===================== */
+    const todayStr = now.toISOString().slice(0, 10); // YYYY-MM-DD
+    if (partner.lastDailyCancelDate === todayStr) {
+      if (partner.dailyCancelCount >= PARTNER_DAILY_CANCEL_LIMIT) {
+        return res.status(400).json({
+          message: `You can only cancel ${PARTNER_DAILY_CANCEL_LIMIT} job per day. Try again tomorrow.`,
+        });
+      }
+      partner.dailyCancelCount += 1;
+    } else {
+      partner.dailyCancelCount = 1;
+      partner.lastDailyCancelDate = todayStr;
+    }
+
+    /* =====================
+       ROLLING 7-DAY CANCEL WINDOW (for auto-suspension)
+    ===================== */
     // Use epoch (0) as the safe default so a null lastCancelReset always triggers a reset,
     // rather than comparing against NaN (which is what `new Date(null)` produces in some runtimes).
     const lastReset = partner.lastCancelReset ? new Date(partner.lastCancelReset) : new Date(0);
@@ -1176,7 +1286,8 @@ exports.cancelBooking = async (req, res) => {
         status: { $in: ["ASSIGNED", "CONFIRMED", "PARTNER_ACCEPTED", "ON_THE_WAY", "ARRIVED"] },
       },
       {
-        $set: { status: "SEARCHING", partner: null },
+        $set:  { status: "SEARCHING", partner: null },
+        $push: { partnerCancellations: { partner: partner._id, reason, cancelledAt: now } },
       },
       { new: true }
     );

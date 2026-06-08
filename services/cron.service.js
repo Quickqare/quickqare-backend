@@ -7,6 +7,8 @@ No external scheduler library required.
 */
 
 const STALE_HOURS = 48;
+const PARTNER_HISTORY_DAYS = 60;
+const HISTORY_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // once per day
 const CHECK_INTERVAL_MS = 30 * 60 * 1000; // every 30 minutes
 
 // No-show thresholds: how many hours past scheduled time before we flag a booking
@@ -535,6 +537,54 @@ async function detectNoShowPartners() {
 
 /*
 =====================================================
+PURGE OLD PARTNER JOB HISTORY
+Removes partner references from bookings older than
+60 days that have no open/in-review dispute.
+This prevents partners from ever seeing those jobs
+again (the query filter is the first gate; this
+scrub is the permanent one).
+Runs once daily.
+=====================================================
+*/
+async function purgeOldPartnerJobHistory() {
+  try {
+    const Booking = require("../models/Booking");
+    const Dispute = require("../admin/models/Dispute");
+
+    const cutoff = new Date(Date.now() - PARTNER_HISTORY_DAYS * 24 * 60 * 60 * 1000);
+
+    // Booking IDs that still have an open dispute — must NOT be scrubbed
+    const disputedIds = await Dispute.distinct("bookingId", {
+      status: { $in: ["OPEN", "IN_REVIEW"] },
+    });
+
+    const result = await Booking.updateMany(
+      {
+        createdAt: { $lt: cutoff },
+        _id: { $nin: disputedIds },
+        $or: [
+          { partner: { $ne: null } },
+          { "additionalPartners.0": { $exists: true } },
+          { "partnerCancellations.0": { $exists: true } },
+        ],
+      },
+      {
+        $set: { partner: null, additionalPartners: [], partnerCancellations: [] },
+      }
+    );
+
+    if (result.modifiedCount > 0) {
+      console.log(
+        `[cron] Purged partner references from ${result.modifiedCount} booking(s) older than ${PARTNER_HISTORY_DAYS} days`
+      );
+    }
+  } catch (err) {
+    console.error("[cron] purgeOldPartnerJobHistory error:", err.message);
+  }
+}
+
+/*
+=====================================================
 INIT — called once after MongoDB connects
 =====================================================
 */
@@ -547,6 +597,7 @@ function initCronJobs() {
   sendHelperInviteReminders();
   retryPendingPayouts();
   detectNoShowPartners();
+  purgeOldPartnerJobHistory();
 
   setInterval(cancelStaleBookings, CHECK_INTERVAL_MS);
   setInterval(dispatchQueuedBookings, CHECK_INTERVAL_MS);
@@ -555,6 +606,7 @@ function initCronJobs() {
   setInterval(sendHelperInviteReminders, REMINDER_INTERVAL_MS);
   setInterval(retryPendingPayouts, PAYOUT_RETRY_INTERVAL_MS);
   setInterval(detectNoShowPartners, CHECK_INTERVAL_MS);
+  setInterval(purgeOldPartnerJobHistory, HISTORY_CLEANUP_INTERVAL_MS);
 
   if (process.env.NODE_ENV !== "test") {
     console.log(
@@ -580,4 +632,5 @@ module.exports = {
   sendHelperInviteReminders,
   retryPendingPayouts,
   detectNoShowPartners,
+  purgeOldPartnerJobHistory,
 };

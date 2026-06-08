@@ -3,6 +3,7 @@ const mongoose = require("mongoose");
 const Partner = require("../../../models/Partner");
 const Booking = require("../../../models/Booking");
 const PartnerWallet = require("../../../models/PartnerWallet");
+const Hub = require("../../../models/Hub");
 const authenticateAdmin = require("../../middleware/authenticateAdmin");
 const authorize = require("../../middleware/authorize");
 const audit = require("../../middleware/audit");
@@ -195,7 +196,8 @@ router.get("/:id/stats", async (req, res) => {
     }
 
     const partner = await Partner.findById(partnerId)
-      .select("name phone email rating activeJobs maxJobsLimit currentPincode serviceAreas serviceCategories skillTier isOnline approvalStatus isBlocked plan commissionPercent subscriptionActive createdAt")
+      .select("name phone email rating activeJobs maxJobsLimit currentPincode serviceAreas serviceCategories skillTier isOnline approvalStatus isBlocked plan commissionPercent subscriptionActive createdAt location assignedHubId mehendiSpecializations")
+      .populate("assignedHubId", "name city state")
       .lean();
     if (!partner) {
       return fail(res, 404, "NOT_FOUND", "Partner not found", null, { requestId: req.requestId });
@@ -421,6 +423,43 @@ router.patch("/:id/subscription", audit("admin.partners.subscription"), async (r
     return fail(res, 500, "PARTNER_SUBSCRIPTION_FAILED", "Unable to update partner subscription", error.message, {
       requestId: req.requestId,
     });
+  }
+});
+
+/* ── Assign Hub to partner ──────────────────────────────────────────────── */
+router.patch("/:id/hub", audit("admin.partners.hub"), async (req, res) => {
+  try {
+    const partnerId = asSingleString(req.params.id);
+    if (!partnerId || !mongoose.Types.ObjectId.isValid(partnerId)) {
+      return fail(res, 400, "INVALID_ID", "Invalid partner id", null, { requestId: req.requestId });
+    }
+
+    const { hubId } = req.body;
+
+    // Allow clearing the assignment by passing null
+    if (hubId !== null && hubId !== undefined) {
+      if (!mongoose.Types.ObjectId.isValid(String(hubId))) {
+        return fail(res, 400, "VALIDATION_ERROR", "Invalid hub id", null, { requestId: req.requestId });
+      }
+      const hub = await Hub.findById(hubId).select("_id").lean();
+      if (!hub) {
+        return fail(res, 404, "HUB_NOT_FOUND", "Hub not found", null, { requestId: req.requestId });
+      }
+    }
+
+    const partner = await Partner.findByIdAndUpdate(
+      partnerId,
+      { $set: { assignedHubId: hubId || null } },
+      { new: true }
+    ).select("name assignedHubId").populate("assignedHubId", "name city").lean();
+
+    if (!partner) {
+      return fail(res, 404, "NOT_FOUND", "Partner not found", null, { requestId: req.requestId });
+    }
+
+    return success(res, partner, { requestId: req.requestId });
+  } catch (err) {
+    return fail(res, 500, "HUB_ASSIGN_FAILED", "Unable to assign hub", err.message, { requestId: req.requestId });
   }
 });
 

@@ -43,6 +43,9 @@ router.patch("/settings", audit("admin.settings.update"), async (req, res) => {
     if (req.body.useLiveLocation !== undefined) {
       settings.useLiveLocation = Boolean(req.body.useLiveLocation);
     }
+    if (req.body.useH3Zones !== undefined) {
+      settings.useH3Zones = Boolean(req.body.useH3Zones);
+    }
 
     // Pricing (platform fee + tax). Clamped to sane ranges.
     if (req.body.pricing !== undefined && typeof req.body.pricing === "object") {

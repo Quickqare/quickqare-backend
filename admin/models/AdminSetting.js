@@ -26,6 +26,13 @@ const adminSettingSchema = new mongoose.Schema(
     useLiveLocation: { type: Boolean, default: false },
 
     /* =============================================
+       H3 GEOSPATIAL ASSIGNMENT
+       false (default) = pincode-based assignment (current behaviour)
+       true            = H3-based assignment (flip when ready)
+    ============================================= */
+    useH3Zones: { type: Boolean, default: false },
+
+    /* =============================================
        PRICING (platform fee + tax)
        Shown to the customer as a single combined
        "Fees and Taxes" line. Backend remains

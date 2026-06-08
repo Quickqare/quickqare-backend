@@ -1,6 +1,8 @@
 const Partner = require("../models/Partner");
 const Service = require("../models/service.model"); // ✅ FIXED IMPORT
 const Category = require("../models/Category");
+const { deriveH3Cell } = require("../utils/h3");
+const { reverseGeocode } = require("../services/geocode.service");
 
 /* =============================
    UPDATE PARTNER SERVICES
@@ -141,6 +143,23 @@ exports.updatePartnerServices = async (req, res) => {
     }
 
     /* =============================
+       DERIVE H3 SERVICE CELLS
+       Silently geocode each service-area pincode to get its
+       centroid lat/lng, then convert to an H3 cell index.
+       Failures are swallowed — this is best-effort.
+    ============================= */
+    const h3ServiceCells = [];
+    for (const pincode of serviceAreas) {
+      try {
+        const geo = await reverseGeocode(null, null, "pincode_lookup", pincode);
+        if (geo?.ok && Number.isFinite(geo.lat) && Number.isFinite(geo.lng)) {
+          const cell = deriveH3Cell(geo.lat, geo.lng);
+          if (cell) h3ServiceCells.push(cell);
+        }
+      } catch { /* non-fatal */ }
+    }
+
+    /* =============================
        UPDATE PARTNER
     ============================= */
     const partner = await Partner.findByIdAndUpdate(
@@ -148,6 +167,7 @@ exports.updatePartnerServices = async (req, res) => {
       {
         services,
         serviceAreas,
+        h3ServiceCells: [...new Set(h3ServiceCells)],
         serviceCategories: [serviceCategoryName],
         ...skillTierUpdate,
         ...mehendiUpdate,
@@ -243,5 +263,58 @@ exports.updatePartnerProfile = async (req, res) => {
       success: false,
       message: error.message,
     });
+  }
+};
+
+/* =============================
+   GET MY HUB  ("Mera Hub" screen)
+   GET /api/partner/profile/hub
+   Returns the partner's assigned hub with its H3 cell
+   boundary geometry so the app can draw the zone polygon.
+============================= */
+exports.getMyHub = async (req, res) => {
+  try {
+    const Hub = require("../models/Hub");
+    const { cellToBoundary } = require("h3-js");
+
+    const partner = await Partner.findById(req.partner._id)
+      .select("name assignedHubId")
+      .lean();
+
+    if (!partner) {
+      return res.status(404).json({ success: false, message: "Partner not found" });
+    }
+
+    if (!partner.assignedHubId) {
+      return res.json({ success: true, hub: null, message: "No hub assigned yet" });
+    }
+
+    const hub = await Hub.findById(partner.assignedHubId).lean();
+    if (!hub || hub.isActive === false) {
+      return res.json({ success: true, hub: null, message: "Hub not available" });
+    }
+
+    // Build polygon rings — one [lat,lng][] boundary per H3 cell — so the
+    // mobile map can render the hub shape without needing h3 libs client-side.
+    const cellBoundaries = (hub.h3Cells || []).map((cell) => ({
+      cell,
+      boundary: cellToBoundary(cell).map(([lat, lng]) => ({ latitude: lat, longitude: lng })),
+    }));
+
+    return res.json({
+      success: true,
+      hub: {
+        id: String(hub._id),
+        name: hub.name,
+        city: hub.city,
+        state: hub.state,
+        center: hub.center,
+        services: hub.services,
+        cellCount: (hub.h3Cells || []).length,
+        cellBoundaries,
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({ success: false, message: error.message });
   }
 };

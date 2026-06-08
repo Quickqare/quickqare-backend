@@ -1,4 +1,6 @@
 const Zone = require("../models/zone.model");
+const Hub = require("../models/Hub");
+const { getH3Ring, deriveH3Cell } = require("../utils/h3");
 
 const SERVICE_KEY_ALIASES = {
   acRepair: ["ac", "air conditioner", "air-conditioner", "airconditioner", "ac repair"],
@@ -98,6 +100,51 @@ function filterServicesByZone(services = [], zone) {
   });
 }
 
+/**
+ * Resolves the active Hub that contains a given H3 cell.
+ * A hub "contains" a cell when the cell is one of the hub's h3Cells.
+ * Returns the hub document, or null.
+ */
+async function resolveHubForH3Cell(h3Index) {
+  if (!h3Index) return null;
+  return Hub.findOne({ h3Cells: h3Index, isActive: true }).lean();
+}
+
+/**
+ * Resolves the set of active Hub _ids whose h3Cells intersect any of
+ * the supplied cells. Used by the assignment engine to find which hubs
+ * cover a booking's cell (and its ring-expansion cells in later stages).
+ */
+async function resolveHubsForCells(cells = []) {
+  if (!Array.isArray(cells) || !cells.length) return [];
+  const hubs = await Hub.find({ h3Cells: { $in: cells }, isActive: true })
+    .select("_id")
+    .lean();
+  return hubs.map((h) => h._id);
+}
+
+// Derives the H3 cell for a lat/lng and looks up the active hub containing it.
+//
+// ringFallback: when the exact cell isn't inside any hub, also check the
+// immediate ring of neighbouring cells (~1-2km out) and return the first hub
+// found. Used for pincode-geocoded bookings, where the coordinate is a coarse
+// pincode centroid that may land just outside a hub boundary. Precise-GPS
+// callers should leave it off so a customer genuinely outside all hubs is
+// correctly rejected.
+async function resolveHubForLocation(lat, lng, { ringFallback = false, k = 1 } = {}) {
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  const cell = deriveH3Cell(lat, lng);
+  if (!cell) return null;
+
+  const exact = await resolveHubForH3Cell(cell);
+  if (exact || !ringFallback) return exact;
+
+  // No hub on the exact cell — widen to neighbours to absorb centroid fuzz.
+  const ringCells = getH3Ring(cell, k).filter((c) => c !== cell);
+  if (!ringCells.length) return null;
+  return Hub.findOne({ h3Cells: { $in: ringCells }, isActive: true }).lean();
+}
+
 module.exports = {
   filterServicesByZone,
   getZoneCoveragePincodes,
@@ -105,4 +152,7 @@ module.exports = {
   getZoneServiceKeysFromValues,
   isZoneServiceEnabled,
   resolveZoneForPincode,
+  resolveHubForH3Cell,
+  resolveHubsForCells,
+  resolveHubForLocation,
 };

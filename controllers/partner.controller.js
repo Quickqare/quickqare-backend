@@ -1,5 +1,6 @@
 const Booking = require("../models/Booking");
 const Partner = require("../models/Partner");
+const Dispute = require("../admin/models/Dispute");
 const Service = require("../models/service.model");
 const CatalogItem = require("../models/CatalogItem");
 const SubCategory = require("../models/SubCategory");
@@ -7,12 +8,15 @@ const { reverseGeocode } = require("../services/geocode.service");
 const { syncPartnerOperationalState } = require("../services/scheduling_service");
 const { emitBookingUpdate } = require("../socket/emitters");
 const { completeBooking } = require("./booking.controller");
+const { deriveH3Cell } = require("../utils/h3");
 const {
   filterServicesByZone,
   resolveZoneForPincode,
+  resolveHubForLocation,
 } = require("../services/zone.service");
+const { getUseH3Flag } = require("../services/assignmentEngine");
 
-function toPartnerJobPayload(booking, partnerId) {
+function toPartnerJobPayload(booking, partnerId, { isPartnerCancelled = false } = {}) {
   const firstService = Array.isArray(booking?.services) ? booking.services[0] || {} : {};
   const firstServiceName = String(firstService?.name || booking?.serviceCategory || "Service");
   const customerLongitude = Array.isArray(booking?.location?.coordinates)
@@ -39,7 +43,10 @@ function toPartnerJobPayload(booking, partnerId) {
 
   // CONFIRMED = auto-accepted on the backend. Return PARTNER_ACCEPTED so the
   // partner app treats it identically to a manually accepted job.
-  const partnerStatus = booking?.status === "CONFIRMED" ? "PARTNER_ACCEPTED" : (booking?.status || "ASSIGNED");
+  // isPartnerCancelled = this partner cancelled the booking; override status to CANCELLED.
+  const partnerStatus = isPartnerCancelled
+    ? "CANCELLED"
+    : booking?.status === "CONFIRMED" ? "PARTNER_ACCEPTED" : (booking?.status || "ASSIGNED");
 
   const helpers = Array.isArray(booking?.helpers)
     ? booking.helpers.map((h) => ({
@@ -356,15 +363,22 @@ exports.updateLocation = async (req, res) => {
 
     if (movedFarEnough && geocodeCooledDown) {
       const resolved = await reverseGeocode(latitude, longitude, "partner_heartbeat");
-      req.partner.currentPincode = resolved?.ok ? resolved.pincode || "" : "";
-      req.partner.currentAddress = resolved?.ok ? resolved.address || "" : "";
-      req.partner.lastGeocodedAt = new Date();
+      // Only overwrite on a successful geocode. On a Google outage/timeout we
+      // keep the partner's last known pincode/address rather than wiping them to
+      // empty, and we DON'T stamp lastGeocodedAt — so the next heartbeat retries
+      // promptly instead of waiting out the 5-minute cooldown.
+      if (resolved?.ok) {
+        req.partner.currentPincode = resolved.pincode || "";
+        req.partner.currentAddress = resolved.address || "";
+        req.partner.lastGeocodedAt = new Date();
+      }
     }
 
     req.partner.location = {
       type: "Point",
       coordinates: [longitude, latitude],
     };
+    req.partner.h3Cell = deriveH3Cell(latitude, longitude);
     req.partner.lastLocationAt = new Date();
     req.partner.lastOnlineAt = new Date();
     await req.partner.save();
@@ -447,8 +461,15 @@ exports.getAvailableServicesForLocation = async (req, res) => {
       });
     }
 
-    const zone = await resolveZoneForPincode(pincode);
-    if (!zone || zone.isActive === false || zone.partnerAppEnabled === false) {
+    const useH3 = await getUseH3Flag();
+    let serviceArea;
+    if (useH3) {
+      serviceArea = await resolveHubForLocation(latitude, longitude);
+    } else {
+      serviceArea = await resolveZoneForPincode(pincode);
+    }
+
+    if (!serviceArea || serviceArea.isActive === false || serviceArea.partnerAppEnabled === false) {
       return res.json({
         success: true,
         pincode,
@@ -476,7 +497,9 @@ exports.getAvailableServicesForLocation = async (req, res) => {
       .sort({ createdAt: -1 })
       .lean();
 
-    const filteredServices = filterServicesByZone(services, zone);
+    // filterServicesByZone works for both zones and hubs — both have the same
+    // services structure ({ acRepair, plumbing, mehendi, electrician }).
+    const filteredServices = filterServicesByZone(services, serviceArea);
 
     return res.json({
       success: true,
@@ -676,19 +699,40 @@ exports.getPartnerBookings = async (req, res) => {
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 50));
     const skip  = (page - 1) * limit;
 
+    const now = new Date();
+    const sixtyDaysAgo = new Date(now.getTime() - 60 * 24 * 60 * 60 * 1000);
+
+    // Booking IDs with open disputes involving this partner — shown regardless of age
+    const disputedBookingIds = await Dispute.distinct("bookingId", {
+      partnerId,
+      status: { $in: ["OPEN", "IN_REVIEW"] },
+    });
+
+    const partnerConditions = [
+      { partner: partnerId },
+      { additionalPartners: partnerId },
+      { "partnerCancellations.partner": partnerId },
+    ];
+
     const query = {
-      $or: [{ partner: partnerId }, { additionalPartners: partnerId }],
-      status: {
-        $in: [
-          "ASSIGNED",
-          "CONFIRMED",
-          "PARTNER_ACCEPTED",
-          "ON_THE_WAY",
-          "ARRIVED",
-          "IN_PROGRESS",
-          "COMPLETED",
-        ],
-      },
+      $or: [
+        // Normal history: last 60 days only
+        {
+          $or: partnerConditions,
+          status: {
+            $in: [
+              "ASSIGNED", "CONFIRMED", "PARTNER_ACCEPTED",
+              "ON_THE_WAY", "ARRIVED", "IN_PROGRESS",
+              "COMPLETED", "CANCELLED",
+            ],
+          },
+          createdAt: { $gte: sixtyDaysAgo },
+        },
+        // Disputed bookings: keep regardless of age, until dispute is resolved
+        ...(disputedBookingIds.length
+          ? [{ _id: { $in: disputedBookingIds }, $or: partnerConditions }]
+          : []),
+      ],
     };
 
     const [bookingDocs, total] = await Promise.all([
@@ -704,7 +748,11 @@ exports.getPartnerBookings = async (req, res) => {
     const payloads = [];
     for (const booking of bookingDocs) {
       try {
-        payloads.push(toPartnerJobPayload(booking, partnerId));
+        const isPartnerCancelled = Array.isArray(booking.partnerCancellations) &&
+          booking.partnerCancellations.some(
+            (c) => c.partner?.toString() === partnerId.toString()
+          );
+        payloads.push(toPartnerJobPayload(booking, partnerId, { isPartnerCancelled }));
       } catch (itemErr) {
         console.error("getPartnerBookings item error:", {
           bookingId: booking?._id?.toString?.() || String(booking?._id || ""),

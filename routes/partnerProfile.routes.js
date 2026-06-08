@@ -44,4 +44,16 @@ router.patch(
   partnerProfileController.updatePartnerServices
 );
 
+/**
+ * ======================================
+ * GET MY HUB  ("Mera Hub")
+ * GET /api/partner/profile/hub
+ * ======================================
+ */
+router.get(
+  "/hub",
+  partnerAuth,
+  partnerProfileController.getMyHub
+);
+
 module.exports = router;

@@ -803,7 +803,7 @@ ELIGIBLE PARTNER FINDER
  *   true for live assignment (we need someone reachable now).
  */
 async function findEligiblePartnersForBooking(booking, pincodes = [], opts = {}) {
-  const { requireOnline = true } = opts;
+  const { requireOnline = true, useH3 = false } = opts;
   const requestContext = await buildRequestContext({ booking });
   if (
     !requestContext.requestedServiceIds.length &&
@@ -812,25 +812,47 @@ async function findEligiblePartnersForBooking(booking, pincodes = [], opts = {})
     return [];
   }
 
-  const zone = await resolveZoneForPincode(booking?.pincode);
+  // ── Zone validation ────────────────────────────────────────────────────────
+  // Hub path (useH3): validate against Hub; pincode path: validate against Zone.
   let noZoneFallback = false;
-  if (!zone) {
-    // No zone configured for this pincode. Don't hard-block — fall back to
-    // matching partners whose serviceAreas explicitly include this pincode.
-    // This allows assignment to work in areas the admin hasn't zoned yet.
-    console.warn(
-      `[assignment] No zone found for pincode "${booking?.pincode}" (booking ${booking?._id}) — using serviceAreas fallback`
-    );
-    noZoneFallback = true;
-  } else if (
-    zone.isActive === false ||
-    zone.partnerAppEnabled === false ||
-    !isZoneServiceEnabled(zone, requestContext.requestedCategories)
-  ) {
-    console.warn(
-      `[assignment] Zone check blocked assignment for pincode "${booking?.pincode}" (booking ${booking?._id}): isActive=${zone.isActive}, partnerAppEnabled=${zone.partnerAppEnabled}`
-    );
-    return [];
+  let hubIds = null; // resolved hub _ids when on the Hub path
+  if (useH3 && booking?.h3Cell) {
+    const { resolveHubForH3Cell, resolveHubsForCells } = require("./zone.service");
+    const hub = await resolveHubForH3Cell(booking.h3Cell);
+    if (!hub) {
+      // Booking's cell isn't inside any hub's exact shape. Widen via the
+      // supplied ring cells (stage 2/3) before giving up.
+      hubIds = await resolveHubsForCells(Array.isArray(pincodes) ? pincodes : []);
+      if (!hubIds.length) {
+        console.warn(`[assignment/Hub] No hub covers cell "${booking.h3Cell}" (booking ${booking?._id})`);
+        return [];
+      }
+    } else if (hub.partnerAppEnabled === false) {
+      console.warn(`[assignment/Hub] Hub "${hub.name}" blocked: partnerAppEnabled=false`);
+      return [];
+    } else {
+      // Stage expansion may legitimately reach neighbouring hubs — resolve all
+      // hubs intersecting the current stage's cells, not just the home hub.
+      hubIds = await resolveHubsForCells(Array.isArray(pincodes) && pincodes.length ? pincodes : [booking.h3Cell]);
+      if (!hubIds.length) hubIds = [hub._id];
+    }
+  } else {
+    const zone = await resolveZoneForPincode(booking?.pincode);
+    if (!zone) {
+      console.warn(
+        `[assignment] No zone found for pincode "${booking?.pincode}" (booking ${booking?._id}) — using serviceAreas fallback`
+      );
+      noZoneFallback = true;
+    } else if (
+      zone.isActive === false ||
+      zone.partnerAppEnabled === false ||
+      !isZoneServiceEnabled(zone, requestContext.requestedCategories)
+    ) {
+      console.warn(
+        `[assignment] Zone check blocked assignment for pincode "${booking?.pincode}" (booking ${booking?._id}): isActive=${zone.isActive}, partnerAppEnabled=${zone.partnerAppEnabled}`
+      );
+      return [];
+    }
   }
 
   const settings = await AdminSetting.findOne().lean();
@@ -845,22 +867,23 @@ async function findEligiblePartnersForBooking(booking, pincodes = [], opts = {})
     _id: { $nin: booking?.rejectedPartners || [] },
   };
 
-  // No-zone fallback: restrict to partners who registered this pincode as a service area
-  if (noZoneFallback && booking?.pincode) {
-    query.serviceAreas = booking.pincode;
-  }
+  // ── Territorial filter ─────────────────────────────────────────────────────
+  if (useH3) {
+    // Hub path: match partners assigned to any hub covering the stage's cells.
+    query.assignedHubId = { $in: hubIds || [] };
+  } else {
+    // No-zone fallback: restrict to partners who registered this pincode as a service area
+    if (noZoneFallback && booking?.pincode) {
+      query.serviceAreas = booking.pincode;
+    }
 
-  // STAGED PINCODE EXPANSION
-  // assignBooking widens the partner search stage-by-stage: exact pincode →
-  // nearby → extended. Restrict the pool to partners who serve any pincode in
-  // the current stage — matched on their live currentPincode or their declared
-  // serviceAreas. When no pincodes are passed (slot-availability counting) this
-  // is skipped and the whole zone is considered, preserving slot-listing behaviour.
-  if (Array.isArray(pincodes) && pincodes.length) {
-    query.$or = [
-      { currentPincode: { $in: pincodes } },
-      { serviceAreas: { $in: pincodes } },
-    ];
+    // STAGED PINCODE EXPANSION
+    if (Array.isArray(pincodes) && pincodes.length) {
+      query.$or = [
+        { currentPincode: { $in: pincodes } },
+        { serviceAreas: { $in: pincodes } },
+      ];
+    }
   }
 
   // For live assignment we require partners to be currently online + available.
