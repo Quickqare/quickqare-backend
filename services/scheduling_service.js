@@ -6,6 +6,19 @@ const {
   isZoneServiceEnabled,
   resolveZoneForPincode,
 } = require("./zone.service");
+const { deriveH3Cell } = require("../utils/h3");
+
+let _h3FlagCache = { value: false, expiresAt: 0 };
+async function getUseH3Flag() {
+  if (Date.now() < _h3FlagCache.expiresAt) return _h3FlagCache.value;
+  try {
+    const s = await AdminSetting.findOne().select("useH3Zones").lean();
+    _h3FlagCache = { value: Boolean(s?.useH3Zones), expiresAt: Date.now() + 60_000 };
+  } catch {
+    _h3FlagCache.expiresAt = Date.now() + 10_000;
+  }
+  return _h3FlagCache.value;
+}
 
 /*
 =====================================================
@@ -1090,15 +1103,44 @@ async function getAvailableSlotsForRequest({
     requestContext.isAC
   );
 
-  const zone = await resolveZoneForPincode(pincode);
-  if (
-    !zone ||
-    zone.isActive === false ||
-    zone.customerAppEnabled === false ||
-    zone.partnerAppEnabled === false ||
-    !isZoneServiceEnabled(zone, requestContext.requestedCategories)
-  ) {
-    return [];
+  const useH3 = await getUseH3Flag();
+  if (useH3) {
+    // H3 mode: validate against the hub covering the booking location.
+    const coords = Array.isArray(location?.coordinates) ? location.coordinates : null;
+    const hasGps = coords && coords.length === 2 &&
+      Number.isFinite(Number(coords[0])) && Number.isFinite(Number(coords[1])) &&
+      (Number(coords[0]) !== 0 || Number(coords[1]) !== 0);
+
+    let hub = null;
+    if (hasGps) {
+      const { resolveHubForLocation } = require("./zone.service");
+      hub = await resolveHubForLocation(Number(coords[1]), Number(coords[0]));
+    } else if (pincode) {
+      const { forwardGeocode } = require("./geocode.service");
+      const { resolveHubForLocation } = require("./zone.service");
+      const geo = await forwardGeocode(pincode);
+      if (geo.ok) hub = await resolveHubForLocation(geo.lat, geo.lng, { ringFallback: true });
+    }
+
+    if (
+      !hub ||
+      hub.isActive === false ||
+      hub.customerAppEnabled === false ||
+      hub.partnerAppEnabled === false
+    ) {
+      return [];
+    }
+  } else {
+    const zone = await resolveZoneForPincode(pincode);
+    if (
+      !zone ||
+      zone.isActive === false ||
+      zone.customerAppEnabled === false ||
+      zone.partnerAppEnabled === false ||
+      !isZoneServiceEnabled(zone, requestContext.requestedCategories)
+    ) {
+      return [];
+    }
   }
 
   // --- PERFORMANCE FIX: CACHING ---
@@ -1140,12 +1182,21 @@ async function getAvailableSlotsForRequest({
     if (isToday && slotStart.getTime() <= now.getTime()) continue;
     if (!isInsideWorkday(slotStart, slotEnd)) continue;
 
+    const coords = Array.isArray(location?.coordinates) ? location.coordinates : null;
+    const hasGps = coords && coords.length === 2 &&
+      Number.isFinite(Number(coords[0])) && Number.isFinite(Number(coords[1])) &&
+      (Number(coords[0]) !== 0 || Number(coords[1]) !== 0);
+    const slotH3Cell = useH3 && hasGps
+      ? deriveH3Cell(Number(coords[1]), Number(coords[0]))
+      : null;
+
     const rankedPartners = await findEligiblePartnersForBooking(
       {
         scheduledDate: date,
         scheduledTime: getTimeLabel(slotStart),
         pincode,
         location,
+        h3Cell: slotH3Cell,
         rejectedPartners: [],
         services: requestContext.requestServices.map((item) => ({
           serviceId: item.serviceId,
@@ -1159,7 +1210,7 @@ async function getAvailableSlotsForRequest({
         scheduledEndAt: slotEnd,
       },
       [],
-      { requireOnline: false } // slot listing — partner may come online later
+      { requireOnline: false, useH3 } // slot listing — partner may come online later
     );
 
     if (!rankedPartners.length) continue;

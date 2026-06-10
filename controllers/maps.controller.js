@@ -1,5 +1,7 @@
 const { reverseGeocode } = require("../services/geocode.service");
 const { trackApiCall } = require("../services/apiCallTracker.service");
+
+const SEARCH_REQUEST_TIMEOUT_MS = 5000;
 const GOOGLE_MAPS_SERVER_API_KEY =
   process.env.GOOGLE_MAPS_SERVER_API_KEY || process.env.GOOGLE_MAPS_API_KEY;
 
@@ -119,11 +121,26 @@ exports.searchAddress = async (req, res) => {
     }
     trackApiCall("customer_address_search", { cacheHit: false });
 
-    const response = await fetch(
-      `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(
-        query
-      )}&key=${GOOGLE_MAPS_SERVER_API_KEY}&language=en&region=IN&components=country:IN`
-    );
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), SEARCH_REQUEST_TIMEOUT_MS);
+
+    let response;
+    try {
+      response = await fetch(
+        `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(
+          query
+        )}&key=${GOOGLE_MAPS_SERVER_API_KEY}&language=en&region=IN&components=country:IN`,
+        { signal: controller.signal }
+      );
+    } catch (fetchErr) {
+      clearTimeout(timeout);
+      const isTimeout = fetchErr.name === "AbortError";
+      return res.status(502).json({
+        success: false,
+        message: isTimeout ? "Google Maps search request timed out" : "Google Maps search request failed",
+      });
+    }
+    clearTimeout(timeout);
 
     if (!response.ok) {
       return res.status(502).json({
@@ -132,7 +149,15 @@ exports.searchAddress = async (req, res) => {
       });
     }
 
-    const data = await response.json();
+    let data;
+    try {
+      data = await response.json();
+    } catch {
+      return res.status(502).json({
+        success: false,
+        message: "Google Maps search returned invalid JSON",
+      });
+    }
     const googleStatus = String(data?.status || "");
     const googleErrorMessage = String(data?.error_message || "");
 
