@@ -3,8 +3,9 @@ const router = express.Router();
 
 const serviceController = require("../controllers/service.controller");
 
-// ⚠ enable later when admin panel ready
-const adminAuth = require("../middlewares/adminAuth");
+// Admin-panel JWT (ADMIN_JWT_ACCESS_SECRET) — the legacy shared-secret
+// adminAuth middleware was removed; only real admin accounts pass this.
+const adminAuth = require("../admin/middleware/authenticateAdmin");
 
 /* =====================================================
    SERVICE ROUTES (PRODUCTION READY)

@@ -109,7 +109,9 @@ exports.processReferralReward = async (userId, bookingId) => {
       discountValue: settings.newUserDiscountAmount,
       minAmount: 0,
       maxDiscount: settings.newUserDiscountAmount,
-      expiryDate,
+      // Schema field is expiresAt (required) — passing the old expiryDate name
+      // made this create throw and silently killed the whole reward flow.
+      expiresAt: expiryDate,
       isActive: true,
       description: settings.couponDescription,
       usageLimit: 1,

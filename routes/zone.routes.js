@@ -3,8 +3,9 @@ const router = express.Router();
 
 const zoneController = require("../controllers/zone.controller");
 
-// enable when admin panel fully active
-const adminAuth = require("../middlewares/adminAuth");
+// Admin-panel JWT (ADMIN_JWT_ACCESS_SECRET) — the legacy shared-secret
+// adminAuth middleware was removed; only real admin accounts pass this.
+const adminAuth = require("../admin/middleware/authenticateAdmin");
 
 /* =====================================================
    ZONE ROUTES (PRODUCTION READY)

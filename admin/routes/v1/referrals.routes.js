@@ -50,7 +50,7 @@ router.get("/", async (req, res) => {
     const referrals = await Referral.find(query)
       .populate("referrerId", "name phone")
       .populate("referredId", "name phone")
-      .populate("couponId", "code discountValue expiryDate")
+      .populate("couponId", "code discountValue expiresAt")
       .sort({ createdAt: -1 })
       .limit(limit * 1)
       .skip((page - 1) * limit);

@@ -163,6 +163,9 @@ exports.createBooking = async (req, res) => {
     // When H3 mode resolves coordinates from a pincode (no client GPS), we reuse
     // them for the booking's stored location + h3Cell so assignment routes correctly.
     let effectiveCoords = null; // [lng, lat]
+    // Resolved only in pincode/zone mode (useH3 === false). Stays null in hub
+    // mode; the zone-service check below is skipped when it is null.
+    let zone = null;
 
     const useH3 = await getUseH3Flag();
     if (useH3) {
@@ -220,7 +223,7 @@ exports.createBooking = async (req, res) => {
         effectiveCoords = [lng, lat];
       }
     } else {
-      const zone = await resolveZoneForPincode(pincode);
+      zone = await resolveZoneForPincode(pincode);
       if (!zone || zone.isActive === false) {
         return res.status(403).json({
           success: false,
@@ -475,7 +478,9 @@ exports.createBooking = async (req, res) => {
       ...bookingServices.map((item) => item.name),
     ]);
 
-    if (!isZoneServiceEnabled(zone, zoneServiceKeys)) {
+    // Only enforced in pincode/zone mode. In hub mode zone is null and the hub's
+    // own availability was already checked above, so skip this gate.
+    if (zone && !isZoneServiceEnabled(zone, zoneServiceKeys)) {
       return res.status(403).json({
         success: false,
         message: "Selected service is not enabled in this pincode",

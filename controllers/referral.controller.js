@@ -84,7 +84,7 @@ exports.getReferralHistory = async (req, res) => {
     const [referrals, total] = await Promise.all([
       Referral.find(filter)
         .populate("referredId", "name phone")
-        .populate("couponId", "code discountValue expiryDate")
+        .populate("couponId", "code discountValue expiresAt")
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limit),

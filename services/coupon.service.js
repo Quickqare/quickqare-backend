@@ -1,5 +1,6 @@
 const Coupon = require("../models/coupon");
 const CouponRedemption = require("../admin/models/CouponRedemption");
+const Booking = require("../models/Booking");
 
 const roundAmount = (value) =>
   Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
@@ -119,12 +120,26 @@ const validateCouponForAmount = async ({ code, amount, customerId = null, servic
   }
 
   if (customerId && coupon.perUserLimit) {
-    const usedByCustomer = await CouponRedemption.countDocuments({
-      couponId: coupon._id,
-      customerId,
-    });
+    // Redemptions are only recorded after payment succeeds, so counting them
+    // alone lets a customer open several PENDING_PAYMENT bookings with the
+    // same coupon in parallel and pay for all of them. Unpaid bookings holding
+    // a live payment lock must consume a use too. Abandoned checkouts free the
+    // coupon when their lock expires (or instantly on cancel), and a paid
+    // booking moves from the in-flight count to the redemption count.
+    const [usedByCustomer, inFlightByCustomer] = await Promise.all([
+      CouponRedemption.countDocuments({
+        couponId: coupon._id,
+        customerId,
+      }),
+      Booking.countDocuments({
+        user: customerId,
+        couponId: coupon._id,
+        status: "PENDING_PAYMENT",
+        lockedUntil: { $gt: new Date() },
+      }),
+    ]);
 
-    if (usedByCustomer >= Number(coupon.perUserLimit || 1)) {
+    if (usedByCustomer + inFlightByCustomer >= Number(coupon.perUserLimit || 1)) {
       const err = new Error("Coupon usage limit reached for this user");
       err.statusCode = 400;
       throw err;
