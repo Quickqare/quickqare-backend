@@ -6,7 +6,7 @@ const {
   isZoneServiceEnabled,
   resolveZoneForPincode,
 } = require("./zone.service");
-const { deriveH3Cell } = require("../utils/h3");
+const { deriveH3Cell, getH3Ring } = require("../utils/h3");
 
 let _h3FlagCache = { value: false, expiresAt: 0 };
 async function getUseH3Flag() {
@@ -1104,6 +1104,12 @@ async function getAvailableSlotsForRequest({
   );
 
   const useH3 = await getUseH3Flag();
+  // H3 mode: the request's cell + ring-1 search cells are reused by the
+  // per-slot partner search below so it stays on the Hub path. Without an
+  // h3Cell that search silently falls back to the pincode/Zone path, and a
+  // disabled zone would hide every slot even though the hub is active.
+  let requestH3Cell = null;
+  let h3SearchCells = [];
   if (useH3) {
     // H3 mode: validate against the hub covering the booking location.
     const coords = Array.isArray(location?.coordinates) ? location.coordinates : null;
@@ -1114,22 +1120,31 @@ async function getAvailableSlotsForRequest({
     let hub = null;
     if (hasGps) {
       const { resolveHubForLocation } = require("./zone.service");
+      requestH3Cell = deriveH3Cell(Number(coords[1]), Number(coords[0]));
       hub = await resolveHubForLocation(Number(coords[1]), Number(coords[0]));
     } else if (pincode) {
       const { forwardGeocode } = require("./geocode.service");
       const { resolveHubForLocation } = require("./zone.service");
       const geo = await forwardGeocode(pincode);
-      if (geo.ok) hub = await resolveHubForLocation(geo.lat, geo.lng, { ringFallback: true });
+      if (geo.ok) {
+        requestH3Cell = deriveH3Cell(geo.lat, geo.lng);
+        hub = await resolveHubForLocation(geo.lat, geo.lng, { ringFallback: true });
+      }
     }
 
     if (
       !hub ||
+      !requestH3Cell ||
       hub.isActive === false ||
       hub.customerAppEnabled === false ||
       hub.partnerAppEnabled === false
     ) {
       return [];
     }
+
+    // Ring-1 cells absorb pincode-centroid fuzz (same k as the hub gate's
+    // ringFallback above) and match the assignment engine's stage-2 reach.
+    h3SearchCells = getH3Ring(requestH3Cell, 1);
   } else {
     const zone = await resolveZoneForPincode(pincode);
     if (
@@ -1182,21 +1197,13 @@ async function getAvailableSlotsForRequest({
     if (isToday && slotStart.getTime() <= now.getTime()) continue;
     if (!isInsideWorkday(slotStart, slotEnd)) continue;
 
-    const coords = Array.isArray(location?.coordinates) ? location.coordinates : null;
-    const hasGps = coords && coords.length === 2 &&
-      Number.isFinite(Number(coords[0])) && Number.isFinite(Number(coords[1])) &&
-      (Number(coords[0]) !== 0 || Number(coords[1]) !== 0);
-    const slotH3Cell = useH3 && hasGps
-      ? deriveH3Cell(Number(coords[1]), Number(coords[0]))
-      : null;
-
     const rankedPartners = await findEligiblePartnersForBooking(
       {
         scheduledDate: date,
         scheduledTime: getTimeLabel(slotStart),
         pincode,
         location,
-        h3Cell: slotH3Cell,
+        h3Cell: requestH3Cell,
         rejectedPartners: [],
         services: requestContext.requestServices.map((item) => ({
           serviceId: item.serviceId,
@@ -1209,7 +1216,7 @@ async function getAvailableSlotsForRequest({
         scheduledStartAt: slotStart,
         scheduledEndAt: slotEnd,
       },
-      [],
+      h3SearchCells,
       { requireOnline: false, useH3 } // slot listing — partner may come online later
     );
 
@@ -1232,6 +1239,7 @@ async function getAvailableSlotsForRequest({
         estimatedDurationMinutes: durationMinutes,
         location,
         pincode,
+        h3Cell: requestH3Cell,
         rejectedPartners: [],
       },
       slotStart,
