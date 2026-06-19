@@ -14,6 +14,14 @@ const adminSettingSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
+    /* Job-spot selfie verification: partner must upload a live selfie at the
+       customer's location before the service can start. The customer app also
+       shows the partner's onboarding photo so the customer can match the face.
+       Distinct from partnerSelfieRequired (signup selfie). */
+    jobSelfieVerificationEnabled: {
+      type: Boolean,
+      default: false,
+    },
     updatedByAdminId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "AdminUser",

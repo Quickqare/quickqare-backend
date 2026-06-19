@@ -4,6 +4,7 @@ const router = express.Router();
 const partnerAuth = require("../middlewares/partnerAuth");
 const partnerController = require("../controllers/partner.controller");
 const walletController = require("../controllers/partnerWallet.controller");
+const upload = require("../config/multer");
 
 /* =====================================================
    PARTNER JOB LIFECYCLE ROUTES (PRODUCTION READY)
@@ -53,10 +54,25 @@ router.get(
   partnerController.getPartnerBookings
 );
 
+// Public: the signup screen reads feature flags before any account exists.
+// Returns only boolean flags — nothing sensitive.
 router.get(
   "/app-settings",
-  partnerAuth,
   partnerController.getPartnerAppSettings
+);
+
+/**
+ * ======================================
+ * UPLOAD MY SELFIE (signup / profile)
+ * POST /api/partner/me/selfie
+ * multipart field: "selfie"
+ * ======================================
+ */
+router.post(
+  "/me/selfie",
+  partnerAuth,
+  upload.single("selfie"),
+  partnerController.uploadMySelfie
 );
 
 /**

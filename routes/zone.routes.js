@@ -24,11 +24,28 @@ const adminAuth = require("../admin/middleware/authenticateAdmin");
 */
 router.get("/check", async (req, res) => {
   try {
-    const { resolveZoneForPincode } = require("../services/zone.service");
+    const { resolveZoneForPincode, resolveHubForLocation } = require("../services/zone.service");
+    const { getUseH3Flag } = require("../services/assignmentEngine");
     const pincode = String(req.query.pincode || "").trim();
     if (!/^\d{6}$/.test(pincode)) {
       return res.status(400).json({ success: false, serviceable: false, message: "Invalid pincode" });
     }
+
+    // H3 mode: pincode zones are disabled, so resolve serviceability against the
+    // hub covering the pincode centroid (lenient ring fallback for boundary fuzz).
+    // Mirrors the gate used in booking.controller.createBooking.
+    const useH3 = await getUseH3Flag();
+    if (useH3) {
+      const { forwardGeocode } = require("../services/geocode.service");
+      const geo = await forwardGeocode(pincode, "zone_check");
+      let hub = null;
+      if (geo.ok) {
+        hub = await resolveHubForLocation(geo.lat, geo.lng, { ringFallback: true });
+      }
+      const serviceable = !!(hub && hub.isActive !== false && hub.customerAppEnabled !== false);
+      return res.json({ success: true, serviceable, zoneName: hub?.name || null });
+    }
+
     const zone = await resolveZoneForPincode(pincode);
     const serviceable = !!(zone && zone.isActive !== false && zone.customerAppEnabled !== false);
     return res.json({ success: true, serviceable, zoneName: zone?.name || null });

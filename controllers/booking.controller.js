@@ -37,6 +37,24 @@ const {
 
 const PAYMENT_LOCK_MINUTES = SLOT_LOCK_MINUTES;
 
+const AdminSetting = require("../admin/models/AdminSetting");
+
+// Admin flag: job-spot selfie verification (60s cache, same pattern as useH3Zones)
+let _jobSelfieFlagCache = { value: false, expiresAt: 0 };
+async function getJobSelfieFlag() {
+  if (Date.now() < _jobSelfieFlagCache.expiresAt) return _jobSelfieFlagCache.value;
+  try {
+    const s = await AdminSetting.findOne().select("jobSelfieVerificationEnabled").lean();
+    _jobSelfieFlagCache = {
+      value: Boolean(s?.jobSelfieVerificationEnabled),
+      expiresAt: Date.now() + 60_000,
+    };
+  } catch {
+    _jobSelfieFlagCache.expiresAt = Date.now() + 10_000;
+  }
+  return _jobSelfieFlagCache.value;
+}
+
 const normalizeText = (value = "") =>
   String(value).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 
@@ -875,9 +893,107 @@ exports.markArrived = async (req, res) => {
   }
 };
 
+// Selfies taken further than this from the booking location get flagged
+// for admin review (GPS drift indoors is typically well under 100m).
+const SELFIE_FLAG_DISTANCE_METERS = 300;
+
+function haversineMeters(lat1, lng1, lat2, lng2) {
+  const R = 6371000;
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLng = ((lng2 - lng1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
+      Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+/* =======================
+   PARTNER UPLOADS ON-SITE SELFIE
+   Live selfie taken at the customer's location (front camera, no gallery).
+   Required before startService when jobSelfieVerificationEnabled is on.
+   GPS sent with the upload is compared against the booking location;
+   far-away selfies are flagged for admin review (never blocked).
+======================= */
+exports.uploadStartSelfie = async (req, res) => {
+  try {
+    const { bookingId } = req.params;
+    const partnerId = req.partner?._id;
+    if (!partnerId) return res.status(401).json({ message: "Partner auth required" });
+
+    if (!req.file) {
+      return res.status(400).json({ success: false, message: "Selfie image is required" });
+    }
+
+    const booking = await Booking.findById(bookingId);
+    if (!booking) return res.status(404).json({ message: "Booking not found" });
+
+    const pid = String(partnerId);
+    const isAssigned =
+      booking.partner?.toString() === pid ||
+      (booking.additionalPartners || []).some((p) => p.toString() === pid);
+    if (!isAssigned) {
+      return res.status(403).json({ message: "Not assigned to this booking" });
+    }
+
+    if (!["ON_THE_WAY", "ARRIVED"].includes(booking.status)) {
+      return res.status(400).json({
+        message: `Cannot upload selfie from status ${booking.status}`,
+      });
+    }
+
+    // Cloudinary storage puts the hosted URL in file.path; local storage needs
+    // the public /uploads URL built (same pattern as uploadController.js).
+    const filePath = String(req.file.path || "");
+    const isRemote = filePath.startsWith("http://") || filePath.startsWith("https://");
+    const configuredBaseUrl = String(process.env.PUBLIC_BASE_URL || "").trim().replace(/\/+$/, "");
+    const selfieUrl = isRemote
+      ? filePath
+      : configuredBaseUrl
+        ? `${configuredBaseUrl}/uploads/${req.file.filename}`
+        : `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`;
+
+    // GPS tie-in: multer parses multipart text fields into req.body.
+    const latitude = Number(req.body?.latitude);
+    const longitude = Number(req.body?.longitude);
+    const hasGps =
+      Number.isFinite(latitude) && Number.isFinite(longitude) &&
+      (latitude !== 0 || longitude !== 0);
+
+    let distanceMeters = null;
+    let flagged = false;
+    const bCoords = booking.location?.coordinates;
+    if (hasGps && Array.isArray(bCoords) && bCoords.length === 2) {
+      const bLng = Number(bCoords[0]);
+      const bLat = Number(bCoords[1]);
+      if (Number.isFinite(bLat) && Number.isFinite(bLng) && (bLat !== 0 || bLng !== 0)) {
+        distanceMeters = Math.round(haversineMeters(latitude, longitude, bLat, bLng));
+        flagged = distanceMeters > SELFIE_FLAG_DISTANCE_METERS;
+      }
+    }
+
+    booking.startSelfieUrl = selfieUrl;
+    booking.startSelfieAt = new Date();
+    booking.startSelfieLocation = {
+      latitude: hasGps ? latitude : null,
+      longitude: hasGps ? longitude : null,
+    };
+    booking.startSelfieDistanceMeters = distanceMeters;
+    booking.startSelfieFlagged = flagged;
+    await booking.save();
+
+    return res.json({ success: true, message: "Selfie uploaded" });
+  } catch (err) {
+    console.error("uploadStartSelfie error:", err);
+    return res.status(500).json({ success: false, message: "Failed to upload selfie" });
+  }
+};
+
 /* =======================
    PARTNER STARTS SERVICE
-   Transition from arrival to in-progress without OTP gating.
+   Gated by the in-app service start code: the customer reads the 4-digit
+   code from their booking screen to the partner. No SMS involved.
 ======================= */
 exports.startService = async (req, res) => {
   try {
@@ -901,6 +1017,46 @@ exports.startService = async (req, res) => {
       return res.status(400).json({
         message: `Cannot start service from status ${booking.status}`,
       });
+    }
+
+    // Job-spot selfie gate (admin-controlled): the partner must have uploaded
+    // their on-site selfie via /start-selfie before the start code is accepted.
+    if (!booking.startSelfieUrl && (await getJobSelfieFlag())) {
+      return res.status(400).json({
+        code: "START_SELFIE_REQUIRED",
+        message: "Please take your on-site selfie before starting the service.",
+      });
+    }
+
+    // Verify the start code. Bookings created before this feature have no
+    // code stored — they start without one (legacy fallback).
+    if (booking.serviceStartCode) {
+      const attempts = Number(booking.startCodeAttempts || 0);
+      if (attempts >= 5) {
+        return res.status(429).json({
+          code: "START_CODE_LOCKED",
+          message: "Too many wrong code attempts. Please contact support.",
+        });
+      }
+
+      const submitted = String(req.body?.startCode || "").trim();
+      if (!submitted) {
+        return res.status(400).json({
+          code: "START_CODE_REQUIRED",
+          message: "Ask the customer for the start code shown in their app.",
+        });
+      }
+      if (submitted !== booking.serviceStartCode) {
+        await Booking.updateOne(
+          { _id: booking._id },
+          { $inc: { startCodeAttempts: 1 } }
+        );
+        const remaining = 4 - attempts;
+        return res.status(400).json({
+          code: "START_CODE_INVALID",
+          message: `Incorrect code. ${remaining} attempt${remaining === 1 ? "" : "s"} left.`,
+        });
+      }
     }
 
     // ATOMIC UPDATE: Prevent race conditions
@@ -1701,12 +1857,18 @@ exports.respondToEstimate = async (req, res) => {
 
 exports.getBookingById = async (req, res) => {
   try {
+    // When job selfie verification is on, include the partner's onboarding
+    // photo so the customer can match the face at the door.
+    const partnerFields = (await getJobSelfieFlag())
+      ? "name phone rating selfieUrl"
+      : "name phone rating";
+
     const booking = await Booking.findOne({
       _id: req.params.bookingId,
       user: req.user._id,
     })
-      .populate("partner", "name phone rating")
-      .populate("additionalPartners", "name phone rating")
+      .populate("partner", partnerFields)
+      .populate("additionalPartners", partnerFields)
       .lean();
 
     if (!booking) {

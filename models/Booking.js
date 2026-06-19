@@ -325,6 +325,58 @@ const bookingSchema = new mongoose.Schema(
     },
 
     /* ======================
+       SERVICE START CODE
+       4-digit code shown only in the customer app; the partner must enter it
+       to move the booking to IN_PROGRESS. Delivered in-app — zero SMS cost.
+       Never expose via partner-facing payloads (toPartnerJobPayload / socket).
+    ====================== */
+    serviceStartCode: {
+      type: String,
+      default: null,
+    },
+
+    // Wrong-code attempts by the partner; locked after 5 (support unlocks).
+    startCodeAttempts: {
+      type: Number,
+      default: 0,
+    },
+
+    /* ======================
+       JOB-SPOT SELFIE (admin-gated via jobSelfieVerificationEnabled)
+       Live selfie the partner uploads at the customer's location before
+       starting. Admin reviews it side-by-side with the onboarding selfie.
+    ====================== */
+    startSelfieUrl: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+
+    startSelfieAt: {
+      type: Date,
+      default: null,
+    },
+
+    // GPS captured at selfie time (plain lat/lng — no geo queries needed).
+    startSelfieLocation: {
+      latitude: { type: Number, default: null },
+      longitude: { type: Number, default: null },
+    },
+
+    // Haversine distance from the booking location; null when GPS unavailable.
+    startSelfieDistanceMeters: {
+      type: Number,
+      default: null,
+    },
+
+    // True when the selfie was taken too far from the customer's address —
+    // surfaces in the admin booking detail for review. Never blocks the job.
+    startSelfieFlagged: {
+      type: Boolean,
+      default: false,
+    },
+
+    /* ======================
        RESCHEDULE
     ====================== */
     rescheduleReason: { type: String, trim: true, default: null },
@@ -608,6 +660,9 @@ bookingSchema.index({ location: "2dsphere" });
    Retries on the rare collision (uniqueness backed by index).
 ====================== */
 bookingSchema.pre("save", async function (next) {
+  if (!this.serviceStartCode) {
+    this.serviceStartCode = String(Math.floor(1000 + Math.random() * 9000));
+  }
   if (this.bookingNumber) return next();
   for (let attempt = 0; attempt < 5; attempt += 1) {
     const candidate = generateBookingNumber();

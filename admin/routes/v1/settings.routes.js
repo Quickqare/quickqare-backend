@@ -40,6 +40,9 @@ router.patch("/settings", audit("admin.settings.update"), async (req, res) => {
     if (req.body.partnerSelfieRequired !== undefined) {
       settings.partnerSelfieRequired = Boolean(req.body.partnerSelfieRequired);
     }
+    if (req.body.jobSelfieVerificationEnabled !== undefined) {
+      settings.jobSelfieVerificationEnabled = Boolean(req.body.jobSelfieVerificationEnabled);
+    }
     if (req.body.useLiveLocation !== undefined) {
       settings.useLiveLocation = Boolean(req.body.useLiveLocation);
     }

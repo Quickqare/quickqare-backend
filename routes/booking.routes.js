@@ -7,6 +7,7 @@ const partnerAuth = require("../middlewares/partnerAuth");
 
 const validate = require("../middlewares/validate");
 const { createBookingValidator } = require("../middlewares/validators");
+const upload = require("../config/multer");
 
 /* =========================
    USER SIDE
@@ -95,6 +96,14 @@ router.patch(
   "/arrived/:bookingId",
   partnerAuth,
   bookingController.markArrived
+);
+
+// Partner uploads on-site selfie (required before start when admin flag is on)
+router.post(
+  "/start-selfie/:bookingId",
+  partnerAuth,
+  upload.single("selfie"),
+  bookingController.uploadStartSelfie
 );
 
 // Partner starts service after arrival

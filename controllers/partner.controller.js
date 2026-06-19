@@ -18,7 +18,12 @@ const { getUseH3Flag } = require("../services/assignmentEngine");
 
 function toPartnerJobPayload(booking, partnerId, { isPartnerCancelled = false } = {}) {
   const firstService = Array.isArray(booking?.services) ? booking.services[0] || {} : {};
-  const firstServiceName = String(firstService?.name || booking?.serviceCategory || "Service");
+  // Trim each candidate so a blank/whitespace-only name falls through to the next
+  // option instead of rendering as an empty card title in the partner app.
+  const firstServiceName =
+    String(firstService?.name || "").trim() ||
+    String(booking?.serviceCategory || "").trim() ||
+    "Service";
   const customerLongitude = Array.isArray(booking?.location?.coordinates)
     ? Number(booking.location.coordinates[0])
     : null;
@@ -361,7 +366,11 @@ exports.updateLocation = async (req, res) => {
       movedFarEnough = distanceMeters > GEOCODE_THRESHOLD_M;
     }
 
-    if (movedFarEnough && geocodeCooledDown) {
+    // Also geocode when the partner has no stored address/pincode (e.g. a past
+    // geocode failure left them empty) — a stationary partner would otherwise
+    // never re-trigger the >500m gate and stay blank forever.
+    const missingGeocode = !req.partner.currentAddress || !req.partner.currentPincode;
+    if ((movedFarEnough || missingGeocode) && geocodeCooledDown) {
       const resolved = await reverseGeocode(latitude, longitude, "partner_heartbeat");
       // Only overwrite on a successful geocode. On a Google outage/timeout we
       // keep the partner's last known pincode/address rather than wiping them to
@@ -517,6 +526,43 @@ exports.getAvailableServicesForLocation = async (req, res) => {
   }
 };
 
+/**
+ * =====================================================
+ * UPLOAD MY SELFIE
+ * Sets the partner's reference selfie (onboarding photo) used for
+ * job-spot verification and admin approval review.
+ * =====================================================
+ */
+exports.uploadMySelfie = async (req, res) => {
+  try {
+    if (!req.partner?._id) {
+      return res.status(401).json({ success: false, message: "Partner auth required" });
+    }
+    if (!req.file) {
+      return res.status(400).json({ success: false, message: "Selfie image is required" });
+    }
+
+    // Cloudinary storage puts the hosted URL in file.path; local storage needs
+    // the public /uploads URL built (same pattern as uploadController.js).
+    const filePath = String(req.file.path || "");
+    const isRemote = filePath.startsWith("http://") || filePath.startsWith("https://");
+    const configuredBaseUrl = String(process.env.PUBLIC_BASE_URL || "").trim().replace(/\/+$/, "");
+    const selfieUrl = isRemote
+      ? filePath
+      : configuredBaseUrl
+        ? `${configuredBaseUrl}/uploads/${req.file.filename}`
+        : `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`;
+
+    req.partner.selfieUrl = selfieUrl;
+    await req.partner.save();
+
+    return res.json({ success: true, selfieUrl });
+  } catch (err) {
+    console.error("uploadMySelfie error:", err);
+    return res.status(500).json({ success: false, message: "Failed to upload selfie" });
+  }
+};
+
 exports.getPartnerAppSettings = async (_req, res) => {
   try {
     const settings = await require("../admin/models/AdminSetting").findOne().lean();
@@ -526,6 +572,7 @@ exports.getPartnerAppSettings = async (_req, res) => {
       partnerSubscriptionRequired: Boolean(settings?.partnerSubscriptionRequired),
       partnerVerificationRequired: Boolean(settings?.partnerVerificationRequired),
       partnerSelfieRequired: Boolean(settings?.partnerSelfieRequired),
+      jobSelfieVerificationEnabled: Boolean(settings?.jobSelfieVerificationEnabled),
     });
   } catch (err) {
     console.error("getPartnerAppSettings error:", err);
