@@ -666,6 +666,28 @@ async function assignBooking(bookingId, opts = {}) {
     return null;
   } catch (error) {
     console.error("Assignment error:", error);
+    // Record the crash on the booking so it's visible in the admin panel /
+    // diagnostics instead of vanishing (a swallowed error here previously left
+    // bookings stuck with no audit trail — see the h3-js outage). Use $push so
+    // it works even if `booking` was never loaded before the throw.
+    try {
+      await Booking.updateOne(
+        { _id: bookingId },
+        {
+          $push: {
+            assignmentAudit: {
+              stage: 0,
+              event: "ASSIGNMENT_ERROR",
+              searchedPincodes: [],
+              notes: `Assignment crashed: ${String(error?.message || error).slice(0, 300)}`,
+              candidates: [],
+            },
+          },
+        }
+      );
+    } catch (e) {
+      console.error("Assignment error: failed to record audit entry:", e.message);
+    }
     // Release the lock if the assignment process crashed
     try {
       await Booking.updateOne({ _id: bookingId, status: "ASSIGNING_LOCK" }, { status: "PENDING_ASSIGNMENT" });
