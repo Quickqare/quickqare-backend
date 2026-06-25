@@ -1,5 +1,8 @@
 const Zone = require("../models/zone.model");
 const Hub = require("../models/Hub");
+const Service = require("../models/service.model");
+const Category = require("../models/Category");
+const mongoose = require("mongoose");
 const { getH3Ring, deriveH3Cell } = require("../utils/h3");
 
 const SERVICE_KEY_ALIASES = {
@@ -131,18 +134,71 @@ async function resolveHubsForCells(cells = []) {
 // pincode centroid that may land just outside a hub boundary. Precise-GPS
 // callers should leave it off so a customer genuinely outside all hubs is
 // correctly rejected.
-async function resolveHubForLocation(lat, lng, { ringFallback = false, k = 1 } = {}) {
+//
+// categoryId: when supplied, only hubs serving that service category match.
+// Hubs are per-service and may overlap, so a booking for AC must land inside an
+// *AC* hub — being inside a Mehendi hub covering the same area is not enough.
+async function resolveHubForLocation(lat, lng, { ringFallback = false, k = 1, categoryId = null } = {}) {
   if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
   const cell = deriveH3Cell(lat, lng);
   if (!cell) return null;
 
-  const exact = await resolveHubForH3Cell(cell);
+  const catFilter = categoryId ? { category: categoryId } : {};
+
+  const exact = await Hub.findOne({ h3Cells: cell, isActive: true, ...catFilter }).lean();
   if (exact || !ringFallback) return exact;
 
   // No hub on the exact cell — widen to neighbours to absorb centroid fuzz.
   const ringCells = getH3Ring(cell, k).filter((c) => c !== cell);
   if (!ringCells.length) return null;
-  return Hub.findOne({ h3Cells: { $in: ringCells }, isActive: true }).lean();
+  return Hub.findOne({ h3Cells: { $in: ringCells }, isActive: true, ...catFilter }).lean();
+}
+
+/**
+ * Resolves the distinct service categories a booking/request needs, so hub
+ * gates can check coverage *per service*. Accepts the loose shape used across
+ * the booking flow ({ services?: [{ serviceId }], serviceId?, serviceCategory? }).
+ * `serviceCategory` may be a Category id, slug, or name. Returns [{ id, name }];
+ * empty when nothing is resolvable (legacy flow) so callers can fall back to an
+ * area-level check.
+ */
+async function resolveBookingCategories({ services, serviceId, serviceCategory } = {}) {
+  const serviceIds = [];
+  if (Array.isArray(services)) {
+    for (const it of services) if (it?.serviceId) serviceIds.push(String(it.serviceId));
+  }
+  if (serviceId) serviceIds.push(String(serviceId));
+
+  const validIds = [...new Set(serviceIds)].filter((id) => mongoose.Types.ObjectId.isValid(id));
+  const categoryIds = new Set();
+
+  if (validIds.length) {
+    const svcs = await Service.find({ _id: { $in: validIds } }).select("category").lean();
+    for (const s of svcs) {
+      if (s?.category && mongoose.Types.ObjectId.isValid(String(s.category))) {
+        categoryIds.add(String(s.category));
+      }
+    }
+  }
+
+  // Legacy single-category flow: only a category id / slug / name was sent.
+  if (!categoryIds.size && serviceCategory) {
+    const term = String(serviceCategory).trim();
+    if (mongoose.Types.ObjectId.isValid(term)) {
+      categoryIds.add(term);
+    } else if (term) {
+      const cat = await Category.findOne({
+        $or: [{ slug: term.toLowerCase() }, { name: term }],
+      })
+        .select("_id")
+        .lean();
+      if (cat) categoryIds.add(String(cat._id));
+    }
+  }
+
+  if (!categoryIds.size) return [];
+  const cats = await Category.find({ _id: { $in: [...categoryIds] } }).select("name").lean();
+  return cats.map((c) => ({ id: String(c._id), name: c.name }));
 }
 
 module.exports = {
@@ -155,4 +211,5 @@ module.exports = {
   resolveHubForH3Cell,
   resolveHubsForCells,
   resolveHubForLocation,
+  resolveBookingCategories,
 };

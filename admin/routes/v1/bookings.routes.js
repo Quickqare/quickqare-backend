@@ -78,6 +78,7 @@ router.get("/:id", async (req, res) => {
         .populate("primaryService")
         .populate("assignmentAudit.selectedPartnerId", "name phone")
         .populate("assignmentAudit.candidates.partnerId", "name phone")
+        .populate("partnerReports.partner", "name phone")
         .lean(),
       BookingTimeline.find({ bookingId }).sort({ createdAt: 1 }).lean(),
       BookingAssignment.find({ bookingId }).sort({ createdAt: -1 }).lean(),

@@ -4,6 +4,7 @@
  * booking + available-services controllers use — resolveHubForLocation — with
  * the real Hub model, real h3-js, and a real (in-memory) database.
  */
+const mongoose = require("mongoose");
 const Hub = require("../models/Hub");
 const { deriveH3Cell, getH3Ring } = require("../utils/h3");
 const { resolveHubForLocation } = require("../services/zone.service");
@@ -12,12 +13,17 @@ const { resolveHubForLocation } = require("../services/zone.service");
 const KOLKATA = { lat: 22.5726, lng: 88.3639 };
 const MUMBAI = { lat: 19.076, lng: 72.8777 };
 
+// Each hub belongs to one service category now (required on the schema).
+const CATEGORY_ID = new mongoose.Types.ObjectId();
+
 async function makeHubCovering(point, overrides = {}) {
   const cell = deriveH3Cell(point.lat, point.lng);
   return Hub.create({
     name: "Test Hub",
     h3Cells: [cell],
     resolution: 7,
+    category: CATEGORY_ID,
+    categoryName: "AC",
     ...overrides,
   });
 }
@@ -62,7 +68,7 @@ describe("Hub-based booking gate (resolveHubForLocation)", () => {
     // centre cell itself — simulating a pincode centroid landing just outside.
     const centreCell = deriveH3Cell(KOLKATA.lat, KOLKATA.lng);
     const neighbours = getH3Ring(centreCell, 1).filter((c) => c !== centreCell);
-    await Hub.create({ name: "Ring Hub", h3Cells: neighbours, resolution: 7 });
+    await Hub.create({ name: "Ring Hub", h3Cells: neighbours, resolution: 7, category: CATEGORY_ID, categoryName: "AC" });
 
     // Strict (precise GPS): exact cell not in hub → blocked.
     const strict = await resolveHubForLocation(KOLKATA.lat, KOLKATA.lng);
@@ -74,14 +80,26 @@ describe("Hub-based booking gate (resolveHubForLocation)", () => {
     expect(lenient.name).toBe("Ring Hub");
   });
 
-  test("carries the service flags so the controller can gate per-service", async () => {
-    await makeHubCovering(KOLKATA, {
-      services: { acRepair: true, plumbing: false, mehendi: true, electrician: true },
-    });
+  test("carries its service category so the controller/app can show it", async () => {
+    await makeHubCovering(KOLKATA, { categoryName: "Mehendi" });
 
     const found = await resolveHubForLocation(KOLKATA.lat, KOLKATA.lng);
 
-    expect(found.services.acRepair).toBe(true);
-    expect(found.services.plumbing).toBe(false);
+    expect(String(found.category)).toBe(String(CATEGORY_ID));
+    expect(found.categoryName).toBe("Mehendi");
+  });
+
+  test("per-service: a hub only matches a request for its own category", async () => {
+    await makeHubCovering(KOLKATA); // category = CATEGORY_ID
+
+    // Same spot, but asking for a DIFFERENT service → not served here.
+    const otherCategory = new mongoose.Types.ObjectId();
+    const wrong = await resolveHubForLocation(KOLKATA.lat, KOLKATA.lng, { categoryId: otherCategory });
+    expect(wrong).toBeNull();
+
+    // Asking for the hub's own service → served.
+    const right = await resolveHubForLocation(KOLKATA.lat, KOLKATA.lng, { categoryId: CATEGORY_ID });
+    expect(right).not.toBeNull();
+    expect(String(right.category)).toBe(String(CATEGORY_ID));
   });
 });

@@ -2,6 +2,7 @@ const express = require("express");
 const mongoose = require("mongoose");
 const Hub = require("../../../models/Hub");
 const Partner = require("../../../models/Partner");
+const Category = require("../../../models/Category");
 const authenticateAdmin = require("../../middleware/authenticateAdmin");
 const authorize = require("../../middleware/authorize");
 const audit = require("../../middleware/audit");
@@ -25,11 +26,13 @@ function cleanCells(values) {
   ];
 }
 
-/* Returns any cells already claimed by another hub. Each cell must
-   belong to exactly one hub, or booking → hub resolution is ambiguous. */
-async function findCellConflicts(cells, excludeHubId) {
-  if (!cells.length) return [];
-  const query = { h3Cells: { $in: cells } };
+/* Returns any cells already claimed by another hub *of the same category*.
+   Within one category each cell must belong to exactly one hub (or booking →
+   hub resolution is ambiguous). Hubs of different categories may overlap, so
+   conflicts are scoped to categoryId. */
+async function findCellConflicts(cells, categoryId, excludeHubId) {
+  if (!cells.length || !categoryId) return [];
+  const query = { h3Cells: { $in: cells }, category: categoryId };
   if (excludeHubId) query._id = { $ne: excludeHubId };
 
   const hubs = await Hub.find(query).select("h3Cells").lean();
@@ -41,6 +44,12 @@ async function findCellConflicts(cells, excludeHubId) {
     }
   }
   return [...conflicts];
+}
+
+/* Validate a category id and return the live Category doc, or null. */
+async function resolveCategory(categoryId) {
+  if (!mongoose.Types.ObjectId.isValid(categoryId)) return null;
+  return Category.findById(categoryId).lean();
 }
 
 /* ── List ─────────────────────────────────────────────────────────────────── */
@@ -74,13 +83,31 @@ router.get("/", async (req, res) => {
   }
 });
 
+/* ── Categories (for the hub service picker) ──────────────────────────────── */
+router.get("/categories", async (req, res) => {
+  try {
+    const rows = await Category.find({ isActive: { $ne: false } })
+      .sort({ name: 1 })
+      .select("name slug imageUrl isActive")
+      .lean();
+    return success(res, rows, { requestId: req.requestId });
+  } catch (err) {
+    return fail(res, 500, "CATEGORIES_LIST_FAILED", "Unable to fetch categories", err.message, { requestId: req.requestId });
+  }
+});
+
 /* ── Create ───────────────────────────────────────────────────────────────── */
 router.post("/", audit("admin.hubs.create"), async (req, res) => {
   try {
-    const { name, h3Cells, city, state, isActive, customerAppEnabled, partnerAppEnabled, services, center } = req.body;
+    const { name, h3Cells, city, state, isActive, customerAppEnabled, partnerAppEnabled, categoryId, center } = req.body;
 
     if (!name || !String(name).trim()) {
       return fail(res, 400, "VALIDATION_ERROR", "Hub name is required", null, { requestId: req.requestId });
+    }
+
+    const category = await resolveCategory(categoryId);
+    if (!category) {
+      return fail(res, 400, "VALIDATION_ERROR", "Select a valid service category for this hub", null, { requestId: req.requestId });
     }
 
     const cells = cleanCells(h3Cells);
@@ -88,12 +115,11 @@ router.post("/", audit("admin.hubs.create"), async (req, res) => {
       return fail(res, 400, "VALIDATION_ERROR", "Select at least one cell on the map to define the hub", null, { requestId: req.requestId });
     }
 
-    const conflicts = await findCellConflicts(cells, null);
+    const conflicts = await findCellConflicts(cells, category._id, null);
     if (conflicts.length) {
-      return fail(res, 409, "CELL_CONFLICT", `${conflicts.length} cell(s) already belong to another hub. Each cell can be in only one hub.`, null, { requestId: req.requestId });
+      return fail(res, 409, "CELL_CONFLICT", `${conflicts.length} cell(s) already belong to another ${category.name} hub. Within one service, each cell can be in only one hub.`, null, { requestId: req.requestId });
     }
 
-    const s = services || {};
     const centroid = (center && Number.isFinite(center.lat) && Number.isFinite(center.lng))
       ? { lat: center.lat, lng: center.lng }
       : cellsCentroid(cells) || { lat: null, lng: null };
@@ -108,12 +134,8 @@ router.post("/", audit("admin.hubs.create"), async (req, res) => {
       isActive: isActive !== undefined ? Boolean(isActive) : true,
       customerAppEnabled: customerAppEnabled !== undefined ? Boolean(customerAppEnabled) : true,
       partnerAppEnabled: partnerAppEnabled !== undefined ? Boolean(partnerAppEnabled) : true,
-      services: {
-        acRepair:    s.acRepair    !== undefined ? Boolean(s.acRepair)    : true,
-        plumbing:    s.plumbing    !== undefined ? Boolean(s.plumbing)    : true,
-        mehendi:     s.mehendi     !== undefined ? Boolean(s.mehendi)     : true,
-        electrician: s.electrician !== undefined ? Boolean(s.electrician) : true,
-      },
+      category: category._id,
+      categoryName: category.name,
     });
 
     return success(res, hub, { requestId: req.requestId });
@@ -130,8 +152,13 @@ router.patch("/:id", audit("admin.hubs.update"), async (req, res) => {
       return fail(res, 400, "INVALID_ID", "Invalid hub id", null, { requestId: req.requestId });
     }
 
+    const existing = await Hub.findById(id).select("h3Cells category").lean();
+    if (!existing) {
+      return fail(res, 404, "NOT_FOUND", "Hub not found", null, { requestId: req.requestId });
+    }
+
     const patch = {};
-    const { name, h3Cells, city, state, isActive, customerAppEnabled, partnerAppEnabled, services, center } = req.body;
+    const { name, h3Cells, city, state, isActive, customerAppEnabled, partnerAppEnabled, categoryId, center } = req.body;
 
     if (name !== undefined) {
       if (!String(name).trim()) {
@@ -140,14 +167,27 @@ router.patch("/:id", audit("admin.hubs.update"), async (req, res) => {
       patch.name = String(name).trim();
     }
 
-    if (h3Cells !== undefined) {
-      const cells = cleanCells(h3Cells);
+    // Resolve the effective category (new one if changing, else the existing).
+    let effectiveCategory = existing.category;
+    if (categoryId !== undefined) {
+      const category = await resolveCategory(categoryId);
+      if (!category) {
+        return fail(res, 400, "VALIDATION_ERROR", "Select a valid service category for this hub", null, { requestId: req.requestId });
+      }
+      patch.category = category._id;
+      patch.categoryName = category.name;
+      effectiveCategory = category._id;
+    }
+
+    const cellsChanged = h3Cells !== undefined;
+    const categoryChanged =
+      categoryId !== undefined && String(effectiveCategory) !== String(existing.category);
+
+    let cells = existing.h3Cells || [];
+    if (cellsChanged) {
+      cells = cleanCells(h3Cells);
       if (!cells.length) {
         return fail(res, 400, "VALIDATION_ERROR", "A hub must have at least one cell", null, { requestId: req.requestId });
-      }
-      const conflicts = await findCellConflicts(cells, id);
-      if (conflicts.length) {
-        return fail(res, 409, "CELL_CONFLICT", `${conflicts.length} cell(s) already belong to another hub.`, null, { requestId: req.requestId });
       }
       patch.h3Cells = cells;
       // Recompute centroid unless explicitly provided
@@ -160,19 +200,20 @@ router.patch("/:id", audit("admin.hubs.update"), async (req, res) => {
       patch.center = { lat: center.lat, lng: center.lng };
     }
 
+    // Re-check conflicts whenever the cells OR the category change, scoped to
+    // the (possibly new) category. Different-category hubs may overlap freely.
+    if (cellsChanged || categoryChanged) {
+      const conflicts = await findCellConflicts(cells, effectiveCategory, id);
+      if (conflicts.length) {
+        return fail(res, 409, "CELL_CONFLICT", `${conflicts.length} cell(s) already belong to another hub in this service.`, null, { requestId: req.requestId });
+      }
+    }
+
     if (city  !== undefined) patch.city  = String(city);
     if (state !== undefined) patch.state = String(state);
     if (isActive !== undefined) patch.isActive = Boolean(isActive);
     if (customerAppEnabled !== undefined) patch.customerAppEnabled = Boolean(customerAppEnabled);
     if (partnerAppEnabled  !== undefined) patch.partnerAppEnabled  = Boolean(partnerAppEnabled);
-
-    if (services && typeof services === "object") {
-      const s = services;
-      if (s.acRepair    !== undefined) patch["services.acRepair"]    = Boolean(s.acRepair);
-      if (s.plumbing    !== undefined) patch["services.plumbing"]    = Boolean(s.plumbing);
-      if (s.mehendi     !== undefined) patch["services.mehendi"]     = Boolean(s.mehendi);
-      if (s.electrician !== undefined) patch["services.electrician"] = Boolean(s.electrician);
-    }
 
     const hub = await Hub.findByIdAndUpdate(id, { $set: patch }, { new: true }).lean();
     if (!hub) {

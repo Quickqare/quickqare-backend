@@ -13,6 +13,7 @@ const {
   isZoneServiceEnabled,
   resolveZoneForPincode,
   resolveHubForLocation,
+  resolveBookingCategories,
 } = require("../services/zone.service");
 const { getUseH3Flag } = require("../services/assignmentEngine");
 const {
@@ -213,31 +214,45 @@ exports.createBooking = async (req, res) => {
         }
       }
 
-      const hub =
-        Number.isFinite(lat) && Number.isFinite(lng)
-          ? await resolveHubForLocation(lat, lng, { ringFallback })
+      // Per-service gate: every service category in the booking must have an
+      // active hub covering this spot. Hubs are per-service and can overlap, so
+      // an area served for one service is not automatically served for another.
+      const neededCategories = await resolveBookingCategories(req.body);
+      const gateCategories = neededCategories.length
+        ? neededCategories
+        : [{ id: null, name: "Service" }];
+
+      const hasCoords = Number.isFinite(lat) && Number.isFinite(lng);
+      for (const cat of gateCategories) {
+        const hub = hasCoords
+          ? await resolveHubForLocation(lat, lng, { ringFallback, categoryId: cat.id })
           : null;
 
-      if (!hub || hub.isActive === false) {
-        return res.status(403).json({
-          success: false,
-          message: "Service not available in this area",
-        });
-      }
-      if (hub.customerAppEnabled === false) {
-        return res.status(403).json({
-          success: false,
-          message: "Bookings are currently paused for this area",
-        });
-      }
-      if (hub.partnerAppEnabled === false) {
-        return res.status(403).json({
-          success: false,
-          message: "Service is currently unavailable in this area",
-        });
+        if (!hub || hub.isActive === false) {
+          return res.status(403).json({
+            success: false,
+            message: cat.id
+              ? `${cat.name} is not available in this area`
+              : "Service not available in this area",
+          });
+        }
+        if (hub.customerAppEnabled === false) {
+          return res.status(403).json({
+            success: false,
+            message: "Bookings are currently paused for this area",
+          });
+        }
+        if (hub.partnerAppEnabled === false) {
+          return res.status(403).json({
+            success: false,
+            message: cat.id
+              ? `${cat.name} is currently unavailable in this area`
+              : "Service is currently unavailable in this area",
+          });
+        }
       }
 
-      if (Number.isFinite(lat) && Number.isFinite(lng)) {
+      if (hasCoords) {
         effectiveCoords = [lng, lat];
       }
     } else {
@@ -890,6 +905,86 @@ exports.markArrived = async (req, res) => {
   } catch (err) {
     console.error("markArrived error:", err);
     res.status(500).json({ message: "Failed to update status" });
+  }
+};
+
+/* =======================
+   PARTNER REPORTS AN ON-SITE ISSUE
+   e.g. "customer not available" / "asked me to come later".
+   Deliberately minimal: records an audit entry + pings ops. It does NOT
+   change booking status, apply fees, or issue refunds — a human decides.
+   This exists to (a) give partners a way to flag the problem instead of
+   silently cancelling, and (b) measure how often it happens before we
+   invest in an automated fee/reschedule rule.
+======================= */
+const PARTNER_REPORT_ISSUE_TYPES = [
+  "CUSTOMER_NOT_AVAILABLE",
+  "CUSTOMER_ASKED_LATER",
+  "CUSTOMER_NOT_REACHABLE",
+  "WRONG_ADDRESS",
+  "OTHER",
+];
+
+exports.reportBookingIssue = async (req, res) => {
+  try {
+    const { bookingId } = req.params;
+    const partnerId = req.partner?._id;
+    if (!partnerId) return res.status(401).json({ message: "Partner auth required" });
+
+    const issueType = String(req.body?.issueType || "OTHER").toUpperCase();
+    const note = String(req.body?.note || "").trim().slice(0, 500);
+    if (!PARTNER_REPORT_ISSUE_TYPES.includes(issueType)) {
+      return res.status(400).json({ message: "Invalid issue type" });
+    }
+
+    const booking = await Booking.findById(bookingId);
+    if (!booking) return res.status(404).json({ message: "Booking not found" });
+
+    // Only the assigned partner (or a helper) may report on this booking.
+    const pid = String(partnerId);
+    const isAssigned =
+      booking.partner?.toString() === pid ||
+      (booking.additionalPartners || []).some((p) => p.toString() === pid);
+    if (!isAssigned) {
+      return res.status(403).json({ message: "Not assigned to this booking" });
+    }
+
+    const report = {
+      partner: partnerId,
+      issueType,
+      note,
+      statusAtReport: booking.status,
+      createdAt: new Date(),
+    };
+
+    booking.partnerReports = booking.partnerReports || [];
+    booking.partnerReports.push(report);
+    await booking.save();
+
+    console.warn(
+      `[partner-report] Booking ${bookingId} flagged by partner ${pid} — issue=${issueType}, status=${booking.status}, note="${note}"`
+    );
+
+    // Ping the ops room so support can follow up — same channel as escalations.
+    if (global.io) {
+      global.io.to("admin_ops").emit("partner_booking_report", {
+        bookingId: String(bookingId),
+        partnerId: pid,
+        issueType,
+        note,
+        statusAtReport: booking.status,
+        pincode: booking.pincode || "",
+        timestamp: report.createdAt.toISOString(),
+      });
+    }
+
+    return res.json({
+      success: true,
+      message: "Reported to support. Our team will reach out shortly.",
+    });
+  } catch (err) {
+    console.error("reportBookingIssue error:", err);
+    return res.status(500).json({ message: "Failed to report issue" });
   }
 };
 
@@ -1569,11 +1664,19 @@ exports.cancelBookingByUser = async (req, res) => {
 
     let refund = { percent: 100, amount: 0 };
     if (booking.payment?.status === "PAID") {
-      refund = calculateRefund(
-        Number(booking.totalAmount || 0),
-        hoursToService,
-        booking.cancellationTiersSnapshot
-      );
+      // A reschedule is the company's fault — the partner couldn't complete the
+      // booking at the scheduled time. If the customer chooses to cancel instead
+      // of rescheduling, they get a FULL refund with no late-cancellation penalty,
+      // even though the original slot time has already passed (hoursToService < 0).
+      if (booking.status === "NEEDS_RESCHEDULING") {
+        refund = { percent: 100, amount: Number(booking.totalAmount || 0) };
+      } else {
+        refund = calculateRefund(
+          Number(booking.totalAmount || 0),
+          hoursToService,
+          booking.cancellationTiersSnapshot
+        );
+      }
     }
 
     // ATOMIC STATE TRANSITION: Prevents race condition where partner completes 

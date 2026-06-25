@@ -19,8 +19,13 @@ const adminAuth = require("../admin/middleware/authenticateAdmin");
  */
 
 /* PUBLIC PINCODE SERVICEABILITY CHECK — no auth required
-   GET /api/zones/check?pincode=500001
+   GET /api/zones/check?pincode=500001[&lat=17.4&lng=78.4]
    Returns { serviceable: true/false, zoneName }
+
+   When the caller supplies precise lat/lng (e.g. a browser that already has
+   GPS), H3 mode uses those for strict exact-cell hub matching. Without coords
+   it falls back to geocoding the pincode centroid + a lenient ring gate, which
+   is coarser. Mirrors the gate used in booking.controller.createBooking.
 */
 router.get("/check", async (req, res) => {
   try {
@@ -31,19 +36,61 @@ router.get("/check", async (req, res) => {
       return res.status(400).json({ success: false, serviceable: false, message: "Invalid pincode" });
     }
 
-    // H3 mode: pincode zones are disabled, so resolve serviceability against the
-    // hub covering the pincode centroid (lenient ring fallback for boundary fuzz).
-    // Mirrors the gate used in booking.controller.createBooking.
+    // Optional precise coordinates from a GPS-capable client.
+    const qLat = Number(req.query.lat);
+    const qLng = Number(req.query.lng);
+    const hasClientGps =
+      Number.isFinite(qLat) &&
+      Number.isFinite(qLng) &&
+      qLat >= -90 && qLat <= 90 &&
+      qLng >= -180 && qLng <= 180 &&
+      (qLat !== 0 || qLng !== 0);
+
     const useH3 = await getUseH3Flag();
     if (useH3) {
-      const { forwardGeocode } = require("../services/geocode.service");
-      const geo = await forwardGeocode(pincode, "zone_check");
-      let hub = null;
-      if (geo.ok) {
-        hub = await resolveHubForLocation(geo.lat, geo.lng, { ringFallback: true });
+      const { resolveBookingCategories } = require("../services/zone.service");
+      // Optional service scoping: callers that pass ?serviceId= or ?category=
+      // (id / slug / name) get a precise per-service answer; without it we report
+      // area-level serviceability (any active hub here), as before.
+      const neededCategories = await resolveBookingCategories({
+        serviceId: req.query.serviceId,
+        serviceCategory: req.query.category || req.query.serviceCategory,
+      });
+      const gateCategories = neededCategories.length ? neededCategories : [{ id: null }];
+
+      // Resolve the lookup coordinates once.
+      let baseLat = null;
+      let baseLng = null;
+      let ringFallback = false;
+      if (hasClientGps) {
+        // Precise GPS — strict exact-cell gate, no ring fuzz.
+        baseLat = qLat;
+        baseLng = qLng;
+      } else {
+        // No coords — geocode the pincode centroid and use the lenient ring gate.
+        const { forwardGeocode } = require("../services/geocode.service");
+        const geo = await forwardGeocode(pincode, "zone_check");
+        if (geo.ok) {
+          baseLat = geo.lat;
+          baseLng = geo.lng;
+          ringFallback = true;
+        }
       }
-      const serviceable = !!(hub && hub.isActive !== false && hub.customerAppEnabled !== false);
-      return res.json({ success: true, serviceable, zoneName: hub?.name || null });
+
+      let serviceable = baseLat !== null;
+      let zoneName = null;
+      if (serviceable) {
+        for (const cat of gateCategories) {
+          const hub = await resolveHubForLocation(baseLat, baseLng, { ringFallback, categoryId: cat.id });
+          if (!hub || hub.isActive === false || hub.customerAppEnabled === false) {
+            serviceable = false;
+            zoneName = null;
+            break;
+          }
+          zoneName = hub.name;
+        }
+      }
+      return res.json({ success: true, serviceable, zoneName });
     }
 
     const zone = await resolveZoneForPincode(pincode);

@@ -1111,35 +1111,52 @@ async function getAvailableSlotsForRequest({
   let requestH3Cell = null;
   let h3SearchCells = [];
   if (useH3) {
-    // H3 mode: validate against the hub covering the booking location.
+    // H3 mode: validate against the hub(s) covering the booking location — one
+    // per service category, since hubs are per-service and may overlap. Showing
+    // bookable slots for a service the area's hub doesn't cover would fail later
+    // at the createBooking gate, so we apply the same per-service check here.
     const coords = Array.isArray(location?.coordinates) ? location.coordinates : null;
     const hasGps = coords && coords.length === 2 &&
       Number.isFinite(Number(coords[0])) && Number.isFinite(Number(coords[1])) &&
       (Number(coords[0]) !== 0 || Number(coords[1]) !== 0);
 
-    let hub = null;
+    const { resolveHubForLocation, resolveBookingCategories } = require("./zone.service");
+
+    let gateLat = null;
+    let gateLng = null;
+    let ringFallback = false;
     if (hasGps) {
-      const { resolveHubForLocation } = require("./zone.service");
-      requestH3Cell = deriveH3Cell(Number(coords[1]), Number(coords[0]));
-      hub = await resolveHubForLocation(Number(coords[1]), Number(coords[0]));
+      gateLat = Number(coords[1]);
+      gateLng = Number(coords[0]);
+      requestH3Cell = deriveH3Cell(gateLat, gateLng);
     } else if (pincode) {
       const { forwardGeocode } = require("./geocode.service");
-      const { resolveHubForLocation } = require("./zone.service");
       const geo = await forwardGeocode(pincode);
       if (geo.ok) {
-        requestH3Cell = deriveH3Cell(geo.lat, geo.lng);
-        hub = await resolveHubForLocation(geo.lat, geo.lng, { ringFallback: true });
+        gateLat = geo.lat;
+        gateLng = geo.lng;
+        ringFallback = true;
+        requestH3Cell = deriveH3Cell(gateLat, gateLng);
       }
     }
 
-    if (
-      !hub ||
-      !requestH3Cell ||
-      hub.isActive === false ||
-      hub.customerAppEnabled === false ||
-      hub.partnerAppEnabled === false
-    ) {
+    if (gateLat === null || !requestH3Cell) {
       return [];
+    }
+
+    // Every service category in the request must have an active, app-enabled hub here.
+    const neededCategories = await resolveBookingCategories({ services, serviceId, serviceCategory });
+    const gateCategories = neededCategories.length ? neededCategories : [{ id: null }];
+    for (const cat of gateCategories) {
+      const hub = await resolveHubForLocation(gateLat, gateLng, { ringFallback, categoryId: cat.id });
+      if (
+        !hub ||
+        hub.isActive === false ||
+        hub.customerAppEnabled === false ||
+        hub.partnerAppEnabled === false
+      ) {
+        return [];
+      }
     }
 
     // Ring-1 cells absorb pincode-centroid fuzz (same k as the hub gate's

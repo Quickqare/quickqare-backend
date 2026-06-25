@@ -126,6 +126,14 @@ router.patch(
   bookingController.cancelBooking
 );
 
+// Partner flags an on-site issue (e.g. customer asked to come later).
+// Records an audit entry + notifies ops; does NOT change status/fees/refunds.
+router.post(
+  "/partner/report-issue/:bookingId",
+  partnerAuth,
+  bookingController.reportBookingIssue
+);
+
 // User cancel
 router.patch(
   "/user/cancel/:bookingId",

@@ -43,17 +43,26 @@ const hubSchema = new mongoose.Schema(
     customerAppEnabled: { type: Boolean, default: true },
     partnerAppEnabled:  { type: Boolean, default: true },
 
-    services: {
-      acRepair:    { type: Boolean, default: true },
-      plumbing:    { type: Boolean, default: true },
-      mehendi:     { type: Boolean, default: true },
-      electrician: { type: Boolean, default: true },
+    // Each hub serves exactly ONE service category. Hubs of *different*
+    // categories may overlap the same H3 cells (e.g. an AC hub and a Mehendi
+    // hub covering the same area); two hubs of the *same* category may not.
+    category: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Category",
+      required: true,
+      index: true,
     },
+    // Denormalised category name, kept in sync on save for display/filtering
+    // without a populate on every list.
+    categoryName: { type: String, default: "" },
 
     city:  { type: String, default: "" },
     state: { type: String, default: "" },
   },
   { timestamps: true }
 );
+
+// Cell-conflict checks always filter by category + cells, so index both.
+hubSchema.index({ category: 1, h3Cells: 1 });
 
 module.exports = mongoose.model("Hub", hubSchema);

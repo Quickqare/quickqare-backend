@@ -646,6 +646,29 @@ const bookingSchema = new mongoose.Schema(
       type: String,
       enum: ["pending", "credited", "failed"],
     },
+
+    /* ======================
+       PARTNER ON-SITE ISSUE REPORTS
+       Lightweight audit trail when a partner flags a problem at the door
+       (e.g. customer not available / asked to come later). Purely informational
+       for ops — does NOT change booking status, fees, or refunds. A human in the
+       admin panel decides what to do. See controller reportBookingIssue.
+    ====================== */
+    partnerReports: [
+      {
+        partner: {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: "Partner",
+        },
+        issueType: String,
+        note: String,
+        statusAtReport: String,
+        createdAt: {
+          type: Date,
+          default: Date.now,
+        },
+      },
+    ],
   },
   { timestamps: true }
 );
