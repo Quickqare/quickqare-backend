@@ -142,16 +142,13 @@ exports.requestWithdrawal = async (req, res) => {
 
     const wallet = await PartnerWallet.findOne({ partnerId });
     if (!wallet) return res.status(404).json({ success: false, message: "Wallet not found" });
+
+    // Persist a normalized wallet so withdrawableBalance is populated (migrates
+    // any legacy balance-only doc) before the atomic hold reads that field.
     normalizeWallet(wallet);
+    await wallet.save();
 
-    if (wallet.withdrawableBalance < amount) {
-      return res.status(400).json({
-        success: false,
-        message: `Insufficient balance. Available: ₹${wallet.withdrawableBalance}`,
-      });
-    }
-
-    // Block duplicate pending requests
+    // Block duplicate pending requests (product rule + cheap pre-check).
     const existing = await Withdrawal.findOne({ partnerId, status: "PENDING" });
     if (existing) {
       return res.status(400).json({
@@ -169,17 +166,70 @@ exports.requestWithdrawal = async (req, res) => {
       });
     }
 
-    const withdrawal = await Withdrawal.create({
-      partnerId,
-      amount,
-      status: "PENDING",
-      bankDetails: {
-        accountHolderName: bankDetails.accountHolderName || "",
-        accountNumber: bankDetails.accountNumber,
-        ifsc: bankDetails.ifsc,
-        bankName: bankDetails.bankName || "",
-      },
-    });
+    // ATOMIC HOLD: reserve the amount out of the withdrawable bucket in a single
+    // guarded update. The `withdrawableBalance: { $gte: amount }` filter means
+    // two concurrent requests can't both pass, and the balance can never be
+    // requested twice or driven negative — the old check-then-create left the
+    // funds sitting in the balance until approval, so a later penalty/debit
+    // could make an already-approved request un-payable (or be spent twice).
+    const held = await PartnerWallet.findOneAndUpdate(
+      { partnerId, withdrawableBalance: { $gte: amount } },
+      [
+        {
+          $set: {
+            withdrawableBalance: {
+              $round: [{ $subtract: [{ $ifNull: ["$withdrawableBalance", 0] }, amount] }, 2],
+            },
+            lastUpdated: new Date(),
+          },
+        },
+        // balance mirrors the withdrawable bucket.
+        { $set: { balance: "$withdrawableBalance" } },
+      ],
+      { new: true }
+    );
+
+    if (!held) {
+      const available = roundAmount(wallet.withdrawableBalance ?? wallet.balance ?? 0);
+      return res.status(400).json({
+        success: false,
+        message: `Insufficient balance. Available: ₹${available}`,
+      });
+    }
+
+    let withdrawal;
+    try {
+      withdrawal = await Withdrawal.create({
+        partnerId,
+        amount,
+        status: "PENDING",
+        balanceHeld: true,
+        bankDetails: {
+          accountHolderName: bankDetails.accountHolderName || "",
+          accountNumber: bankDetails.accountNumber,
+          ifsc: bankDetails.ifsc,
+          bankName: bankDetails.bankName || "",
+        },
+      });
+    } catch (createErr) {
+      // Creation failed after the hold — return the reserved funds so they
+      // aren't stranded out of the partner's withdrawable balance.
+      await PartnerWallet.findOneAndUpdate(
+        { partnerId },
+        [
+          {
+            $set: {
+              withdrawableBalance: {
+                $round: [{ $add: [{ $ifNull: ["$withdrawableBalance", 0] }, amount] }, 2],
+              },
+              lastUpdated: new Date(),
+            },
+          },
+          { $set: { balance: "$withdrawableBalance" } },
+        ]
+      );
+      throw createErr;
+    }
 
     res.status(201).json({
       success: true,
@@ -252,19 +302,24 @@ exports.creditWallet = async ({
     wallet = await PartnerWallet.create({ partnerId, balance: 0, withdrawableBalance: 0, pendingBalance: 0, totalEarnings: 0, totalWithdrawn: 0 });
   }
 
-  normalizeWallet(wallet);
-
-  if (walletBucket === "pending") {
-    wallet.pendingBalance = roundAmount(wallet.pendingBalance + amount);
-  } else {
-    wallet.withdrawableBalance = roundAmount(wallet.withdrawableBalance + amount);
-  }
-
-  wallet.totalEarnings = roundAmount(wallet.totalEarnings + amount);
-  wallet.balance = roundAmount(wallet.withdrawableBalance);
-  wallet.lastUpdated = new Date();
-
-  await wallet.save();
+  // Atomic credit via an $inc-style pipeline update, so a concurrent debit/credit on the
+  // same wallet can't clobber this balance through a stale read-modify-write (findOne+save).
+  const incField = walletBucket === "pending" ? "pendingBalance" : "withdrawableBalance";
+  await PartnerWallet.findOneAndUpdate(
+    { partnerId },
+    [
+      {
+        $set: {
+          [incField]: { $round: [{ $add: [{ $ifNull: [`$${incField}`, 0] }, amount] }, 2] },
+          totalEarnings: { $round: [{ $add: [{ $ifNull: ["$totalEarnings", 0] }, amount] }, 2] },
+          lastUpdated: new Date(),
+        },
+      },
+      // balance mirrors the withdrawable bucket only.
+      { $set: { balance: { $round: [{ $ifNull: ["$withdrawableBalance", 0] }, 2] } } },
+    ],
+    { new: true }
+  );
 
   // Non-job-payment credits (bonus, adjustment, etc.) still need a ledger row.
   // job_payment rows were already written above as the idempotency guard.
@@ -279,7 +334,58 @@ exports.creditWallet = async ({
       description,
     });
   }
+
+  // Now that the partner has earned, try to collect any penalty they owe (recorded as a
+  // PENDING debit when their balance was short). This nets the debt off fresh earnings so
+  // the "owed" row doesn't sit forever uncollected. Only meaningful when the withdrawable
+  // bucket actually grew, so skip for pending-bucket credits.
+  if (walletBucket !== "pending") {
+    await settleOutstandingPenalties(partnerId).catch((e) =>
+      console.warn(`[wallet] settleOutstandingPenalties failed for ${partnerId}: ${e.message}`)
+    );
+  }
 };
+
+/* =====================================================
+   SETTLE OUTSTANDING PENALTIES (INTERNAL)
+   Collects any PENDING penalty debits (recorded by debitWallet's allowShortfall path
+   when the balance was insufficient) from the partner's current withdrawable balance,
+   oldest first. Each collection is atomic ($gte guard) and marks the ledger row settled.
+===================================================== */
+const settleOutstandingPenalties = async (partnerId) => {
+  const owed = await WalletTransaction.find({
+    partnerId,
+    type: "debit",
+    status: "pending",
+    reason: "penalty",
+  })
+    .sort({ createdAt: 1 })
+    .lean();
+
+  for (const row of owed) {
+    const amt = roundAmount(row.amount);
+    if (amt <= 0) {
+      await WalletTransaction.updateOne({ _id: row._id }, { $set: { status: "success" } });
+      continue;
+    }
+    // Atomically deduct only if the balance fully covers this owed row.
+    const wallet = await PartnerWallet.findOneAndUpdate(
+      { partnerId, withdrawableBalance: { $gte: amt } },
+      {
+        $inc: { withdrawableBalance: -amt, balance: -amt, totalWithdrawn: amt },
+        $set: { lastUpdated: new Date() },
+      },
+      { new: true }
+    );
+    if (!wallet) break; // not enough to clear this (or any later, larger) row — stop.
+
+    await WalletTransaction.updateOne(
+      { _id: row._id },
+      { $set: { status: "success", description: `${row.description} [settled from later earnings]` } }
+    );
+  }
+};
+exports.settleOutstandingPenalties = settleOutstandingPenalties;
 
 /* =====================================================
    DEBIT PARTNER WALLET (INTERNAL USE ONLY)
@@ -290,6 +396,7 @@ exports.debitWallet = async ({
   reason,
   bookingId = null,
   description = "",
+  allowShortfall = false,
 }) => {
   if (!partnerId || !amount) {
     throw new Error("partnerId and amount are required");
@@ -297,32 +404,121 @@ exports.debitWallet = async ({
 
   const safeAmount = roundAmount(amount);
 
-  // Atomic debit: only succeeds if sufficient balance exists — prevents concurrent double-spend
-  const wallet = await PartnerWallet.findOneAndUpdate(
-    { partnerId, withdrawableBalance: { $gte: safeAmount } },
-    {
-      $inc: {
-        withdrawableBalance: -safeAmount,
-        balance: -safeAmount,
-        totalWithdrawn: safeAmount,
+  if (!allowShortfall) {
+    // Strict atomic debit: only succeeds if sufficient balance exists — prevents
+    // concurrent double-spend on withdrawals / admin payouts.
+    const wallet = await PartnerWallet.findOneAndUpdate(
+      { partnerId, withdrawableBalance: { $gte: safeAmount } },
+      {
+        $inc: {
+          withdrawableBalance: -safeAmount,
+          balance: -safeAmount,
+          totalWithdrawn: safeAmount,
+        },
+        $set: { lastUpdated: new Date() },
       },
-      $set: { lastUpdated: new Date() },
-    },
-    { new: true }
-  );
+      { new: true }
+    );
 
-  if (!wallet) {
-    const exists = await PartnerWallet.exists({ partnerId });
-    if (!exists) throw new Error("Wallet not found");
-    throw new Error("Insufficient wallet balance");
+    if (!wallet) {
+      const exists = await PartnerWallet.exists({ partnerId });
+      if (!exists) throw new Error("Wallet not found");
+      throw new Error("Insufficient wallet balance");
+    }
+
+    await WalletTransaction.create({
+      partnerId,
+      amount: safeAmount,
+      type: "debit",
+      reason,
+      bookingId,
+      description,
+    });
+
+    return { collected: safeAmount, shortfall: 0, withdrawableBalance: wallet.withdrawableBalance };
   }
 
-  await WalletTransaction.create({
-    partnerId,
-    amount: safeAmount,
-    type: "debit",
-    reason,
-    bookingId,
-    description,
-  });
+  /*
+   * allowShortfall: a MANDATORY charge (e.g. a cancellation penalty) must never be
+   * silently lost. Collect as much as the balance allows (respecting the wallet's
+   * min:0 floor — a negative balance would throw on the next .save()), and record any
+   * uncollected remainder as a PENDING debit ledger row: a durable "owed" record that
+   * shows in wallet history and is queryable/recoverable by ops
+   * (WalletTransaction.find({ type: "debit", status: "pending" })).
+   */
+  // Ensure the wallet exists so the atomic update below has a target.
+  let wallet = await PartnerWallet.findOne({ partnerId });
+  if (!wallet) {
+    wallet = await PartnerWallet.create({
+      partnerId, balance: 0, withdrawableBalance: 0, pendingBalance: 0, totalEarnings: 0, totalWithdrawn: 0,
+    });
+  }
+
+  // Atomic collection: subtract min(withdrawableBalance, safeAmount) in a single pipeline
+  // update so a concurrent credit/debit on the same wallet can't clobber the balance via a
+  // stale read-modify-write. We read the PRE-image to compute exactly how much was collected
+  // (the same min() the pipeline applied), then record the success/owed ledger rows.
+  const pre = await PartnerWallet.findOneAndUpdate(
+    { partnerId },
+    [
+      {
+        $set: {
+          withdrawableBalance: {
+            $round: [
+              { $subtract: [
+                { $ifNull: ["$withdrawableBalance", 0] },
+                { $min: [{ $ifNull: ["$withdrawableBalance", 0] }, safeAmount] },
+              ] },
+              2,
+            ],
+          },
+          totalWithdrawn: {
+            $round: [
+              { $add: [
+                { $ifNull: ["$totalWithdrawn", 0] },
+                { $min: [{ $ifNull: ["$withdrawableBalance", 0] }, safeAmount] },
+              ] },
+              2,
+            ],
+          },
+          lastUpdated: new Date(),
+        },
+      },
+      { $set: { balance: "$withdrawableBalance" } },
+    ],
+    { new: false }
+  );
+
+  const availablePre = Math.max(0, roundAmount(pre?.withdrawableBalance || 0));
+  const collected = roundAmount(Math.min(availablePre, safeAmount));
+  const shortfall = roundAmount(safeAmount - collected);
+
+  if (collected > 0) {
+    await WalletTransaction.create({
+      partnerId,
+      amount: collected,
+      type: "debit",
+      reason,
+      bookingId,
+      status: "success",
+      description: shortfall > 0
+        ? `${description} (partial: ₹${collected} collected, ₹${shortfall} outstanding)`
+        : description,
+    });
+  }
+
+  if (shortfall > 0) {
+    // Uncollected remainder — recorded as PENDING so it reads as owed, not settled.
+    await WalletTransaction.create({
+      partnerId,
+      amount: shortfall,
+      type: "debit",
+      reason,
+      bookingId,
+      status: "pending",
+      description: `${description} — OUTSTANDING (insufficient balance, ₹${shortfall} owed)`,
+    });
+  }
+
+  return { collected, shortfall, withdrawableBalance: roundAmount(availablePre - collected) };
 };

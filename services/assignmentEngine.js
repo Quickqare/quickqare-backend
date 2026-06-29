@@ -463,6 +463,12 @@ async function assignBooking(bookingId, opts = {}) {
       booking.standbyPartners = standbyCandidates;
 
       booking.status = finalStatus;
+      // A partner is now attached, so the partner-cancel auto-refund window is closed.
+      // Clear the flag (set by cancelBooking on a partner cancel) — otherwise it stays
+      // sticky across this partner's tenure, and a much-later re-search exhaustion would
+      // wrongly auto-cancel + refund a booking we did manage to staff. If THIS partner
+      // later cancels, cancelBooking re-arms it.
+      booking.autoRefundIfUnassigned = false;
       // Auto-accepted bookings don't need a manual ACK from the partner.
       // Mark ackReceivedAt now so the ACK timeout handler skips reassignment.
       if (autoAccepted) {
@@ -721,8 +727,9 @@ async function reassignBooking(bookingId, partnerId, options = {}) {
     const booking = await Booking.findById(bookingId);
     if (!booking) return;
 
-    // Gate: don't reassign already-completed or cancelled bookings
-    if (["COMPLETED", "CANCELLED"].includes(booking.status)) return;
+    // Gate: don't reassign already-completed/cancelled bookings, nor one the customer
+    // is actively rescheduling (NEEDS_RESCHEDULING) — that flow owns the slot.
+    if (["COMPLETED", "CANCELLED", "NEEDS_RESCHEDULING"].includes(booking.status)) return;
 
     // Hard cap on reassignment attempts — count REASSIGN_REQUESTED audit entries.
     const reassignCount = (booking.assignmentAudit || []).filter(
@@ -730,15 +737,25 @@ async function reassignBooking(bookingId, partnerId, options = {}) {
     ).length;
 
     if (reassignCount >= MAX_REASSIGN_ATTEMPTS) {
-      booking.status = "NO_PARTNER_AVAILABLE";
-      booking.assignmentAudit.push({
-        stage: booking.assignmentStage || 3,
-        event: "REASSIGN_LIMIT_REACHED",
-        searchedPincodes: [],
-        notes: `Max reassignment attempts (${MAX_REASSIGN_ATTEMPTS}) reached — escalating to ops`,
-        candidates: [],
-      });
-      await booking.save();
+      // Guarded atomic update so a concurrent reschedule/cancel/complete isn't clobbered
+      // by a stale full-document save.
+      const capped = await Booking.findOneAndUpdate(
+        { _id: bookingId, status: { $nin: ["COMPLETED", "CANCELLED", "NEEDS_RESCHEDULING"] } },
+        {
+          $set: { status: "NO_PARTNER_AVAILABLE" },
+          $push: {
+            assignmentAudit: {
+              stage: booking.assignmentStage || 3,
+              event: "REASSIGN_LIMIT_REACHED",
+              searchedPincodes: [],
+              notes: `Max reassignment attempts (${MAX_REASSIGN_ATTEMPTS}) reached — escalating to ops`,
+              candidates: [],
+            },
+          },
+        },
+        { new: true }
+      );
+      if (!capped) return; // booking moved on concurrently — abort.
 
       await escalateUnassignedBooking(booking._id);
 
@@ -756,8 +773,6 @@ async function reassignBooking(bookingId, partnerId, options = {}) {
     }
 
     if (partnerId) {
-      booking.rejectedPartners.push(partnerId);
-
       // Apply reliability penalty — unless the caller (HTTP cancelBooking) has
       // already counted this strike themselves. Without the skip flag, an HTTP
       // partner-cancel would increment weeklyCancelCount twice (once in the
@@ -790,20 +805,33 @@ async function reassignBooking(bookingId, partnerId, options = {}) {
     const prevPartner = booking.partner;
     const prevAdditional = booking.additionalPartners || [];
 
-    booking.partner = null;
-    booking.additionalPartners = [];
-    booking.status = "SEARCHING";
-    booking.assignmentAudit.push({
-      stage: booking.assignmentStage || 1,
-      event: "REASSIGN_REQUESTED",
-      searchedPincodes: [],
-      selectedPartnerId: partnerId || null,
-      notes: partnerId
-        ? "Reassignment triggered after partner reject/cancel"
-        : "Reassignment triggered (no partner penalised)",
-      candidates: [],
-    });
-    await booking.save();
+    // Guarded atomic release: only $set/$push the reassignment fields, and only if the
+    // booking is still reassign-eligible. This avoids a stale full-document save clobbering
+    // a concurrent reschedule (which would otherwise revert the slot + re-arm autoRefund).
+    const pushOps = {
+      assignmentAudit: {
+        stage: booking.assignmentStage || 1,
+        event: "REASSIGN_REQUESTED",
+        searchedPincodes: [],
+        selectedPartnerId: partnerId || null,
+        notes: partnerId
+          ? "Reassignment triggered after partner reject/cancel"
+          : "Reassignment triggered (no partner penalised)",
+        candidates: [],
+      },
+    };
+    if (partnerId) pushOps.rejectedPartners = partnerId;
+
+    const released = await Booking.findOneAndUpdate(
+      { _id: bookingId, status: { $nin: ["COMPLETED", "CANCELLED", "NEEDS_RESCHEDULING"] } },
+      {
+        $set: { partner: null, additionalPartners: [], status: "SEARCHING" },
+        $push: pushOps,
+      },
+      { new: true }
+    );
+
+    if (!released) return; // concurrently rescheduled/cancelled/completed — abort reassignment.
 
     // Bust slot cache: the rejecting partner is no longer holding this window,
     // so the slot may now be available to a different customer. Without this,

@@ -320,7 +320,8 @@ const bookingSchema = new mongoose.Schema(
 
     cancelledBy: {
       type: String,
-      enum: ["user", "partner", "system"],
+      // "admin" covers force-cancel / manual cancel from the admin panel.
+      enum: ["user", "partner", "system", "admin"],
       default: null,
     },
 
@@ -400,6 +401,16 @@ const bookingSchema = new mongoose.Schema(
         },
       ],
       default: [],
+    },
+
+    // Set when a partner CANCELS a job we're re-searching for. If reassignment then
+    // exhausts (no replacement found), escalation auto-cancels with a full refund —
+    // the platform absorbs the failure. Distinct from a customer-initiated reschedule
+    // (which clears this) and from an initial booking that simply can't be filled
+    // (which stays false and goes to ops). See escalation.service.js.
+    autoRefundIfUnassigned: {
+      type: Boolean,
+      default: false,
     },
 
     cancelReason: {

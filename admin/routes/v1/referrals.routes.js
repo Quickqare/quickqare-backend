@@ -4,9 +4,36 @@ const ReferralSettings = require("../../../models/ReferralSettings");
 const Referral = require("../../../models/Referral");
 const UserWallet = require("../../../models/UserWallet");
 const UserWalletTransaction = require("../../../models/UserWalletTransaction");
+const authenticateAdmin = require("../../middleware/authenticateAdmin");
+const authorize = require("../../middleware/authorize");
+const { PERMISSIONS } = require("../../constants/permissions");
+
+// Every endpoint here exposes customer wallet balances, PII (name/phone), or
+// referral reward configuration. The whole router used to be mounted with NO
+// auth at all — a critical broken-access-control + unauthenticated-write hole.
+// Require a valid admin session on every route from here down.
+router.use(authenticateAdmin);
+
+// Whitelist of fields a referral-settings write is allowed to touch. Prevents
+// mass-assignment of arbitrary/internal fields via Object.assign(settings, req.body).
+const REFERRAL_SETTINGS_FIELDS = [
+  "referrerRewardAmount",
+  "newUserDiscountAmount",
+  "minOrderAmount",
+  "couponExpiryDays",
+  "maxReferralsPerUser",
+  "isEnabled",
+  "couponDescription",
+];
+
+const pickReferralSettings = (body = {}) =>
+  REFERRAL_SETTINGS_FIELDS.reduce((acc, key) => {
+    if (body[key] !== undefined) acc[key] = body[key];
+    return acc;
+  }, {});
 
 // Get referral settings
-router.get("/referral-settings", async (req, res) => {
+router.get("/referral-settings", authorize(PERMISSIONS.ANALYTICS_READ), async (req, res) => {
   try {
     let settings = await ReferralSettings.findOne();
     if (!settings) {
@@ -19,15 +46,15 @@ router.get("/referral-settings", async (req, res) => {
 });
 
 // Update referral settings
-router.put("/referral-settings", async (req, res) => {
+router.put("/referral-settings", authorize(PERMISSIONS.SETTINGS_MANAGE), async (req, res) => {
   try {
-    const updateData = req.body;
+    const updateData = pickReferralSettings(req.body);
     let settings = await ReferralSettings.findOne();
 
     if (!settings) {
       settings = await ReferralSettings.create(updateData);
     } else {
-      Object.assign(settings, updateData);
+      settings.set(updateData);
       await settings.save();
     }
 
@@ -38,7 +65,7 @@ router.put("/referral-settings", async (req, res) => {
 });
 
 // Get referrals list
-router.get("/", async (req, res) => {
+router.get("/", authorize(PERMISSIONS.ANALYTICS_READ), async (req, res) => {
   try {
     const { page = 1, limit = 20, status, referrerId, referredId } = req.query;
 
@@ -75,7 +102,7 @@ router.get("/", async (req, res) => {
 });
 
 // Get referral stats
-router.get("/referral-stats", async (req, res) => {
+router.get("/referral-stats", authorize(PERMISSIONS.ANALYTICS_READ), async (req, res) => {
   try {
     const stats = await Referral.aggregate([
       {
@@ -114,7 +141,7 @@ router.get("/referral-stats", async (req, res) => {
 });
 
 // Get user wallets
-router.get("/user-wallets", async (req, res) => {
+router.get("/user-wallets", authorize(PERMISSIONS.ANALYTICS_READ), async (req, res) => {
   try {
     const { page = 1, limit = 20 } = req.query;
 
@@ -144,7 +171,7 @@ router.get("/user-wallets", async (req, res) => {
 });
 
 // Get user wallet transactions
-router.get("/user-wallet-transactions", async (req, res) => {
+router.get("/user-wallet-transactions", authorize(PERMISSIONS.ANALYTICS_READ), async (req, res) => {
   try {
     const { page = 1, limit = 20, userId } = req.query;
 

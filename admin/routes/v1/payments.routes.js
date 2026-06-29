@@ -180,13 +180,34 @@ router.patch(
         return fail(res, 400, "ALREADY_PROCESSED", "Withdrawal already processed", null, { requestId: req.requestId });
       }
 
-      // Debit wallet — throws if insufficient balance
-      await debitWallet({
-        partnerId: withdrawal.partnerId,
-        amount: withdrawal.amount,
-        reason: "withdrawal",
-        description: `Withdrawal approved by admin. Ref: ${referenceId || "N/A"}`,
-      });
+      if (withdrawal.balanceHeld) {
+        // Funds were already reserved out of withdrawableBalance when the
+        // partner submitted the request. Approving must NOT debit again —
+        // just move the held amount into totalWithdrawn and write the ledger row.
+        await PartnerWallet.updateOne(
+          { partnerId: withdrawal.partnerId },
+          {
+            $inc: { totalWithdrawn: withdrawal.amount },
+            $set: { lastUpdated: new Date() },
+          }
+        );
+        await WalletTransaction.create({
+          partnerId: withdrawal.partnerId,
+          amount: withdrawal.amount,
+          type: "debit",
+          reason: "withdrawal",
+          status: "success",
+          description: `Withdrawal approved by admin. Ref: ${referenceId || "N/A"}`,
+        });
+      } else {
+        // Legacy request (no hold at creation) — debit now. Throws if insufficient balance.
+        await debitWallet({
+          partnerId: withdrawal.partnerId,
+          amount: withdrawal.amount,
+          reason: "withdrawal",
+          description: `Withdrawal approved by admin. Ref: ${referenceId || "N/A"}`,
+        });
+      }
 
       withdrawal.status = "APPROVED";
       withdrawal.referenceId = referenceId || null;
@@ -226,6 +247,25 @@ router.patch(
       }
       if (withdrawal.status !== "PENDING") {
         return fail(res, 400, "ALREADY_PROCESSED", "Withdrawal already processed", null, { requestId: req.requestId });
+      }
+
+      if (withdrawal.balanceHeld) {
+        // The amount was reserved out of withdrawableBalance at request time.
+        // Rejecting returns it to the partner's withdrawable bucket.
+        await PartnerWallet.findOneAndUpdate(
+          { partnerId: withdrawal.partnerId },
+          [
+            {
+              $set: {
+                withdrawableBalance: {
+                  $round: [{ $add: [{ $ifNull: ["$withdrawableBalance", 0] }, withdrawal.amount] }, 2],
+                },
+                lastUpdated: new Date(),
+              },
+            },
+            { $set: { balance: "$withdrawableBalance" } },
+          ]
+        );
       }
 
       withdrawal.status = "REJECTED";

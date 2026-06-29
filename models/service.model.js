@@ -70,6 +70,12 @@ const serviceSchema = new mongoose.Schema(
       default: "",
     },
 
+    // Separate image for web (16:9 banner ratio); app uses imageUrl (4:3)
+    webImageUrl: {
+      type: String,
+      default: "",
+    },
+
     /* =====================
        PRICING
     ===================== */

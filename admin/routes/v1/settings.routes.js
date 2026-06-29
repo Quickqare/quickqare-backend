@@ -60,6 +60,14 @@ router.patch("/settings", audit("admin.settings.update"), async (req, res) => {
       if (p.taxPercent         !== undefined) settings.pricing.taxPercent         = clampPct(p.taxPercent);
     }
 
+    // Cancellation (flat partner penalty for cancelling after arriving). ≥ 0.
+    if (req.body.cancellation !== undefined && typeof req.body.cancellation === "object") {
+      const c = req.body.cancellation;
+      if (c.arrivedCancelPenaltyInr !== undefined) {
+        settings.cancellation.arrivedCancelPenaltyInr = Math.max(0, Number(c.arrivedCancelPenaltyInr) || 0);
+      }
+    }
+
     // Home theme (festival / campaign UI)
     if (req.body.homeTheme !== undefined && typeof req.body.homeTheme === "object") {
       const t = req.body.homeTheme;

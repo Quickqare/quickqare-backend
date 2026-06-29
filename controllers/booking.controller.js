@@ -3,7 +3,7 @@ const Partner = require("../models/Partner");
 const Service = require("../models/service.model");
 const mongoose = require("mongoose");
 const Category = require("../models/Category");
-const { creditWallet } = require("./partnerWallet.controller");
+const { creditWallet, debitWallet } = require("./partnerWallet.controller");
 const { getAvailableSlots } = require("../services/slotAvailability_service");
 const { assignBooking, reassignBooking } = require("../services/assignmentEngine");
 const { deriveH3Cell } = require("../utils/h3");
@@ -54,6 +54,26 @@ async function getJobSelfieFlag() {
     _jobSelfieFlagCache.expiresAt = Date.now() + 10_000;
   }
   return _jobSelfieFlagCache.value;
+}
+
+// Admin-configurable flat penalty (₹) charged when a partner cancels after
+// arriving. Cached 60s; falls back to the default if settings are unreachable.
+// Live value lives in AdminSetting.cancellation.arrivedCancelPenaltyInr.
+const DEFAULT_ARRIVED_CANCEL_PENALTY_INR = 100;
+let _arrivedCancelPenaltyCache = { value: DEFAULT_ARRIVED_CANCEL_PENALTY_INR, expiresAt: 0 };
+async function getArrivedCancelPenalty() {
+  if (Date.now() < _arrivedCancelPenaltyCache.expiresAt) return _arrivedCancelPenaltyCache.value;
+  try {
+    const s = await AdminSetting.findOne().select("cancellation.arrivedCancelPenaltyInr").lean();
+    const raw = s?.cancellation?.arrivedCancelPenaltyInr;
+    _arrivedCancelPenaltyCache = {
+      value: Number.isFinite(Number(raw)) ? Math.max(0, Number(raw)) : DEFAULT_ARRIVED_CANCEL_PENALTY_INR,
+      expiresAt: Date.now() + 60_000,
+    };
+  } catch {
+    _arrivedCancelPenaltyCache.expiresAt = Date.now() + 10_000;
+  }
+  return _arrivedCancelPenaltyCache.value;
 }
 
 const normalizeText = (value = "") =>
@@ -925,6 +945,11 @@ const PARTNER_REPORT_ISSUE_TYPES = [
   "OTHER",
 ];
 
+// Subset that means "the customer is the reason the job can't proceed". For
+// these, both apps surface a cancel button: customer cancels → no refund;
+// partner cancels → penalty. The booking is NOT auto-cancelled.
+const CUSTOMER_FAULT_ISSUE_TYPES = ["CUSTOMER_NOT_AVAILABLE", "CUSTOMER_ASKED_LATER"];
+
 exports.reportBookingIssue = async (req, res) => {
   try {
     const { bookingId } = req.params;
@@ -976,6 +1001,19 @@ exports.reportBookingIssue = async (req, res) => {
         pincode: booking.pincode || "",
         timestamp: report.createdAt.toISOString(),
       });
+    }
+
+    // For CUSTOMER_NOT_AVAILABLE / CUSTOMER_ASKED_LATER: notify the customer
+    // so the cancel button appears in their app. No status change here — the
+    // customer cancels (no refund) or the partner cancels (penalty applies).
+    if (CUSTOMER_FAULT_ISSUE_TYPES.includes(issueType)) {
+      if (global.io) {
+        global.io.to(`user_${booking.user}`).emit("booking_update", {
+          bookingId: String(booking._id),
+          status: booking.status,
+          partnerReportedIssue: issueType,
+        });
+      }
     }
 
     return res.json({
@@ -1441,6 +1479,8 @@ exports.completeBooking = async (req, res) => {
 /* =======================
    PARTNER CANCELS BOOKING
    (MAX 5 PER ROLLING WEEK + AUTO-SUSPEND AT LIMIT)
+   Special case: cancelling from ARRIVED status closes the booking entirely
+   (no reassignment) and charges a penalty — partner arrived but walked away.
 ======================= */
 const PARTNER_WEEKLY_CANCEL_LIMIT = 5;
 const PARTNER_DAILY_CANCEL_LIMIT  = 1;
@@ -1483,53 +1523,233 @@ exports.cancelBooking = async (req, res) => {
     const now = new Date();
 
     /* =====================
-       DAILY CANCEL LIMIT (1 per calendar day)
+       CANCEL STRIKES & RATE LIMITS — voluntary (non-ARRIVED) cancels only.
+
+       An ARRIVED cancel is a "customer refused / asked later" situation: it is
+       governed by the wallet penalty instead, so it must NOT consume the daily
+       quota, count toward weekly auto-suspension, or block a partner who is
+       stuck at a refusing customer's door (#5 — no double penalty).
+
+       For voluntary cancels we CHECK the limits up front (reject if over) but only
+       COMMIT the strike via commitCancelStrike() after the booking actually
+       transitions, so a lost race (the 409 paths below) never penalises the
+       partner for a cancellation that didn't happen (#4 — no charge on race).
     ===================== */
+    const isArrivedCancel = booking.status === "ARRIVED";
     const todayStr = now.toISOString().slice(0, 10); // YYYY-MM-DD
-    if (partner.lastDailyCancelDate === todayStr) {
-      if (partner.dailyCancelCount >= PARTNER_DAILY_CANCEL_LIMIT) {
+
+    // Default no-op (ARRIVED path); redefined below for voluntary cancels.
+    let commitCancelStrike = async () => {};
+
+    if (!isArrivedCancel) {
+      // ----- DAILY CANCEL LIMIT (1 per calendar day) — check only -----
+      const sameDay = partner.lastDailyCancelDate === todayStr;
+      if (sameDay && partner.dailyCancelCount >= PARTNER_DAILY_CANCEL_LIMIT) {
         return res.status(400).json({
           message: `You can only cancel ${PARTNER_DAILY_CANCEL_LIMIT} job per day. Try again tomorrow.`,
         });
       }
-      partner.dailyCancelCount += 1;
-    } else {
-      partner.dailyCancelCount = 1;
-      partner.lastDailyCancelDate = todayStr;
+
+      // ----- ROLLING 7-DAY WINDOW (auto-suspension) — check only -----
+      // Use epoch (0) as the safe default so a null lastCancelReset always triggers a reset,
+      // rather than comparing against NaN (which is what `new Date(null)` produces in some runtimes).
+      const lastReset = partner.lastCancelReset ? new Date(partner.lastCancelReset) : new Date(0);
+      const diffDays = (now.getTime() - lastReset.getTime()) / (1000 * 60 * 60 * 24);
+      const willResetWeek = diffDays >= 7;
+      const effectiveWeekly = willResetWeek ? 0 : (partner.weeklyCancelCount || 0);
+
+      if (effectiveWeekly >= PARTNER_WEEKLY_CANCEL_LIMIT) {
+        return res.status(400).json({
+          message: `Weekly cancel limit reached (${PARTNER_WEEKLY_CANCEL_LIMIT} per week). Account suspended.`,
+        });
+      }
+
+      // Persist the strike + free load — only invoked after a successful transition.
+      // Uses a single atomic pipeline update (not read-modify-write) so two concurrent
+      // cancels by the same partner can't clobber each other's counter increments and
+      // dodge the daily/weekly limit or the weekly auto-suspension. The day/week reset is
+      // recomputed from the stored fields inside the update so it's race-safe.
+      commitCancelStrike = async () => {
+        const weekMs = 7 * 24 * 60 * 60 * 1000;
+        const weeklyResetCond = {
+          $gte: [
+            { $subtract: [now, { $ifNull: ["$lastCancelReset", new Date(0)] }] },
+            weekMs,
+          ],
+        };
+        const updated = await Partner.findOneAndUpdate(
+          { _id: partner._id },
+          [
+            {
+              $set: {
+                dailyCancelCount: {
+                  $cond: [
+                    { $eq: ["$lastDailyCancelDate", todayStr] },
+                    { $add: [{ $ifNull: ["$dailyCancelCount", 0] }, 1] },
+                    1,
+                  ],
+                },
+                lastDailyCancelDate: todayStr,
+                weeklyCancelCount: {
+                  $add: [
+                    { $cond: [weeklyResetCond, 0, { $ifNull: ["$weeklyCancelCount", 0] }] },
+                    1,
+                  ],
+                },
+                lastCancelReset: {
+                  $cond: [weeklyResetCond, now, { $ifNull: ["$lastCancelReset", now] }],
+                },
+              },
+            },
+            {
+              $set: {
+                isBlocked: {
+                  $cond: [
+                    { $gte: ["$weeklyCancelCount", PARTNER_WEEKLY_CANCEL_LIMIT] },
+                    true,
+                    "$isBlocked",
+                  ],
+                },
+              },
+            },
+          ],
+          { new: true }
+        );
+
+        if (updated) {
+          // Mirror the committed values onto the in-memory doc for the response below.
+          partner.weeklyCancelCount = updated.weeklyCancelCount;
+          partner.dailyCancelCount = updated.dailyCancelCount;
+          partner.isBlocked = updated.isBlocked;
+          if (updated.weeklyCancelCount >= PARTNER_WEEKLY_CANCEL_LIMIT) {
+            console.warn(`[AUTO-SUSPEND] Partner ${partner._id} (${partner.name}) suspended after ${updated.weeklyCancelCount} weekly cancellations`);
+          }
+        }
+
+        await syncPartnerOperationalState(partner._id);
+      };
     }
 
     /* =====================
-       ROLLING 7-DAY CANCEL WINDOW (for auto-suspension)
+       ARRIVED → CANCEL OUTRIGHT + PENALTY
+       Partner arrived but walked away (customer refused or asked later).
+       No reassignment — the customer caused the situation, so the booking
+       is closed. Customer gets 0% refund; partner pays a penalty.
     ===================== */
-    // Use epoch (0) as the safe default so a null lastCancelReset always triggers a reset,
-    // rather than comparing against NaN (which is what `new Date(null)` produces in some runtimes).
-    const lastReset = partner.lastCancelReset ? new Date(partner.lastCancelReset) : new Date(0);
-    const diffDays = (now.getTime() - lastReset.getTime()) / (1000 * 60 * 60 * 24);
+    if (booking.status === "ARRIVED") {
+      const cancelledBooking = await Booking.findOneAndUpdate(
+        { _id: booking._id, status: "ARRIVED" },
+        {
+          $set: {
+            status: "CANCELLED",
+            cancelledBy: "partner",
+            cancelledAt: now,
+            cancelReason: reason,
+            refundAmount: 0,
+            refundStatus: "NONE",
+          },
+          $push: { partnerCancellations: { partner: partner._id, reason, cancelledAt: now } },
+        },
+        { new: true }
+      );
 
-    if (diffDays >= 7) {
-      partner.weeklyCancelCount = 0;
-      partner.lastCancelReset = now;
-    }
+      if (!cancelledBooking) {
+        return res.status(409).json({
+          success: false,
+          message: "Booking state changed during cancellation — please refresh",
+        });
+      }
 
-    if (partner.weeklyCancelCount >= PARTNER_WEEKLY_CANCEL_LIMIT) {
-      return res.status(400).json({
-        message: `Weekly cancel limit reached (${PARTNER_WEEKLY_CANCEL_LIMIT} per week). Account suspended.`,
+      await releaseSlotCapacityByBookingId(booking._id, { releaseReason: "partner_arrived_cancel" });
+      await syncPartnerOperationalState(partner._id);
+      clearSlotCache(booking.pincode, booking.scheduledDate);
+
+      // Notify customer — booking closed, no refund
+      if (global.io) {
+        global.io.to(`user_${cancelledBooking.user}`).emit("booking_update", {
+          bookingId: cancelledBooking._id.toString(),
+          status: "CANCELLED",
+          cancelledBy: "partner",
+          refundAmount: 0,
+        });
+      }
+
+      // Admin-configured penalty (₹). If set to 0, skip the wallet debit.
+      const penaltyInr = await getArrivedCancelPenalty();
+      // Track the actual outcome so the partner app can show truthful feedback
+      // (how much was charged now vs recorded as owed).
+      let penaltyCollected = penaltyInr;
+      let penaltyOutstanding = 0;
+      if (penaltyInr > 0) {
+        // allowShortfall: a penalty must never be silently lost. It collects what the
+        // balance allows and records any uncollected remainder as a PENDING (owed)
+        // ledger row, so the debt is durable and recoverable — not just a log line.
+        try {
+          const debitResult = await debitWallet({
+            partnerId: partner._id,
+            amount: penaltyInr,
+            reason: "penalty",
+            bookingId: booking._id,
+            description: `Penalty: cancelled after arriving at customer location — Booking ${booking._id}`,
+            allowShortfall: true,
+          });
+          penaltyCollected = debitResult.collected;
+          penaltyOutstanding = debitResult.shortfall;
+          if (debitResult.shortfall > 0) {
+            console.warn(
+              `[arrived-cancel] Partner ${partner._id} penalty ₹${penaltyInr}: ₹${debitResult.collected} collected, ₹${debitResult.shortfall} OUTSTANDING (pending debit recorded). Booking ${booking._id}.`
+            );
+            if (global.io) {
+              global.io.to("admin_ops").emit("partner_penalty_outstanding", {
+                partnerId: String(partner._id),
+                bookingId: String(booking._id),
+                penalty: penaltyInr,
+                collected: debitResult.collected,
+                outstanding: debitResult.shortfall,
+                reason: "arrived_cancel_penalty",
+                timestamp: new Date().toISOString(),
+              });
+            }
+          }
+        } catch (penaltyErr) {
+          // Hard failure (DB error, etc.) — nothing collected; alert ops so the penalty
+          // is still recoverable manually rather than lost to a console line.
+          penaltyCollected = 0;
+          penaltyOutstanding = penaltyInr;
+          console.error(
+            `[arrived-cancel] Penalty debit FAILED for partner ${partner._id}, Booking ${booking._id}: ${penaltyErr.message}`
+          );
+          if (global.io) {
+            global.io.to("admin_ops").emit("partner_penalty_failed", {
+              partnerId: String(partner._id),
+              bookingId: String(booking._id),
+              penalty: penaltyInr,
+              error: penaltyErr.message,
+              timestamp: new Date().toISOString(),
+            });
+          }
+        }
+      }
+
+      console.warn(
+        `[arrived-cancel] Partner ${partner._id} cancelled after arriving — Booking ${booking._id} closed, ₹${penaltyInr} penalty attempted.`
+      );
+
+      return res.json({
+        success: true,
+        message: penaltyInr > 0
+          ? "Booking cancelled. A penalty has been applied to your account."
+          : "Booking cancelled.",
+        weeklyCancelCount: partner.weeklyCancelCount,
+        penalty: penaltyInr,
+        penaltyCollected,
+        penaltyOutstanding,
       });
     }
 
-    partner.weeklyCancelCount += 1;
-
-    // Auto-suspend at the weekly limit — admin must manually unblock
-    if (partner.weeklyCancelCount >= PARTNER_WEEKLY_CANCEL_LIMIT) {
-      partner.isBlocked = true;
-      console.warn(`[AUTO-SUSPEND] Partner ${partner._id} (${partner.name}) suspended after ${partner.weeklyCancelCount} weekly cancellations`);
-    }
-
     /* =====================
-       FREE SLOT + LOAD
+       ALL OTHER STATUSES → REASSIGN AS BEFORE
     ===================== */
-    await partner.save();
-    await syncPartnerOperationalState(partner._id);
 
     // Atomically release the booking before kicking off reassignment.
     // Without this, if reassignBooking later throws inside its internal
@@ -1539,10 +1759,12 @@ exports.cancelBooking = async (req, res) => {
     const releasedBooking = await Booking.findOneAndUpdate(
       {
         _id: booking._id,
-        status: { $in: ["ASSIGNED", "CONFIRMED", "PARTNER_ACCEPTED", "ON_THE_WAY", "ARRIVED"] },
+        status: { $in: ["ASSIGNED", "CONFIRMED", "PARTNER_ACCEPTED", "ON_THE_WAY"] },
       },
       {
-        $set:  { status: "SEARCHING", partner: null },
+        // autoRefundIfUnassigned: this is a partner cancellation — if reassignment
+        // later exhausts, escalation should auto-cancel + refund (not park it on ops).
+        $set:  { status: "SEARCHING", partner: null, autoRefundIfUnassigned: true },
         $push: { partnerCancellations: { partner: partner._id, reason, cancelledAt: now } },
       },
       { new: true }
@@ -1554,6 +1776,10 @@ exports.cancelBooking = async (req, res) => {
         message: "Booking state changed during cancellation — please refresh",
       });
     }
+
+    // Booking actually transitioned — now (and only now) commit the cancel strike,
+    // so a lost race above never penalises the partner.
+    await commitCancelStrike();
 
     // Tell the customer immediately so their BookingStatusScreen flips back
     // to "Searching for Partner" instead of staying on the cancelled assignment.
@@ -1627,7 +1853,14 @@ function mergeCancellationTiers(tiersArrays) {
 // Resolves refund percent from tiers sorted descending by minHoursBefore.
 function calculateRefund(totalAmount, hoursToService, tiers) {
   if (hoursToService < 0) return { percent: 0, amount: 0 };
-  const activeTiers = (tiers && tiers.length > 0) ? tiers : DEFAULT_CANCELLATION_TIERS;
+  let activeTiers = (tiers && tiers.length > 0) ? tiers : DEFAULT_CANCELLATION_TIERS;
+  // Guarantee a 0-hour floor. A service-configured tier set without one would otherwise
+  // let a customer cancelling below the lowest threshold silently drop to 0% — an
+  // accidental under-refund. Fall back to the platform default floor instead of 0%.
+  if (!activeTiers.some((t) => Number(t.minHoursBefore) <= 0)) {
+    const defaultFloor = DEFAULT_CANCELLATION_TIERS[DEFAULT_CANCELLATION_TIERS.length - 1];
+    activeTiers = [...activeTiers, { minHoursBefore: 0, refundPercent: defaultFloor.refundPercent }];
+  }
   const sorted = [...activeTiers].sort((a, b) => b.minHoursBefore - a.minHoursBefore);
   for (const tier of sorted) {
     if (hoursToService >= tier.minHoursBefore) {
@@ -1664,11 +1897,18 @@ exports.cancelBookingByUser = async (req, res) => {
 
     let refund = { percent: 100, amount: 0 };
     if (booking.payment?.status === "PAID") {
-      // A reschedule is the company's fault — the partner couldn't complete the
-      // booking at the scheduled time. If the customer chooses to cancel instead
-      // of rescheduling, they get a FULL refund with no late-cancellation penalty,
-      // even though the original slot time has already passed (hoursToService < 0).
-      if (booking.status === "NEEDS_RESCHEDULING") {
+      if (booking.status === "ARRIVED") {
+        // The professional has already reached the customer's location. Cancelling
+        // now forfeits the fee REGARDLESS of the clock — a partner who arrives early
+        // would otherwise land in a positive-hours refund tier and get money back
+        // despite being at the door. The customer apps' "Cancel (No Refund)" prompt
+        // promises exactly this, so enforce it by status, not by hoursToService.
+        refund = { percent: 0, amount: 0 };
+      } else if (booking.status === "NEEDS_RESCHEDULING") {
+        // A reschedule is the company's fault — the partner couldn't complete the
+        // booking at the scheduled time. If the customer chooses to cancel instead
+        // of rescheduling, they get a FULL refund with no late-cancellation penalty,
+        // even though the original slot time has already passed (hoursToService < 0).
         refund = { percent: 100, amount: Number(booking.totalAmount || 0) };
       } else {
         refund = calculateRefund(
@@ -1978,6 +2218,17 @@ exports.getBookingById = async (req, res) => {
       return res.status(404).json({ success: false, message: "Booking not found" });
     }
 
+    // Surface the latest unresolved "customer-fault" on-site report while the
+    // partner is still at the door (ARRIVED), so the app can show a clear
+    // "cancel — no refund" prompt even after a reload. Null otherwise.
+    booking.partnerReportedIssue = null;
+    if (booking.status === "ARRIVED" && Array.isArray(booking.partnerReports)) {
+      const latest = booking.partnerReports
+        .filter((r) => CUSTOMER_FAULT_ISSUE_TYPES.includes(r.issueType))
+        .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0];
+      if (latest) booking.partnerReportedIssue = latest.issueType;
+    }
+
     return res.json({ success: true, booking });
   } catch (err) {
     console.error("getBookingById error:", err);
@@ -2016,17 +2267,34 @@ exports.rescheduleBooking = async (req, res) => {
       return res.status(400).json({ success: false, message: "Please select a future time slot" });
     }
 
-    // Save old slot for reference, update to new slot, move back to SEARCHING
-    booking.rescheduledFromDate = booking.scheduledDate ? new Date(booking.scheduledDate).toISOString().slice(0, 10) : null;
-    booking.rescheduledFromTime = booking.scheduledTime || null;
-    booking.scheduledDate = new Date(scheduledDate);
-    booking.scheduledTime = scheduledTime;
-    booking.scheduledStartAt = newStart;
-    booking.scheduledEndAt = new Date(newStart.getTime() + (booking.estimatedDurationMinutes || 60) * 60 * 1000);
-    booking.status = "SEARCHING";
-    booking.partner = null;
-    booking.ackReceivedAt = null;
-    await booking.save();
+    // Atomic, guarded transition: apply the new slot only if the booking is STILL
+    // NEEDS_RESCHEDULING. This optimistic lock stops a concurrent reassign (full-doc save)
+    // from clobbering the reschedule, and vice-versa. Old-slot values come from the read
+    // above; the status guard guarantees nothing changed underneath us.
+    const rescheduled = await Booking.findOneAndUpdate(
+      { _id: bookingId, user: req.user._id, status: "NEEDS_RESCHEDULING" },
+      {
+        $set: {
+          rescheduledFromDate: booking.scheduledDate ? new Date(booking.scheduledDate).toISOString().slice(0, 10) : null,
+          rescheduledFromTime: booking.scheduledTime || null,
+          scheduledDate: new Date(scheduledDate),
+          scheduledTime: scheduledTime,
+          scheduledStartAt: newStart,
+          scheduledEndAt: new Date(newStart.getTime() + (booking.estimatedDurationMinutes || 60) * 60 * 1000),
+          status: "SEARCHING",
+          partner: null,
+          ackReceivedAt: null,
+          // The customer chose to wait for a new slot — if it can't be filled, escalate to
+          // ops, do NOT auto-cancel them out (clears any flag left by an earlier partner cancel).
+          autoRefundIfUnassigned: false,
+        },
+      },
+      { new: true }
+    );
+
+    if (!rescheduled) {
+      return res.status(409).json({ success: false, message: "Booking state changed — please refresh and try again." });
+    }
 
     // Clear slot cache for both old and new pincode/date
     const { clearSlotCache } = require("../services/scheduling_service");

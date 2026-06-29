@@ -53,6 +53,16 @@ const adminSettingSchema = new mongoose.Schema(
     },
 
     /* =============================================
+       CANCELLATION
+       Flat ₹ penalty charged to a partner who cancels
+       AFTER arriving at the customer's location (the
+       trip was wasted by the partner walking away).
+    ============================================= */
+    cancellation: {
+      arrivedCancelPenaltyInr: { type: Number, default: 100 },
+    },
+
+    /* =============================================
        EMERGENCY SAFETY CONTROLS
        All default false — must be explicitly enabled.
     ============================================= */

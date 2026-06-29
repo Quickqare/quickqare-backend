@@ -36,6 +36,19 @@ const withdrawalSchema = new mongoose.Schema(
     },
 
     /* =====================
+       BALANCE HELD
+       true  → the amount was atomically reserved out of the partner's
+               withdrawable balance when the request was created. Approve must
+               NOT debit again; reject must refund the held amount.
+       false → legacy request created before the hold model; approve debits at
+               approval time, reject is a no-op on the balance.
+    ===================== */
+    balanceHeld: {
+      type: Boolean,
+      default: false,
+    },
+
+    /* =====================
        BANK DETAILS SNAPSHOT
        (freeze at request time)
     ===================== */

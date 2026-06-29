@@ -573,6 +573,7 @@ exports.getPartnerAppSettings = async (_req, res) => {
       partnerVerificationRequired: Boolean(settings?.partnerVerificationRequired),
       partnerSelfieRequired: Boolean(settings?.partnerSelfieRequired),
       jobSelfieVerificationEnabled: Boolean(settings?.jobSelfieVerificationEnabled),
+      arrivedCancelPenaltyInr: Number(settings?.cancellation?.arrivedCancelPenaltyInr ?? 100),
     });
   } catch (err) {
     console.error("getPartnerAppSettings error:", err);

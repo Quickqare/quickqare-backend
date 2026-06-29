@@ -76,7 +76,7 @@ async function cancelStaleBookings() {
           updatedAt: { $lt: cutoff },
         },
       ],
-    }).select("_id status");
+    }).select("_id status payment totalAmount");
 
     if (!stale.length) return;
 
@@ -88,13 +88,54 @@ async function cancelStaleBookings() {
       });
     }
 
-    const result = await Booking.updateMany(
-      { _id: { $in: ids } },
-      { $set: { status: "CANCELLED", cancelledBy: "system" } }
-    );
+    // Statuses we'll cancel from — guard the writes so a concurrently-transitioned
+    // booking (e.g. a partner just got assigned) isn't clobbered.
+    const fromStatuses = ["PENDING_PAYMENT", ...STALE_PENDING_STATUSES];
+
+    // A PAID booking the platform failed to fulfil gets a full refund (PENDING); unpaid /
+    // payment-expired ones are simply cancelled with no refund. Previously ALL stale
+    // bookings were cancelled with no refund — a paid customer could lose their money.
+    const paidIds = stale.filter((b) => b.payment?.status === "PAID").map((b) => b._id);
+    const unpaidIds = stale.filter((b) => b.payment?.status !== "PAID").map((b) => b._id);
+
+    let modified = 0;
+    if (paidIds.length) {
+      const r = await Booking.updateMany(
+        { _id: { $in: paidIds }, status: { $in: fromStatuses } },
+        [
+          {
+            $set: {
+              status: "CANCELLED",
+              cancelledBy: "system",
+              cancelReason: "Auto-cancelled: no professional available (stale booking)",
+              cancelledAt: now,
+              refundAmount: { $ifNull: ["$totalAmount", 0] },
+              refundStatus: {
+                $cond: [{ $gt: [{ $ifNull: ["$totalAmount", 0] }, 0] }, "PENDING", "NONE"],
+              },
+            },
+          },
+        ]
+      );
+      modified += r.modifiedCount || 0;
+    }
+    if (unpaidIds.length) {
+      const r = await Booking.updateMany(
+        { _id: { $in: unpaidIds }, status: { $in: fromStatuses } },
+        {
+          $set: {
+            status: "CANCELLED",
+            cancelledBy: "system",
+            cancelReason: "Auto-cancelled: stale booking",
+            cancelledAt: now,
+          },
+        }
+      );
+      modified += r.modifiedCount || 0;
+    }
 
     console.log(
-      `[cron] Auto-cancelled ${result.modifiedCount} stale bookings (>${STALE_HOURS}h)`
+      `[cron] Auto-cancelled ${modified} stale bookings (>${STALE_HOURS}h); ${paidIds.length} paid → full refund queued`
     );
   } catch (err) {
     console.error("[cron] cancelStaleBookings error:", err.message);
