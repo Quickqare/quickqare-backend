@@ -26,7 +26,10 @@ if (useLocal) {
     cloudinary,
     params: {
       folder: "quickqare",
-      allowed_formats: ["jpg", "png", "jpeg"],
+      // Must stay in sync with ALLOWED_MIME_TYPES below — otherwise a file the
+      // mimetype filter accepts (e.g. webp) gets rejected by Cloudinary as a
+      // confusing 500 at upload time.
+      allowed_formats: ["jpg", "png", "jpeg", "webp"],
     },
   });
 }
@@ -37,7 +40,9 @@ const fileFilter = (_req, file, cb) => {
   if (ALLOWED_MIME_TYPES.includes(file.mimetype)) {
     cb(null, true);
   } else {
-    cb(new Error("Only JPG, PNG, and WebP images are allowed"), false);
+    const err = new Error("Only JPG, PNG, and WebP images are allowed");
+    err.statusCode = 400; // so the global handler returns 400, not 500
+    cb(err, false);
   }
 };
 

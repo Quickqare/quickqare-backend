@@ -49,6 +49,16 @@ module.exports = (err, req, res, next) => {
   }
 
   /* =====================
+     MULTER (FILE UPLOAD) ERRORS
+     File-size / unexpected-field failures are client errors (4xx),
+     not 500s. Return a clear, parseable message instead of a bare 500.
+  ===================== */
+  if (err.name === "MulterError") {
+    statusCode = err.code === "LIMIT_FILE_SIZE" ? 413 : 400;
+    message = err.code === "LIMIT_FILE_SIZE" ? "File too large (max 5MB)" : err.message;
+  }
+
+  /* =====================
      FINAL RESPONSE
   ===================== */
   res.status(statusCode).json({
