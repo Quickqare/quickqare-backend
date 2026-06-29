@@ -18,6 +18,7 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1075.0",
     "bcrypt": "^6.0.0",
     "cloudinary": "^1.41.3",
     "cors": "^2.8.5",
@@ -31,6 +32,7 @@
     "jsonwebtoken": "^9.0.3",
     "mongoose": "^8.0.0",
     "multer": "^2.0.2",
+    "multer-s3": "^3.0.1",
     "multer-storage-cloudinary": "^4.0.0",
     "razorpay": "^2.9.6",
     "resend": "^4.8.0",

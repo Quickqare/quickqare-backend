@@ -47,6 +47,18 @@ const partnerSchema = new mongoose.Schema(
       trim: true,
     },
 
+    selfieVerificationStatus: {
+      type: String,
+      enum: ["PENDING", "APPROVED", "REJECTED"],
+      default: "PENDING",
+      index: true,
+    },
+
+    selfieRejectionReason: {
+      type: String,
+      default: "",
+    },
+
     password: {
       type: String,
       required: true,

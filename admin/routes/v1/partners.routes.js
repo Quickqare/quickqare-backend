@@ -196,7 +196,7 @@ router.get("/:id/stats", async (req, res) => {
     }
 
     const partner = await Partner.findById(partnerId)
-      .select("name phone email rating activeJobs maxJobsLimit currentPincode serviceAreas serviceCategories skillTier isOnline approvalStatus isBlocked plan commissionPercent subscriptionActive createdAt location assignedHubId mehendiSpecializations")
+      .select("name phone email rating activeJobs maxJobsLimit currentPincode serviceAreas serviceCategories skillTier isOnline approvalStatus isBlocked plan commissionPercent subscriptionActive createdAt location assignedHubId mehendiSpecializations selfieUrl selfieVerificationStatus selfieRejectionReason")
       .populate("assignedHubId", "name city state")
       .lean();
     if (!partner) {
@@ -295,6 +295,51 @@ router.get("/:id", async (req, res) => {
     return fail(res, 500, "PARTNER_FETCH_FAILED", "Unable to fetch partner", error.message, {
       requestId: req.requestId,
     });
+  }
+});
+
+router.patch("/:id/selfie-verification", audit("admin.partners.selfie_verification"), async (req, res) => {
+  try {
+    const partnerId = asSingleString(req.params.id);
+    const status = String(req.body.status || "").toUpperCase();
+    const reason = String(req.body.reason || "").trim();
+
+    if (!partnerId || !mongoose.Types.ObjectId.isValid(partnerId)) {
+      return fail(res, 400, "INVALID_ID", "Invalid partner id", null, { requestId: req.requestId });
+    }
+    if (!["APPROVED", "REJECTED"].includes(status)) {
+      return fail(res, 400, "VALIDATION_ERROR", "status must be APPROVED or REJECTED", null, { requestId: req.requestId });
+    }
+    if (status === "REJECTED" && !reason) {
+      return fail(res, 400, "VALIDATION_ERROR", "reason is required when rejecting a selfie", null, { requestId: req.requestId });
+    }
+
+    const updated = await Partner.findByIdAndUpdate(
+      partnerId,
+      {
+        $set: {
+          selfieVerificationStatus: status,
+          selfieRejectionReason: status === "REJECTED" ? reason : "",
+        },
+      },
+      { new: true }
+    ).select("name selfieUrl selfieVerificationStatus selfieRejectionReason").lean();
+
+    if (!updated) {
+      return fail(res, 404, "NOT_FOUND", "Partner not found", null, { requestId: req.requestId });
+    }
+
+    // Notify partner via socket if connected
+    if (global.io) {
+      global.io.to(`partner_${partnerId}`).emit("selfie_verification_update", {
+        selfieVerificationStatus: status,
+        selfieRejectionReason: status === "REJECTED" ? reason : "",
+      });
+    }
+
+    return success(res, updated, { requestId: req.requestId });
+  } catch (error) {
+    return fail(res, 500, "SELFIE_VERIFICATION_FAILED", "Unable to update selfie verification", error.message, { requestId: req.requestId });
   }
 });
 

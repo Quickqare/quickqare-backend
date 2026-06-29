@@ -5,6 +5,7 @@ const partnerAuth = require("../middlewares/partnerAuth");
 const partnerController = require("../controllers/partner.controller");
 const walletController = require("../controllers/partnerWallet.controller");
 const upload = require("../config/multer");
+const r2Upload = require("../config/multerR2");
 
 /* =====================================================
    PARTNER JOB LIFECYCLE ROUTES (PRODUCTION READY)
@@ -71,7 +72,7 @@ router.get(
 router.post(
   "/me/selfie",
   partnerAuth,
-  upload.single("selfie"),
+  r2Upload.single("selfie"),
   partnerController.uploadMySelfie
 );
 

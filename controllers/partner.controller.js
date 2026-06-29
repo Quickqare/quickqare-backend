@@ -542,21 +542,32 @@ exports.uploadMySelfie = async (req, res) => {
       return res.status(400).json({ success: false, message: "Selfie image is required" });
     }
 
-    // Cloudinary storage puts the hosted URL in file.path; local storage needs
-    // the public /uploads URL built (same pattern as uploadController.js).
-    const filePath = String(req.file.path || "");
-    const isRemote = filePath.startsWith("http://") || filePath.startsWith("https://");
-    const configuredBaseUrl = String(process.env.PUBLIC_BASE_URL || "").trim().replace(/\/+$/, "");
-    const selfieUrl = isRemote
-      ? filePath
-      : configuredBaseUrl
-        ? `${configuredBaseUrl}/uploads/${req.file.filename}`
-        : `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`;
+    // multer-s3 (R2) puts the public URL in file.location.
+    // Cloudinary puts it in file.path.
+    // Local disk needs the URL built from PUBLIC_BASE_URL.
+    let selfieUrl;
+    if (req.file.location) {
+      // R2 via multer-s3 — swap the internal storage endpoint for the public R2 URL
+      const key = req.file.key || req.file.Key || "";
+      const publicBase = String(process.env.R2_PUBLIC_URL || "").trim().replace(/\/+$/, "");
+      selfieUrl = publicBase ? `${publicBase}/${key}` : req.file.location;
+    } else {
+      const filePath = String(req.file.path || "");
+      const isRemote = filePath.startsWith("http://") || filePath.startsWith("https://");
+      const configuredBaseUrl = String(process.env.PUBLIC_BASE_URL || "").trim().replace(/\/+$/, "");
+      selfieUrl = isRemote
+        ? filePath
+        : configuredBaseUrl
+          ? `${configuredBaseUrl}/uploads/${req.file.filename}`
+          : `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`;
+    }
 
     req.partner.selfieUrl = selfieUrl;
+    req.partner.selfieVerificationStatus = "PENDING";
+    req.partner.selfieRejectionReason = "";
     await req.partner.save();
 
-    return res.json({ success: true, selfieUrl });
+    return res.json({ success: true, selfieUrl, selfieVerificationStatus: "PENDING" });
   } catch (err) {
     console.error("uploadMySelfie error:", err);
     return res.status(500).json({ success: false, message: "Failed to upload selfie" });

@@ -2203,7 +2203,7 @@ exports.getBookingById = async (req, res) => {
     // When job selfie verification is on, include the partner's onboarding
     // photo so the customer can match the face at the door.
     const partnerFields = (await getJobSelfieFlag())
-      ? "name phone rating selfieUrl"
+      ? "name phone rating selfieUrl selfieVerificationStatus"
       : "name phone rating";
 
     const booking = await Booking.findOne({
