@@ -319,6 +319,7 @@ router.post("/", audit("admin.services.create"), async (req, res) => {
       subCategory: subCategory?._id,
       legacyCategory: String(category.name || "").toLowerCase(),
       imageUrl: String(req.body.imageUrl || ""),
+      webImageUrl: String(req.body.webImageUrl || ""),
       price,
       commissionPercent,
       ...(Number.isFinite(duration) && duration > 0 ? { duration } : {}),
@@ -415,6 +416,7 @@ router.patch("/:id", audit("admin.services.update"), async (req, res) => {
     if (typeof req.body.name === "string") patch.name = req.body.name.trim();
     if (typeof req.body.description === "string") patch.description = req.body.description;
     if (typeof req.body.imageUrl === "string") patch.imageUrl = req.body.imageUrl;
+    if (typeof req.body.webImageUrl === "string") patch.webImageUrl = req.body.webImageUrl;
     if (req.body.basePriceInr !== undefined) patch.price = Number(req.body.basePriceInr);
     if (req.body.commissionPercent !== undefined) patch.commissionPercent = Number(req.body.commissionPercent);
 
