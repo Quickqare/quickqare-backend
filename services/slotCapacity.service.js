@@ -1,3 +1,4 @@
+const mongoose = require("mongoose");
 const Booking = require("../models/Booking");
 const SlotCapacity = require("../models/SlotCapacity");
 const SlotLock = require("../models/SlotLock");
@@ -34,30 +35,51 @@ slot engine's hub gate). Unzoned pincodes — which cannot take bookings anyway 
 fall back to per-pincode scope, preserving the previous behaviour.
 =====================================================
 */
-async function resolveCapacityScope(pincode, { hubMode = false, h3Cell = null } = {}) {
+async function resolveCapacityScope(
+  pincode,
+  { hubMode = false, h3Cell = null, categoryIds = null } = {}
+) {
   const raw = String(pincode || "").trim();
 
   if (hubMode && h3Cell) {
     const hubCells = getH3Ring(h3Cell, 1);
-    const homeHub = await resolveHubForH3Cell(h3Cell);
-    const hubId = homeHub
-      ? String(homeHub._id)
-      : String((await resolveHubsForCells(hubCells))[0] || "");
+    const catIds = Array.isArray(categoryIds) && categoryIds.length ? categoryIds : null;
+
+    // The scope key must be the hub serving THIS booking's category. Hubs of
+    // different categories may overlap the same cells, so a category-blind
+    // findOne can key two bookings of the same AC hub to two different scope
+    // keys — each then reserves the full shared pool independently (the exact
+    // oversubscription hub-keying exists to prevent).
+    let homeHub = null;
+    for (const catId of catIds || [null]) {
+      homeHub = await resolveHubForH3Cell(h3Cell, { categoryId: catId });
+      if (homeHub) break;
+    }
+
+    // Partner pool for the eligibility count: partner-enabled hubs of the same
+    // categories within ring-1 — the same set the per-slot search uses.
+    const hubIds = await resolveHubsForCells(hubCells, {
+      categoryIds: catIds,
+      requirePartnerApp: true,
+    });
+
+    const hubId = homeHub ? String(homeHub._id) : String(hubIds[0] || "");
     if (hubId) {
-      return { scopeKey: `hub:${hubId}`, coveragePincodes: raw ? [raw] : [], hubCells };
+      return { scopeKey: `hub:${hubId}`, coveragePincodes: raw ? [raw] : [], hubCells, hubIds };
     }
     // No hub covers this cell — fall through to the zone/pincode scope.
   }
 
   const zone = await resolveZoneForPincode(raw);
   if (!zone) {
-    return { scopeKey: raw, coveragePincodes: raw ? [raw] : [], hubCells: null };
+    return { scopeKey: raw, coveragePincodes: raw ? [raw] : [], hubCells: null, hubIds: null };
   }
   const coveragePincodes = getZoneCoveragePincodes(zone);
   return {
     scopeKey: `zone:${String(zone._id)}`,
     coveragePincodes: coveragePincodes.length ? coveragePincodes : raw ? [raw] : [],
     hubCells: null,
+    hubIds: null,
   };
 }
 
@@ -88,8 +110,65 @@ function buildSlotWindows(startAt, endAt) {
   return windows;
 }
 
-function buildSlotKey(pincode, dateKey, time) {
-  return `${String(pincode || "").trim()}:${dateKey}:${time}`;
+function buildSlotKey(pincode, dateKey, time, categoryKey = "") {
+  const cat = String(categoryKey || "").trim() || "general";
+  return `${String(pincode || "").trim()}:${cat}:${dateKey}:${time}`;
+}
+
+/*
+=====================================================
+CATEGORY KEY
+Capacity must be counted PER SERVICE-CATEGORY POOL, not just per territory.
+The old key (scope:date:time) made every category in a zone share one counter
+while totalUnits was overwritten with the *current* request's category-specific
+eligible count — e.g. 3 mehendi reservations at 14:00 could zero out AC
+availability for the whole zone (totalUnits=2 AC techs − 3 reserved = 0).
+
+The key is derived from the DB Service records (never client input) so the
+slot-listing path and the createBooking reservation path always agree.
+=====================================================
+*/
+function normalizeCategorySlug(value = "") {
+  return String(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+async function resolveCategoryKeyForBooking(booking) {
+  const ids = [
+    ...(Array.isArray(booking?.services)
+      ? booking.services.map((s) => s?.serviceId)
+      : []),
+    booking?.serviceId,
+  ]
+    .map((v) => String(v || "").trim())
+    .filter((v) => mongoose.Types.ObjectId.isValid(v));
+
+  const slugs = new Set();
+  if (ids.length) {
+    const Service = require("../models/service.model");
+    const rows = await Service.find({ _id: { $in: [...new Set(ids)] } })
+      .select("category legacyCategory")
+      .populate("category", "slug name")
+      .lean();
+    for (const row of rows) {
+      const slug = normalizeCategorySlug(
+        row?.category?.slug || row?.category?.name || row?.legacyCategory || ""
+      );
+      if (slug) slugs.add(slug);
+    }
+  }
+
+  // No resolvable service ids (very old legacy payloads) — fall back to the
+  // request's category string, then to the shared "general" pool.
+  if (!slugs.size) {
+    const fallback = normalizeCategorySlug(booking?.serviceCategory);
+    if (fallback) slugs.add(fallback);
+  }
+  if (!slugs.size) return "general";
+
+  return [...slugs].sort().join("+");
 }
 
 function buildBookingWindow(booking) {
@@ -129,7 +208,14 @@ async function getEligibleUnitsForWindow(booking, slotStart, slotEnd, scope, ses
     // partners who actually serve THIS area — not every partner in the system.
     // rejectedPartners is read from the booking object above, not from here.
     hubMode ? scope.hubCells : scope?.coveragePincodes || [],
-    { requireOnline: false, useH3: hubMode, session }
+    // Hub path reuses the category-scoped, partner-enabled hub set already
+    // resolved by resolveCapacityScope (precomputedHubIds).
+    {
+      requireOnline: false,
+      useH3: hubMode,
+      precomputedHubIds: hubMode ? scope.hubIds : null,
+      session,
+    }
   );
 
   return candidates.length;
@@ -141,15 +227,28 @@ async function getSlotAvailabilitySnapshot(booking, slotStart, slotEnd, session)
   // h3Cell — mirrors the assignment engine. Bookings without a cell (legacy,
   // or created before the flag flipped) keep the pincode/zone scope.
   const hubMode = (await getUseH3Flag()) && Boolean(booking.h3Cell);
-  const scope = await resolveCapacityScope(booking.pincode, { hubMode, h3Cell: booking.h3Cell || null });
+  // Hub scope is per-category (hubs of different services overlap) — resolve
+  // the booking's categories so the scope key lands on the right hub.
+  let scopeCategoryIds = null;
+  if (hubMode) {
+    const { resolveBookingCategories } = require("./zone.service");
+    scopeCategoryIds = (await resolveBookingCategories(booking)).map((c) => c.id);
+  }
+  const scope = await resolveCapacityScope(booking.pincode, {
+    hubMode,
+    h3Cell: booking.h3Cell || null,
+    categoryIds: scopeCategoryIds,
+  });
   const { scopeKey } = scope;
   const eligibleUnits = await getEligibleUnitsForWindow(booking, slotStart, slotEnd, scope, session);
   const dateKey = normalizeDateKey(slotStart);
   const time = getTimeLabel(slotStart);
   // Key capacity by zone (hub in H3 mode), not raw pincode, so every pincode
   // the territory covers shares ONE counter — otherwise each pincode reserves
-  // the full shared pool independently and the slot is oversold.
-  const slotKey = buildSlotKey(scopeKey, dateKey, time);
+  // the full shared pool independently and the slot is oversold. The category
+  // key keeps disjoint partner pools (AC vs mehendi) on separate counters.
+  const categoryKey = await resolveCategoryKeyForBooking(booking);
+  const slotKey = buildSlotKey(scopeKey, dateKey, time, categoryKey);
 
   const capacity = await SlotCapacity.findOneAndUpdate(
     { slotKey },
@@ -287,13 +386,16 @@ async function releaseSlotCapacityByBookingId(bookingId, { session, releaseReaso
     .select("pincode scheduledDate")
     .lean();
 
-  let lockQuery = SlotLock.findOne({ bookingId });
+  // Exclude RELEASED locks in the query itself: a rescheduled booking can have
+  // an old RELEASED lock plus a live one, and findOne with no filter could
+  // grab the released row and wrongly no-op, stranding the live reservation.
+  let lockQuery = SlotLock.findOne({ bookingId, status: { $ne: "RELEASED" } });
   if (session) {
     lockQuery = lockQuery.session(session);
   }
   const lock = await lockQuery;
-  if (!lock || lock.status === "RELEASED") {
-    return { released: false, lock: lock || null };
+  if (!lock) {
+    return { released: false, lock: null };
   }
 
   const units = Math.max(Number(lock.units || 1), 1);
@@ -387,5 +489,6 @@ module.exports = {
   getSlotAvailabilitySnapshot,
   releaseSlotCapacityByBookingId,
   reserveSlotCapacityForBooking,
+  resolveCapacityScope,
   markSlotLockPaid,
 };

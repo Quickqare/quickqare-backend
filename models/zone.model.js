@@ -74,6 +74,7 @@ const zoneSchema = new mongoose.Schema(
       plumbing:    { type: Boolean, default: true },
       mehendi:     { type: Boolean, default: true },
       electrician: { type: Boolean, default: true },
+      celebration: { type: Boolean, default: true },
     },
 
     /* =====================

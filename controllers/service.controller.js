@@ -1,6 +1,8 @@
 const Service = require("../models/service.model");
 const Category = require("../models/Category");
 const SubCategory = require("../models/SubCategory");
+const { isCakeCategoryText } = require("../utils/categoryDetection");
+const { getAvailableCakeServiceIds } = require("../services/cakeAvailability.service");
 
 /* =====================================================
    CREATE SERVICE (ADMIN - PRODUCTION)
@@ -61,7 +63,7 @@ exports.createService = async (req, res) => {
 ===================================================== */
 exports.getServices = async (req, res) => {
   try {
-    const { category, subCategory, includeInactive } = req.query;
+    const { category, subCategory, includeInactive, pincode, lat, lng } = req.query;
 
     const query = {};
     const shouldIncludeInactive =
@@ -92,10 +94,40 @@ exports.getServices = async (req, res) => {
       .populate("subCategory")
       .sort({ createdAt: -1 });
 
+    // Annotate cake/Celebration services with whether a baker actually
+    // covering the customer's area has declared they can bake it. Only
+    // runs when a location was supplied and the result set includes cake
+    // services — every other service is returned untouched.
+    const cakeServices = services.filter((s) =>
+      isCakeCategoryText(s.category?.slug || s.category?.name || s.legacyCategory || "")
+    );
+
+    let availableSet = null;
+    if (cakeServices.length && (pincode || (lat && lng))) {
+      const availableIds = await getAvailableCakeServiceIds({
+        pincode,
+        lat,
+        lng,
+        cakeServiceIds: cakeServices.map((s) => s._id),
+        categoryId: cakeServices[0]?.category?._id,
+      });
+      availableSet = new Set(availableIds.map(String));
+    }
+
+    const responseServices = availableSet
+      ? services.map((s) => {
+          const plain = s.toObject();
+          if (isCakeCategoryText(s.category?.slug || s.category?.name || s.legacyCategory || "")) {
+            plain.availableNearby = availableSet.has(String(s._id));
+          }
+          return plain;
+        })
+      : services;
+
     res.json({
       success: true,
-      count: services.length,
-      services,
+      count: responseServices.length,
+      services: responseServices,
     });
   } catch (err) {
     console.error("Get services error:", err);

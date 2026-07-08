@@ -298,6 +298,14 @@ const partnerSchema = new mongoose.Schema(
       },
     ],
 
+    // Whole calendar days the partner has blocked off (e.g. a baker taking a
+    // day off). Distinct from busySlots (per-slot, tied to actual bookings) —
+    // these are self-declared and checked against scheduledDate, not time.
+    unavailableDates: {
+      type: [Date],
+      default: [],
+    },
+
     /* =====================
        LOCATION (GEO MATCHING)
     ===================== */

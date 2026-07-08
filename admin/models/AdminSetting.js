@@ -72,6 +72,14 @@ const adminSettingSchema = new mongoose.Schema(
     emergencyLockdown: { type: Boolean, default: false },
 
     /* =============================================
+       WEB DEFAULT PROMO BANNER
+       When true (default), the web home page shows a
+       built-in promo banner whenever no custom banner
+       is active. Admin can switch it off.
+    ============================================= */
+    defaultBannerEnabled: { type: Boolean, default: true },
+
+    /* =============================================
        HOME SCREEN THEME  (festival / campaign UI)
        All color values are CSS hex strings.
        isActive = false  →  app uses its default
@@ -99,7 +107,22 @@ const adminSettingSchema = new mongoose.Schema(
         mehendiShimmer:     { type: Boolean, default: true },
         electrician:        { type: String,  default: "" },
         electricianShimmer: { type: Boolean, default: true },
+        celebration:        { type: String,  default: "" },
+        celebrationShimmer: { type: Boolean, default: true },
       },
+    },
+
+    /* =============================================
+       SOCIAL MEDIA LINKS
+       Shown as icons in the web/app footer. Empty
+       string = not shown for that platform.
+    ============================================= */
+    socialLinks: {
+      whatsapp:  { type: String, default: "" },
+      instagram: { type: String, default: "" },
+      facebook:  { type: String, default: "" },
+      twitter:   { type: String, default: "" }, // X (formerly Twitter)
+      youtube:   { type: String, default: "" },
     },
   },
   { timestamps: true }

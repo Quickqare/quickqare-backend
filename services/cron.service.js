@@ -36,6 +36,12 @@ const REMINDER_INTERVAL_MS = 5 * 60 * 1000; // every 5 minutes
 const REMINDER_LEAD_MINUTES = 30; // pre-job reminder fires ~30 min before service
 const HELPER_NUDGE_AFTER_HOURS = 6; // nudge a still-pending helper invite after 6h
 
+// Cake order reminder — reminds the assigned baker ~24h before delivery so a
+// multi-day-ahead order doesn't get forgotten. Checked hourly; the window is
+// wide enough (24-25h) that an hourly cadence can't skip a booking entirely.
+const CAKE_REMINDER_INTERVAL_MS = 60 * 60 * 1000; // every hour
+const CAKE_REMINDER_LEAD_HOURS = 24;
+
 // Statuses that indicate a booking is stuck and should be auto-cancelled
 const STALE_PENDING_STATUSES = [
   "PENDING_ASSIGNMENT",
@@ -164,14 +170,21 @@ async function dispatchQueuedBookings() {
     // Find QUEUED bookings whose scheduled start is within the dispatch window.
     // We use scheduledStartAt when available, falling back to scheduledDate+scheduledTime.
     const queued = await Booking.find({ status: "QUEUED" })
-      .select("_id scheduledDate scheduledTime scheduledStartAt user pincode")
+      .select("_id scheduledDate scheduledTime scheduledStartAt user pincode services.options.flavour")
       .lean();
 
     const toDispatch = queued.filter((b) => {
       const start = b.scheduledStartAt
         ? new Date(b.scheduledStartAt)
         : buildDateTime(b.scheduledDate, b.scheduledTime);
-      return start <= dispatchWindow && start > now;
+      if (!(start > now)) return false;
+      // Customized (cake) orders never wait for the T-3h window — the baker
+      // needs the full lead time to bake. Normally they're assigned at payment
+      // (paymentFinalize skips QUEUED for them), so any QUEUED one here is a
+      // straggler (admin requeue, queueOnFailure retry, legacy row): dispatch
+      // it on this pass regardless of how far ahead it's scheduled.
+      const isCake = (b.services || []).some((s) => s?.options?.flavour);
+      return isCake || start <= dispatchWindow;
     });
 
     if (!toDispatch.length) return;
@@ -333,6 +346,153 @@ async function sendJobReminders() {
     }
   } catch (err) {
     console.error("[cron] sendJobReminders error:", err.message);
+  }
+}
+
+/*
+=====================================================
+SEND CAKE ORDER REMINDERS (DAY-BEFORE)
+Cake orders are booked at least a day ahead, so it's
+easy for a baker to forget one. Pushes a reminder to
+the assigned baker once the delivery is within
+CAKE_REMINDER_LEAD_HOURS, mirroring sendJobReminders'
+"catch it whenever it enters the lead window" approach
+but with a much wider (24h) window checked hourly —
+still ~24x oversampling, same safety margin.
+=====================================================
+*/
+async function sendCakeOrderReminders() {
+  try {
+    const Booking = require("../models/Booking");
+    const Partner = require("../models/Partner");
+    const { buildDateTime } = require("./scheduling_service");
+    const { sendPushNotification } = require("./pushNotification.service");
+
+    const now = new Date();
+    const windowEnd = new Date(now.getTime() + CAKE_REMINDER_LEAD_HOURS * 60 * 60 * 1000);
+
+    const candidates = await Booking.find({
+      status: { $in: ["ASSIGNED", "CONFIRMED", "PARTNER_ACCEPTED"] },
+      cakeReminderSentAt: null,
+      partner: { $ne: null },
+      "services.options.flavour": { $exists: true, $ne: null },
+    })
+      .select("_id scheduledDate scheduledTime scheduledStartAt partner services")
+      .lean();
+
+    let sentCount = 0;
+
+    for (const booking of candidates) {
+      const start = booking.scheduledStartAt
+        ? new Date(booking.scheduledStartAt)
+        : buildDateTime(booking.scheduledDate, booking.scheduledTime);
+
+      if (!(start instanceof Date) || Number.isNaN(start.getTime())) continue;
+      if (!(start > now && start <= windowEnd)) continue;
+
+      // Atomic claim so the reminder is sent exactly once even with multiple
+      // server instances running this cron.
+      const claimed = await Booking.findOneAndUpdate(
+        { _id: booking._id, cakeReminderSentAt: null },
+        { $set: { cakeReminderSentAt: now } }
+      );
+      if (!claimed) continue;
+
+      const cakeLine = (booking.services || []).find((s) => s?.options?.flavour);
+      const flavour = cakeLine?.options?.flavour || "";
+      const nameOnCake = cakeLine?.options?.nameOnCake || "";
+      const dateLabel = new Date(booking.scheduledDate).toLocaleDateString("en-IN", {
+        day: "numeric",
+        month: "short",
+      });
+
+      const body = nameOnCake
+        ? `Cake order due ${dateLabel}: ${flavour}, "${nameOnCake}". Get baking!`
+        : `Cake order due ${dateLabel}: ${flavour}. Get baking!`;
+
+      const partner = await Partner.findById(booking.partner).select("fcmToken").lean();
+      if (partner?.fcmToken) {
+        sendPushNotification(
+          partner.fcmToken,
+          "Cake order due tomorrow",
+          body,
+          { type: "CAKE_ORDER_REMINDER", bookingId: String(booking._id) }
+        );
+        sentCount += 1;
+      }
+    }
+
+    if (sentCount > 0) {
+      console.log(`[cron] Sent cake order reminders for ${sentCount} booking(s)`);
+    }
+  } catch (err) {
+    console.error("[cron] sendCakeOrderReminders error:", err.message);
+  }
+}
+
+/*
+=====================================================
+ENFORCE ADVANCE-ASSIGNMENT ACK DEADLINES
+Advance assignments (start >3h away — cake orders
+assigned at payment, evening payments for a morning
+slot) don't run the 2-minute socket ACK timer: the
+partner may legitimately be offline when the job
+lands. This cron enforces the wider deadline instead —
+reassign if still unacknowledged 12h after assignment,
+or once the start is within the T-3h dispatch window.
+Restart-safe by construction: state lives entirely in
+the booking row (assignedAt / ackReceivedAt), no
+timers. handleAckTimeout re-checks everything
+atomically-enough (ackReceivedAt, status, window) so a
+double fire is a no-op.
+=====================================================
+*/
+async function enforceAdvanceAckDeadlines() {
+  try {
+    const Booking = require("../models/Booking");
+    const {
+      handleAckTimeout,
+      ADVANCE_IMMINENT_MS,
+      ADVANCE_ACK_WINDOW_MS,
+    } = require("./ackTimeout.service");
+
+    const now = Date.now();
+    const assignedCutoff = new Date(now - ADVANCE_ACK_WINDOW_MS);
+    const imminentCutoff = new Date(now + ADVANCE_IMMINENT_MS);
+
+    const expired = await Booking.find({
+      status: "ASSIGNED",
+      ackReceivedAt: null,
+      partner: { $ne: null },
+      assignedAt: { $ne: null },
+      // ADVANCE-originated only (start was >3h away at assignment time) — an
+      // imminent assignment's 2-minute timer owns it exclusively; matching it
+      // here would reassign it before its 2 minutes are up.
+      $expr: {
+        $gt: [
+          { $subtract: ["$scheduledStartAt", "$assignedAt"] },
+          ADVANCE_IMMINENT_MS,
+        ],
+      },
+      $or: [
+        { assignedAt: { $lte: assignedCutoff } },
+        { scheduledStartAt: { $lte: imminentCutoff } },
+      ],
+    })
+      .select("_id partner")
+      .lean();
+
+    for (const booking of expired) {
+      await handleAckTimeout(booking._id, booking.partner);
+    }
+
+    if (expired.length) {
+      console.log(
+        `[cron] Advance-ACK deadline expired for ${expired.length} booking(s) — reassignment triggered`
+      );
+    }
+  } catch (err) {
+    console.error("[cron] enforceAdvanceAckDeadlines error:", err.message);
   }
 }
 
@@ -635,6 +795,8 @@ function initCronJobs() {
   dispatchQueuedBookings();
   cleanupExpiredSlotLocks();
   sendJobReminders();
+  sendCakeOrderReminders();
+  enforceAdvanceAckDeadlines();
   sendHelperInviteReminders();
   retryPendingPayouts();
   detectNoShowPartners();
@@ -644,6 +806,8 @@ function initCronJobs() {
   setInterval(dispatchQueuedBookings, CHECK_INTERVAL_MS);
   setInterval(cleanupExpiredSlotLocks, SLOT_LOCK_CHECK_INTERVAL_MS);
   setInterval(sendJobReminders, REMINDER_INTERVAL_MS);
+  setInterval(sendCakeOrderReminders, CAKE_REMINDER_INTERVAL_MS);
+  setInterval(enforceAdvanceAckDeadlines, REMINDER_INTERVAL_MS);
   setInterval(sendHelperInviteReminders, REMINDER_INTERVAL_MS);
   setInterval(retryPendingPayouts, PAYOUT_RETRY_INTERVAL_MS);
   setInterval(detectNoShowPartners, CHECK_INTERVAL_MS);
@@ -670,6 +834,8 @@ module.exports = {
   dispatchQueuedBookings,
   cleanupExpiredSlotLocks,
   sendJobReminders,
+  sendCakeOrderReminders,
+  enforceAdvanceAckDeadlines,
   sendHelperInviteReminders,
   retryPendingPayouts,
   detectNoShowPartners,

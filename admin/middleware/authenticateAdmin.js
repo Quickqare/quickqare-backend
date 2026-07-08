@@ -1,5 +1,6 @@
 const jwt = require("jsonwebtoken");
 const AdminUser = require("../models/AdminUser");
+const AdminSession = require("../models/AdminSession");
 const { getPermissionsForRole } = require("../constants/permissions");
 const { asSingleString } = require("../utils/common");
 const { fail } = require("../utils/response");
@@ -29,9 +30,32 @@ module.exports = async function authenticateAdmin(req, res, next) {
       });
     }
 
+    // Access tokens issued after the security update carry the session id (sid).
+    // Reject any token without one — the admin client auto-refreshes on 401, so
+    // a pre-update token is transparently re-minted as a session-bound token.
+    if (!payload.sid) {
+      return fail(res, 401, "ADMIN_TOKEN_INVALID", "Invalid access token", null, {
+        requestId: req.requestId,
+      });
+    }
+
     const admin = await AdminUser.findById(payload.sub).lean();
     if (!admin || !admin.isActive) {
       return fail(res, 401, "ADMIN_INACTIVE", "Admin account is inactive", null, {
+        requestId: req.requestId,
+      });
+    }
+
+    // Session-bind the token: a revoked or expired session invalidates its access
+    // tokens at once, so logout / "revoke all sessions" takes effect immediately
+    // instead of lingering until the short-lived access token expires.
+    const session = await AdminSession.findById(payload.sid).lean();
+    if (
+      !session ||
+      session.isRevoked ||
+      (session.refreshExpiresAt && session.refreshExpiresAt < new Date())
+    ) {
+      return fail(res, 401, "ADMIN_SESSION_INVALID", "Session is no longer valid", null, {
         requestId: req.requestId,
       });
     }

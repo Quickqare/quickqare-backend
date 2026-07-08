@@ -58,13 +58,34 @@ exports.verifyRazorpayPayment = async (req, res) => {
 
     /* =====================
        IDEMPOTENCY GUARD
-       Prevent double verification
+       Prevent double verification. Runs before the order-binding check below so
+       an already-settled booking short-circuits to success regardless of what
+       order id is (re)submitted.
     ===================== */
     if (booking.payment?.status === "PAID") {
       return res.json({
         success: true,
         message: "Payment already verified",
         bookingId: booking._id,
+      });
+    }
+
+    /* =====================
+       ORDER BINDING
+       The signature below only proves that (order_id | payment_id) is a genuine
+       pair from our Razorpay account — it does NOT prove the payment belongs to
+       THIS booking. Without this check, a user could pay a cheap booking's order
+       and submit that valid triple against an expensive booking (pay ₹49, mark a
+       ₹5000 booking PAID). Require that the submitted order matches the order we
+       created and stored for this booking at order-creation time. This is a pure
+       rejection with no state mutation, placed before the lock-expiry handling
+       below (which cancels the booking) so a mismatched order can't cancel it.
+    ===================== */
+    const expectedOrderId = booking.payment?.razorpay_order_id;
+    if (!expectedOrderId || String(razorpay_order_id) !== String(expectedOrderId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Payment does not match this booking",
       });
     }
 
@@ -113,7 +134,17 @@ exports.verifyRazorpayPayment = async (req, res) => {
       .update(body)
       .digest("hex");
 
-    if (expectedSignature !== razorpay_signature) {
+    // timingSafeEqual guards against signature-comparison timing attacks
+    // (mirrors the Razorpay webhook handler). Only equal-length buffers can be
+    // compared — timingSafeEqual throws on a length mismatch — so a forged
+    // signature of the wrong length is treated as invalid here.
+    const expectedBuf = Buffer.from(expectedSignature);
+    const providedBuf = Buffer.from(String(razorpay_signature));
+    const signatureValid =
+      expectedBuf.length === providedBuf.length &&
+      crypto.timingSafeEqual(expectedBuf, providedBuf);
+
+    if (!signatureValid) {
       booking.payment.status = "FAILED";
       await releaseSlotCapacityByBookingId(booking._id, {
         releaseReason: "payment_signature_failed",

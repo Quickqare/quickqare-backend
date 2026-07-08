@@ -1,9 +1,65 @@
-# ── API server ──────────────────────────────────────────────────────────────
+# QuickQare nginx reference config (droplet).
+#
+# Two apps sit behind this nginx:
+#   • api.quickqare.in          → reverse-proxied to the Node backend (127.0.0.1:4000)
+#   • quickqare.in / www.*       → the Vite-built customer web SPA (static files)
+#
+# Both are served over HTTPS; plain HTTP is 301-redirected to HTTPS.
+#
+# TLS: the ssl_certificate paths below use the standard Let's Encrypt/certbot
+# layout. ADJUST them to match your droplet, or keep whatever SSL lines your
+# working config already has — the important addition in this file is the
+# "SECURITY HEADERS" block in the customer web server, further down.
+#
+# WHY THE HEADERS ARE HERE (not in public/_headers):
+#   The Node backend sets its own security headers via helmet, so the API server
+#   block does NOT repeat them. The static web app has no server-side app to set
+#   headers, so nginx must send them itself. The web app's public/_headers file
+#   is a Netlify-only convention and is IGNORED when the site is served by nginx.
+
+server_tokens off;  # don't leak the nginx version in the Server response header
+
+# ── HTTP → HTTPS redirect (all hosts) ────────────────────────────────────────
+# If you renew certificates with the webroot method, keep your existing
+# /.well-known/acme-challenge/ location ABOVE the redirect so renewal keeps
+# working (uncomment the example line below and point it at your webroot).
 server {
     listen 80;
+    server_name api.quickqare.in quickqare.in www.quickqare.in;
+
+    # location /.well-known/acme-challenge/ { root /var/www/certbot; }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# ── API server (api.quickqare.in) ────────────────────────────────────────────
+server {
+    listen 443 ssl http2;
     server_name api.quickqare.in;
 
+    ssl_certificate     /etc/letsencrypt/live/api.quickqare.in/fullchain.pem;   # adjust
+    ssl_certificate_key /etc/letsencrypt/live/api.quickqare.in/privkey.pem;     # adjust
+    # include /etc/letsencrypt/options-ssl-nginx.conf;   # certbot's recommended TLS settings
+
     client_max_body_size 20M;
+
+    # Security headers are set by the Node app (helmet) — do not duplicate them
+    # here or they would be sent twice.
+
+    # Serve a static "we'll be right back" page when the backend container is
+    # completely unreachable (e.g. mid `docker compose up -d --build`), instead
+    # of a raw connection-refused error in the browser/app.
+    #
+    # Scoped to 502 (Bad Gateway) and 504 (Gateway Timeout) ONLY — those are the
+    # codes nginx itself generates when it can't reach the upstream at all.
+    # Deliberately NOT 503: the app itself returns 503 on purpose (emergency
+    # lockdown / bookings disabled / payments frozen — see AdminSetting) with a
+    # JSON body the apps parse. Intercepting 503 here would replace that JSON
+    # with HTML and break the in-app maintenance banners.
+    proxy_intercept_errors on;
+    error_page 502 504 = 503 @maintenance;
 
     location / {
         proxy_pass http://127.0.0.1:4000;
@@ -15,27 +71,62 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
     }
+
+    location @maintenance {
+        internal;
+        root /var/www/quickqare-maintenance;
+        try_files /index.html =503;
+        add_header Retry-After 30 always;
+    }
 }
 
-# ── Customer web app (www.quickqare.in) ─────────────────────────────────────
+# ── Customer web app (quickqare.in / www.quickqare.in) ───────────────────────
 # Serves the Vite-built React SPA from /var/www/quickqare-web/dist
-# IMPORTANT: The try_files line is required so that React Router routes
-# (/privacy-policy, /bookings, etc.) work on direct load or page refresh.
+# IMPORTANT: the try_files line in `location /` is required so React Router
+# routes (/privacy-policy, /bookings/:id, etc.) work on direct load or refresh.
 server {
-    listen 80;
+    listen 443 ssl http2;
     server_name quickqare.in www.quickqare.in;
+
+    ssl_certificate     /etc/letsencrypt/live/quickqare.in/fullchain.pem;   # adjust
+    ssl_certificate_key /etc/letsencrypt/live/quickqare.in/privkey.pem;     # adjust
+    # include /etc/letsencrypt/options-ssl-nginx.conf;   # certbot's recommended TLS settings
 
     root /var/www/quickqare-web/dist;
     index index.html;
 
-    # Serve static assets with long cache headers
+    # ── SECURITY HEADERS ─────────────────────────────────────────────────────
+    # This static site has no server-side app to set these (helmet only covers
+    # the API), so nginx sends them. Declared at SERVER scope so the SPA document
+    # — served by `location /`, which defines no add_header of its own — inherits
+    # them. The asset location below sets its own add_header and therefore does
+    # NOT inherit these; that's fine, because CSP / X-Frame-Options / Referrer /
+    # Permissions are document-level protections, not per-asset ones.
+    #
+    # nginx gotcha: add_header directives are inherited by a location ONLY if
+    # that location defines none of its own. Do not add an add_header inside
+    # `location /` or these six will stop reaching the HTML page.
+    #
+    # The CSP allowlist matches exactly what the app loads: Razorpay Checkout
+    # (script-src / frame-src) and the MSG91 widget + API/socket hosts
+    # (connect-src). There is no 'unsafe-inline' or 'unsafe-eval' in script-src,
+    # so injected inline scripts are blocked. If a new integration is added, add
+    # its host to the specific directive rather than loosening script-src.
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Permissions-Policy "camera=(), microphone=()" always;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header Content-Security-Policy "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'self'; form-action 'self'; script-src 'self' https://checkout.razorpay.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' https://api.quickqare.in wss://api.quickqare.in https://control.msg91.com https://*.razorpay.com; frame-src https://api.razorpay.com https://*.razorpay.com" always;
+
+    # Serve static assets with long cache headers.
     location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|map)$ {
         expires 1y;
         add_header Cache-Control "public, immutable";
         try_files $uri =404;
     }
 
-    # SPA catch-all: any path that isn't a real file falls back to index.html
+    # SPA catch-all: any path that isn't a real file falls back to index.html.
     location / {
         try_files $uri $uri/ /index.html;
     }

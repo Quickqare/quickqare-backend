@@ -10,6 +10,9 @@ const adminSessionSchema = new mongoose.Schema(
     },
     refreshTokenHash: { type: String, default: null, select: false },
     twoFaCodeHash: { type: String, default: null, select: false },
+    // Number of wrong 2FA codes submitted against this challenge. Used to lock
+    // the challenge after a few failures so a 6-digit code can't be brute-forced.
+    twoFaAttempts: { type: Number, default: 0 },
     challengeExpiresAt: { type: Date, default: null, index: true },
     refreshExpiresAt: { type: Date, default: null, index: true },
     ipAddress: { type: String, default: "" },

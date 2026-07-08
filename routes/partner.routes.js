@@ -55,6 +55,23 @@ router.get(
   partnerController.getPartnerBookings
 );
 
+/**
+ * ======================================
+ * UNAVAILABLE DATES (baker days off)
+ * GET/PATCH /api/partner/unavailable-dates
+ * ======================================
+ */
+router.get(
+  "/unavailable-dates",
+  partnerAuth,
+  partnerController.getUnavailableDates
+);
+router.patch(
+  "/unavailable-dates",
+  partnerAuth,
+  partnerController.setUnavailableDates
+);
+
 // Public: the signup screen reads feature flags before any account exists.
 // Returns only boolean flags — nothing sensitive.
 router.get(

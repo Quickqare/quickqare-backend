@@ -88,6 +88,29 @@ exports.phoneOtpLimiter = rateLimit({
   },
 });
 
+/* =====================================================
+   MAPS LIMITER (REVERSE GEOCODE / ADDRESS SEARCH)
+   These routes are unauthenticated and proxy Google Maps
+   (billed per request). The controller caches results, but
+   an uncached / scripted flood could still run up billing.
+   Cap per IP. 30/min comfortably covers a real user typing
+   into a debounced address box while blocking abuse.
+===================================================== */
+exports.mapsLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 30,             // per IP
+
+  standardHeaders: true,
+  legacyHeaders: false,
+
+  handler: (req, res) => {
+    res.status(429).json({
+      success: false,
+      message: "Too many location lookups. Please slow down.",
+    });
+  },
+});
+
 // Secondary hourly cap — prevents someone retrying every 60s for hours.
 exports.phoneOtpHourlyLimiter = rateLimit({
   windowMs: 60 * 60 * 1000, // 1 hour

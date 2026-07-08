@@ -31,6 +31,14 @@ exports.updateProfileValidator = [
     .trim()
     .notEmpty().withMessage("Gender is required")
     .isIn(["Male", "Female", "Other"]).withMessage("Gender must be Male, Female or Other"),
+
+  // Optional — the web profile page edits email; mobile doesn't send it.
+  // An empty string is allowed and clears the saved email.
+  body("email")
+    .optional({ values: "falsy" })
+    .trim()
+    .isEmail().withMessage("Email must be a valid email address")
+    .isLength({ max: 254 }).withMessage("Email must be 254 characters or fewer"),
 ];
 
 /* =====================================================
@@ -98,6 +106,43 @@ exports.createBookingValidator = [
     .optional()
     .isFloat({ min: 0 })
     .withMessage("price must be a non-negative number"),
+
+  /* =====================
+     CUSTOMIZATION OPTIONS (CAKES)
+     Deep validation (valid flavour/addon names, pricing) happens in
+     createBooking against the Service's customization config.
+  ===================== */
+  body("services.*.options.flavour")
+    .optional()
+    .isString()
+    .withMessage("flavour must be a string"),
+
+  body("services.*.options.weight")
+    .optional()
+    .isString()
+    .withMessage("weight must be a string"),
+
+  body("services.*.options.tiers")
+    .optional()
+    .isInt({ min: 1, max: 2 })
+    .withMessage("tiers must be 1 or 2"),
+
+  body("services.*.options.addons")
+    .optional()
+    .isArray()
+    .withMessage("addons must be an array of addon names"),
+
+  body("services.*.options.nameOnCake")
+    .optional()
+    .isString()
+    .isLength({ max: 40 })
+    .withMessage("nameOnCake must be at most 40 characters"),
+
+  body("services.*.options.referencePhotoUrl")
+    .optional()
+    .isString()
+    .isLength({ max: 1024 })
+    .withMessage("referencePhotoUrl must be at most 1024 characters"),
 
   /* =====================
      PRIMARY SERVICE (NEW)

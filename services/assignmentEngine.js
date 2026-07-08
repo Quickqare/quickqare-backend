@@ -9,7 +9,13 @@ const {
   AC_CATEGORY_SLUGS,
   AC_MAX_CAPACITY_MINUTES,
 } = require("./scheduling_service");
-const { resolveZoneForPincode, getZoneCoveragePincodes, resolveHubsForCells } = require("./zone.service");
+const {
+  resolveZoneForPincode,
+  getZoneCoveragePincodes,
+  resolveHubsForCells,
+  resolveHubForH3Cell,
+  resolveBookingCategories,
+} = require("./zone.service");
 const { escalateUnassignedBooking } = require("./escalation.service");
 const { sendJobAssignedPush } = require("./pushNotification.service");
 const { getH3CellsForStage } = require("../utils/h3");
@@ -42,7 +48,13 @@ async function runH3ShadowLookup(booking, stage, pincodePartnerIds) {
     const h3Cells = getH3CellsForStage(booking.h3Cell, stage);
     if (!h3Cells.length) return;
 
-    const hubIds = await resolveHubsForCells(h3Cells);
+    // Mirror the live hub path exactly (category-scoped, partner-enabled) so
+    // the shadow numbers predict what hub mode would really do.
+    const categoryIds = (await resolveBookingCategories(booking)).map((c) => c.id);
+    const hubIds = await resolveHubsForCells(h3Cells, {
+      categoryIds: categoryIds.length ? categoryIds : null,
+      requirePartnerApp: true,
+    });
     if (!hubIds.length) {
       console.log(
         `[Hub Shadow] booking=${booking._id} stage=${stage} ` +
@@ -53,7 +65,9 @@ async function runH3ShadowLookup(booking, stage, pincodePartnerIds) {
 
     const hubPartners = await Partner.find({
       isBlocked: false,
-      approvalStatus: "approved",
+      // Enum value is uppercase — the old lowercase "approved" matched zero
+      // partners, so every shadow log falsely reported hub=0.
+      approvalStatus: "APPROVED",
       assignedHubId: { $in: hubIds },
     }).select("_id").lean();
 
@@ -77,8 +91,20 @@ async function runH3ShadowLookup(booking, stage, pincodePartnerIds) {
 /*
 =====================================================
 GET PINCODES BY ASSIGNMENT STAGE
+Stages are CUMULATIVE — each wider stage still includes every narrower one,
+mirroring the H3 path (gridDisk is inclusive). Stage 2 previously searched
+ONLY nearbyPincodes and stage 3 ONLY extendedPincodes, silently dropping
+home-pincode partners: a 3-partner job with 2 candidates at home and 2 nearby
+failed every stage (2<3, then a different 2<3) even though 4 eligible
+partners existed across the zone.
 =====================================================
 */
+function dedupePincodes(list) {
+  return [
+    ...new Set(list.map((p) => String(p || "").trim()).filter(Boolean)),
+  ];
+}
+
 async function getPincodesForStage(booking) {
   if (booking.assignmentStage === 1) {
     return [booking.pincode];
@@ -88,16 +114,15 @@ async function getPincodesForStage(booking) {
   if (!zone || zone.isActive === false) return [booking.pincode];
   if (zone.partnerAppEnabled === false) return [];
 
-  if (booking.assignmentStage === 2 && zone.nearbyPincodes?.length) {
-    return zone.nearbyPincodes;
+  if (booking.assignmentStage === 2) {
+    return dedupePincodes([
+      booking.pincode,
+      ...(Array.isArray(zone.nearbyPincodes) ? zone.nearbyPincodes : []),
+    ]);
   }
 
-  if (booking.assignmentStage === 3 && zone.extendedPincodes?.length) {
-    return zone.extendedPincodes;
-  }
-
-  const coverage = getZoneCoveragePincodes(zone);
-  return coverage.length ? coverage : [booking.pincode];
+  // Stage 3: full zone coverage (home + nearby + extended).
+  return dedupePincodes([booking.pincode, ...getZoneCoveragePincodes(zone)]);
 }
 
 /*
@@ -228,6 +253,28 @@ async function computeRequiredPartners(booking) {
 
 /*
 =====================================================
+RELEASE CAPACITY FOR AN UNASSIGNABLE BOOKING
+A booking that lands in NO_PARTNER_AVAILABLE (stage exhaustion, reassign cap,
+or a window already in the past) is not going to be staffed — its reserved
+SlotCapacity units must go back to the pool so other customers can book the
+window. Release is idempotent (the lock flips to RELEASED once), so a later
+escalation auto-cancel calling release again is a safe no-op. Lazy require +
+never-throws: capacity bookkeeping must not break the assignment flow.
+=====================================================
+*/
+async function releaseSlotCapacityForUnassignable(bookingId, reason) {
+  try {
+    const { releaseSlotCapacityByBookingId } = require("./slotCapacity.service");
+    await releaseSlotCapacityByBookingId(bookingId, { releaseReason: reason });
+  } catch (err) {
+    console.error(
+      `[assignment] Slot capacity release failed for booking ${bookingId} (${reason}): ${err.message}`
+    );
+  }
+}
+
+/*
+=====================================================
 ASSIGN BOOKING
 =====================================================
 */
@@ -280,6 +327,7 @@ async function assignBooking(bookingId, opts = {}) {
         candidates: [],
       });
       await booking.save();
+      await releaseSlotCapacityForUnassignable(booking._id, "no_partner_window_passed");
       await escalateUnassignedBooking(booking._id);
       return null;
     }
@@ -288,19 +336,94 @@ async function assignBooking(bookingId, opts = {}) {
       ? opts.requireOnline
       : minutesToService <= 30; // only require online for imminent bookings
 
+    // Hub (H3) path is active only when the flag is on AND this booking has a
+    // derived h3Cell. A booking without an h3Cell (e.g. created before H3
+    // rollout, or with no coordinates) safely falls back to the pincode path.
+    // Resolved once so every stage of this attempt runs in the same mode.
+    const hubMode = (await getUseH3Flag()) && Boolean(booking.h3Cell);
+
+    // Hub mode: resolve the booking's categories once (hubs are per-category
+    // and may overlap the same cells), and enforce the home-hub pause gate up
+    // front — a booking whose own hub is switched off for partner jobs must
+    // not be staffed from neighbouring hubs via ring expansion.
+    let hubCategoryIds = null;
+    let pausedHomeHubName = null;
+    if (hubMode) {
+      hubCategoryIds = (await resolveBookingCategories(booking)).map((c) => c.id);
+      for (const catId of hubCategoryIds.length ? hubCategoryIds : [null]) {
+        const homeHub = await resolveHubForH3Cell(booking.h3Cell, { categoryId: catId });
+        if (homeHub && homeHub.partnerAppEnabled === false) {
+          pausedHomeHubName = homeHub.name;
+          break;
+        }
+      }
+    }
+
+    // Hub mode stage-skip bookkeeping: partners match by hub membership, so a
+    // wider ring that reaches no NEW hubs re-runs an identical search.
+    let prevStageHubKey = null;
+    let prevStageFailedDeterministically = false;
+
     for (let stage = booking.assignmentStage || 1; stage <= 3; stage += 1) {
       booking.assignmentStage = stage;
       await booking.save();
 
-      // Hub (H3) path is active only when the flag is on AND this booking has a
-      // derived h3Cell. A booking without an h3Cell (e.g. created before H3
-      // rollout, or with no coordinates) safely falls back to the pincode path.
-      const hubMode = (await getUseH3Flag()) && Boolean(booking.h3Cell);
-
       // ── Stage cell/pincode expansion ──────────────────────────────────────
       let pincodesToSearch;
+      let stageHubIds = null; // hub mode: precomputed pool for this stage
       if (hubMode) {
         pincodesToSearch = getH3CellsForStage(booking.h3Cell, stage);
+
+        if (pausedHomeHubName) {
+          booking.assignmentAudit.push({
+            stage,
+            event: "NO_ELIGIBLE_PARTNERS",
+            searchedPincodes: pincodesToSearch,
+            notes: `Hub "${pausedHomeHubName}" is paused for partner jobs (partnerAppEnabled=false)`,
+            candidates: [],
+          });
+          await booking.save();
+          continue;
+        }
+
+        stageHubIds = await resolveHubsForCells(pincodesToSearch, {
+          categoryIds: hubCategoryIds && hubCategoryIds.length ? hubCategoryIds : null,
+          requirePartnerApp: true,
+        });
+        const stageHubKey = stageHubIds.map(String).sort().join("|");
+
+        // Skip a stage whose hub set is identical to the previous one — the
+        // candidate pool cannot have changed. Claim-contention failures are
+        // the exception: those lose a race, not the pool, so retry them.
+        if (
+          prevStageHubKey !== null &&
+          stageHubKey === prevStageHubKey &&
+          prevStageFailedDeterministically
+        ) {
+          booking.assignmentAudit.push({
+            stage,
+            event: "STAGE_SKIPPED_NO_NEW_HUBS",
+            searchedPincodes: pincodesToSearch,
+            notes: "Ring expansion reached no additional hubs — candidate pool unchanged from previous stage",
+            candidates: [],
+          });
+          await booking.save();
+          continue;
+        }
+        prevStageHubKey = stageHubKey;
+
+        if (!stageHubIds.length) {
+          booking.assignmentAudit.push({
+            stage,
+            event: "NO_ELIGIBLE_PARTNERS",
+            searchedPincodes: pincodesToSearch,
+            notes: "No partner-enabled hub of this booking's category covers this stage's cells",
+            candidates: [],
+          });
+          await booking.save();
+          prevStageFailedDeterministically = true;
+          continue;
+        }
       } else {
         pincodesToSearch = await getPincodesForStage(booking);
       }
@@ -315,13 +438,14 @@ async function assignBooking(bookingId, opts = {}) {
             : "Zone expansion returned no searchable pincodes",
         });
         await booking.save();
+        prevStageFailedDeterministically = true;
         continue;
       }
 
       const rankedPartners = await findEligiblePartnersForBooking(
         booking,
         pincodesToSearch,
-        { requireOnline, useH3: hubMode }
+        { requireOnline, useH3: hubMode, precomputedHubIds: stageHubIds }
       );
 
       // ── Shadow log (Stage 3 — only when running on pincode path) ─────────
@@ -339,6 +463,7 @@ async function assignBooking(bookingId, opts = {}) {
           candidates: [],
         });
         await booking.save();
+        prevStageFailedDeterministically = true;
         continue;
       }
 
@@ -356,6 +481,7 @@ async function assignBooking(bookingId, opts = {}) {
           candidates: rankedPartners.slice(0, 5).map((e) => ({ partnerId: e.partner._id, score: e.score })),
         });
         await booking.save();
+        prevStageFailedDeterministically = true;
         continue;
       }
 
@@ -413,6 +539,9 @@ async function assignBooking(bookingId, opts = {}) {
             .map((e) => ({ partnerId: e.partner._id, score: e.score })),
         });
         await booking.save();
+        // A lost claim race is not deterministic — the same pool is worth
+        // retrying at the next stage even if it reaches no new hubs.
+        prevStageFailedDeterministically = false;
         continue;
       }
 
@@ -463,6 +592,9 @@ async function assignBooking(bookingId, opts = {}) {
       booking.standbyPartners = standbyCandidates;
 
       booking.status = finalStatus;
+      // Anchor for the advance-ACK deadline (see ackTimeout.service). Set on
+      // every (re)assignment so each newly attached partner gets a fresh window.
+      booking.assignedAt = new Date();
       // A partner is now attached, so the partner-cancel auto-refund window is closed.
       // Clear the flag (set by cancelBooking on a partner cancel) — otherwise it stays
       // sticky across this partner's tenure, and a much-later re-search exhaustion would
@@ -500,10 +632,24 @@ async function assignBooking(bookingId, opts = {}) {
       // Schedule ACK timeout only for manual-accept bookings (ASSIGNED).
       // Auto-accepted bookings (CONFIRMED) already have ackReceivedAt set above —
       // no partner action required, so no timeout needed.
+      //
+      // The 2-minute timer is for IMMINENT jobs only. Advance assignments
+      // (start >3h away — e.g. cake orders assigned at payment time, or any
+      // evening payment for a next-morning slot) may land while the partner is
+      // legitimately offline/asleep; a 2-minute window would churn through
+      // every candidate in the zone within minutes. Those get the wider
+      // deadline (12h from assignment, capped at T-3h) enforced by the
+      // enforceAdvanceAckDeadlines cron instead. handleAckTimeout carries the
+      // same guard, so a stray timer fire on an advance booking is a no-op.
       if (!autoAccepted) {
         try {
-          const { scheduleAckTimeout } = require("./ackTimeout.service");
-          await scheduleAckTimeout(booking._id, primaryPartner._id);
+          const {
+            scheduleAckTimeout,
+            ADVANCE_IMMINENT_MS,
+          } = require("./ackTimeout.service");
+          if (minutesToService * 60 * 1000 <= ADVANCE_IMMINENT_MS) {
+            await scheduleAckTimeout(booking._id, primaryPartner._id);
+          }
         } catch (timeoutErr) {
           console.error("ACK timeout schedule error:", timeoutErr.message);
         }
@@ -651,8 +797,11 @@ async function assignBooking(bookingId, opts = {}) {
     });
     await booking.save();
 
-    // Bust slot cache: NO_PARTNER_AVAILABLE no longer holds slot capacity, so
-    // the slot may be available to a different (better-matched) customer now.
+    // Release the reserved SlotCapacity units AND bust the slot cache — a
+    // booking we can't staff must not keep blocking the window for other
+    // customers. (Previously only the cache was busted; the reservedUnits
+    // stayed incremented and the slot showed full for the rest of the day.)
+    await releaseSlotCapacityForUnassignable(booking._id, "no_partner_available");
     try {
       const { clearSlotCache } = require("./scheduling_service");
       clearSlotCache(booking.pincode, booking.scheduledDate);
@@ -757,6 +906,7 @@ async function reassignBooking(bookingId, partnerId, options = {}) {
       );
       if (!capped) return; // booking moved on concurrently — abort.
 
+      await releaseSlotCapacityForUnassignable(booking._id, "reassign_limit_reached");
       await escalateUnassignedBooking(booking._id);
 
       if (global.io) {

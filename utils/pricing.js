@@ -156,6 +156,136 @@ function getMehendiHandsPrice(pricingRuleKey, hands = 1) {
 
 /*
 =====================================================
+CAKE (CELEBRATION) CUSTOMIZATION PRICING
+Options are validated by name against the Service's
+admin-managed `customization` config — client prices
+are never trusted.
+=====================================================
+*/
+
+const MAX_NAME_ON_CAKE_LENGTH = 40;
+const MAX_REFERENCE_PHOTO_URL_LENGTH = 1024;
+
+/**
+ * Validates a cake options payload against service.customization.
+ * Returns { ok: true, options } with resolved (server-priced) values,
+ * or { ok: false, message } when the payload is invalid.
+ */
+function validateCakeOptions(service, rawOptions = {}) {
+  const config = service?.customization;
+  if (!config || !Array.isArray(config.flavours) || config.flavours.length === 0) {
+    return { ok: false, message: "This service has no customization options" };
+  }
+
+  const flavourName = String(rawOptions.flavour || "").trim();
+  const flavour = config.flavours.find(
+    (f) => normalizeText(f.name) === normalizeText(flavourName)
+  );
+  if (!flavour) {
+    return { ok: false, message: `Invalid flavour: ${flavourName || "(none)"}` };
+  }
+
+  // Weight/size is optional per service — only validated when the service has
+  // weight tiers configured. Falls back to the first (base) weight if omitted.
+  let weight = null;
+  if (Array.isArray(config.weights) && config.weights.length > 0) {
+    const weightLabel = String(rawOptions.weight || "").trim() || config.weights[0].label;
+    const matchedWeight = config.weights.find(
+      (w) => normalizeText(w.label) === normalizeText(weightLabel)
+    );
+    if (!matchedWeight) {
+      return { ok: false, message: `Invalid weight: ${weightLabel}` };
+    }
+    weight = matchedWeight.label;
+  }
+
+  const tiers = Number(rawOptions.tiers) || 1;
+  if (tiers !== 1 && tiers !== 2) {
+    return { ok: false, message: "tiers must be 1 or 2" };
+  }
+
+  const addonNames = Array.isArray(rawOptions.addons) ? rawOptions.addons : [];
+  const addons = [];
+  for (const rawName of addonNames) {
+    const addon = (config.addons || []).find(
+      (a) => normalizeText(a.name) === normalizeText(String(rawName || ""))
+    );
+    if (!addon) {
+      return { ok: false, message: `Invalid addon: ${rawName}` };
+    }
+    if (addons.some((a) => normalizeText(a.name) === normalizeText(addon.name))) {
+      continue; // ignore duplicates
+    }
+    addons.push({ name: addon.name, price: Number(addon.price) || 0 });
+  }
+
+  let nameOnCake = String(rawOptions.nameOnCake || "").trim();
+  if (nameOnCake && config.nameOnCakeEnabled === false) {
+    return { ok: false, message: "Name on cake is not available for this service" };
+  }
+  nameOnCake = nameOnCake.slice(0, MAX_NAME_ON_CAKE_LENGTH);
+
+  // Customer's "make it look like this" reference photo — a URL from the
+  // upload endpoint, not validated against any admin config (display only).
+  const referencePhotoUrl = String(rawOptions.referencePhotoUrl || "")
+    .trim()
+    .slice(0, MAX_REFERENCE_PHOTO_URL_LENGTH);
+
+  return {
+    ok: true,
+    options: {
+      flavour: flavour.name,
+      ...(weight ? { weight } : {}),
+      tiers,
+      addons,
+      nameOnCake,
+      ...(referencePhotoUrl ? { referencePhotoUrl } : {}),
+    },
+  };
+}
+
+/**
+ * Line total for one customized cake (already-validated options).
+ * lineTotal = (base + flavourDelta + weightDelta + twoTierDelta + Σ addons) × quantity
+ */
+function computeCakeLineTotal(service, options, quantity = 1) {
+  const config = service?.customization || {};
+  const qty = Math.max(Number(quantity) || 1, 1);
+
+  const flavour = (config.flavours || []).find(
+    (f) => normalizeText(f.name) === normalizeText(options.flavour)
+  );
+  const flavourDelta = Number(flavour?.priceDelta) || 0;
+
+  const weightEntry = options.weight
+    ? (config.weights || []).find((w) => normalizeText(w.label) === normalizeText(options.weight))
+    : null;
+  const weightDelta = Number(weightEntry?.priceDelta) || 0;
+
+  const tierDelta = Number(options.tiers) === 2 ? Number(config.twoTierPriceDelta) || 0 : 0;
+  const addonsTotal = (options.addons || []).reduce(
+    (total, addon) => total + (Number(addon.price) || 0),
+    0
+  );
+
+  const unitPrice = (Number(service.price) || 0) + flavourDelta + weightDelta + tierDelta + addonsTotal;
+  return { unitPrice: round(unitPrice), lineTotal: round(unitPrice * qty) };
+}
+
+/**
+ * True when a service is configured for per-order customization
+ * (i.e. it's a cake/celebration-style service).
+ */
+function hasCustomization(service) {
+  return Boolean(
+    service?.customization &&
+    Array.isArray(service.customization.flavours) &&
+    service.customization.flavours.length > 0
+  );
+}
+
+/*
+=====================================================
 SAFE ROUND (avoid floating errors)
 =====================================================
 */
@@ -281,3 +411,7 @@ exports.getAboveElbowBridalMehendiHandsPrice =
   getAboveElbowBridalMehendiHandsPrice;
 exports.getMehendiPricingRuleKey = getMehendiPricingRuleKey;
 exports.getMehendiHandsPrice = getMehendiHandsPrice;
+exports.validateCakeOptions = validateCakeOptions;
+exports.computeCakeLineTotal = computeCakeLineTotal;
+exports.hasCustomization = hasCustomization;
+exports.MAX_NAME_ON_CAKE_LENGTH = MAX_NAME_ON_CAKE_LENGTH;

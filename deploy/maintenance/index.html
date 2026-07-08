@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <!-- Retry every 15s so the tab recovers on its own once the deploy finishes. -->
+  <meta http-equiv="refresh" content="15" />
+  <title>QuickQare — Be right back</title>
+  <style>
+    :root { color-scheme: light dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: #f7f8fa;
+      color: #1f2937;
+    }
+    @media (prefers-color-scheme: dark) {
+      body { background: #0f172a; color: #e2e8f0; }
+      .sub { color: #94a3b8 !important; }
+    }
+    .card { max-width: 420px; text-align: center; }
+    .icon { font-size: 48px; margin-bottom: 12px; }
+    h1 { font-size: 20px; font-weight: 700; margin: 0 0 8px; }
+    p { font-size: 15px; line-height: 1.5; margin: 0 0 4px; color: #4b5563; }
+    .sub { font-size: 13px; color: #6b7280; margin-top: 16px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">🛠️</div>
+    <h1>We'll be right back</h1>
+    <p>QuickQare is undergoing a brief update. This usually takes a minute or two.</p>
+    <p class="sub">This page refreshes automatically — no need to keep reloading.</p>
+  </div>
+</body>
+</html>

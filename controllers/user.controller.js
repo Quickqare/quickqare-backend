@@ -3,12 +3,12 @@ const Booking = require("../models/Booking");
 const Complaint = require("../models/Complaint");
 
 /**
- * Update user profile (name and gender)
+ * Update user profile (name, gender, and optionally email)
  * Limited to 3 times per year
  */
 const updateProfile = async (req, res) => {
   try {
-    const { name, gender } = req.body;
+    const { name, gender, email } = req.body;
     const userId = req.user.id;
 
     // Validate input
@@ -45,10 +45,15 @@ const updateProfile = async (req, res) => {
     const changes = {};
     if (user.name !== name) changes.name = { from: user.name, to: name };
     if (user.gender !== gender) changes.gender = { from: user.gender, to: gender };
+    // Email is optional — only clients that send it (web) update it.
+    if (typeof email !== "undefined" && user.email !== email) {
+      changes.email = { from: user.email, to: email };
+    }
 
     // Update user
     user.name = name;
     user.gender = gender;
+    if (typeof email !== "undefined") user.email = email;
     user.profileEdits.push({
       date: new Date(),
       changes,

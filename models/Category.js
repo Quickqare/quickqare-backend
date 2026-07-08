@@ -14,6 +14,7 @@ const categorySchema = new mongoose.Schema(
       index: true,
     },
     imageUrl: String,
+    webImageUrl: String,
     isActive: {
       type: Boolean,
       default: true,

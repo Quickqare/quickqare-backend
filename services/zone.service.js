@@ -10,6 +10,7 @@ const SERVICE_KEY_ALIASES = {
   plumbing: ["plumbing", "plumber"],
   mehendi: ["mehendi", "mehndi"],
   electrician: ["electrician", "electrical", "electric"],
+  celebration: ["celebration", "cake", "cakes", "baker", "bakery"],
 };
 
 function normalizeText(value = "") {
@@ -107,23 +108,73 @@ function filterServicesByZone(services = [], zone) {
  * Resolves the active Hub that contains a given H3 cell.
  * A hub "contains" a cell when the cell is one of the hub's h3Cells.
  * Returns the hub document, or null.
+ *
+ * categoryId: hubs are per-service and may overlap the same cells, so callers
+ * that know the booking's category MUST pass it — a bare findOne on an
+ * overlapped cell returns an arbitrary category's hub.
  */
-async function resolveHubForH3Cell(h3Index) {
+async function resolveHubForH3Cell(h3Index, { categoryId = null } = {}) {
   if (!h3Index) return null;
-  return Hub.findOne({ h3Cells: h3Index, isActive: true }).lean();
+  const query = { h3Cells: h3Index, isActive: true };
+  if (categoryId) query.category = categoryId;
+  return Hub.findOne(query).lean();
 }
 
 /**
  * Resolves the set of active Hub _ids whose h3Cells intersect any of
  * the supplied cells. Used by the assignment engine to find which hubs
  * cover a booking's cell (and its ring-expansion cells in later stages).
+ *
+ * categoryIds: restrict to hubs of these service categories (see
+ * resolveHubForH3Cell — overlapping hubs of other services must not match).
+ * requirePartnerApp: exclude hubs paused for partner jobs, so ring expansion
+ * cannot assign partners out of a hub an admin has switched off.
  */
-async function resolveHubsForCells(cells = []) {
+async function resolveHubsForCells(
+  cells = [],
+  { categoryIds = null, requirePartnerApp = false } = {}
+) {
   if (!Array.isArray(cells) || !cells.length) return [];
-  const hubs = await Hub.find({ h3Cells: { $in: cells }, isActive: true })
-    .select("_id")
-    .lean();
+  const query = { h3Cells: { $in: cells }, isActive: true };
+  if (Array.isArray(categoryIds) && categoryIds.length) {
+    query.category = { $in: categoryIds };
+  }
+  if (requirePartnerApp) query.partnerAppEnabled = { $ne: false };
+  const hubs = await Hub.find(query).select("_id").lean();
   return hubs.map((h) => h._id);
+}
+
+/**
+ * All active hubs (any category) covering the exact cell at lat/lng.
+ * Partner-facing endpoints use this to answer "which services are live
+ * HERE" — one hub per category, so the full set is needed, not findOne.
+ */
+async function resolveHubsForLocation(lat, lng) {
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return [];
+  const cell = deriveH3Cell(lat, lng);
+  if (!cell) return [];
+  return Hub.find({ h3Cells: cell, isActive: true }).lean();
+}
+
+/**
+ * Hub-mode counterpart of filterServicesByZone: keep only services whose
+ * category has a hub in `hubs`. Hubs carry no per-service toggle map — the
+ * hub's category IS its service — so filterServicesByZone (which reads
+ * zone.services) silently passes everything for a hub. Services without a
+ * resolvable category stay visible, mirroring the createBooking gate's
+ * area-level fallback for legacy records.
+ */
+function filterServicesByHubs(services = [], hubs = []) {
+  const hubCategoryIds = new Set(
+    (Array.isArray(hubs) ? hubs : [])
+      .map((h) => String(h?.category || ""))
+      .filter(Boolean)
+  );
+  return (Array.isArray(services) ? services : []).filter((service) => {
+    const catId = service?.category?._id || service?.category;
+    if (!catId) return true;
+    return hubCategoryIds.has(String(catId));
+  });
 }
 
 // Derives the H3 cell for a lat/lng and looks up the active hub containing it.
@@ -203,6 +254,7 @@ async function resolveBookingCategories({ services, serviceId, serviceCategory }
 
 module.exports = {
   filterServicesByZone,
+  filterServicesByHubs,
   getZoneCoveragePincodes,
   getZoneServiceKey,
   getZoneServiceKeysFromValues,
@@ -210,6 +262,7 @@ module.exports = {
   resolveZoneForPincode,
   resolveHubForH3Cell,
   resolveHubsForCells,
+  resolveHubsForLocation,
   resolveHubForLocation,
   resolveBookingCategories,
 };

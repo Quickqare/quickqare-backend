@@ -23,7 +23,15 @@ const {
   AC_MAX_CAPACITY_MINUTES,
   AC_CATEGORY_SLUGS,
 } = require("../services/scheduling_service");
-const { calculatePricing, getPricingSettings } = require("../utils/pricing");
+const {
+  calculatePricing,
+  getPricingSettings,
+  getMehendiPricingRuleKey,
+  getMehendiHandsPrice,
+  validateCakeOptions,
+  computeCakeLineTotal,
+  hasCustomization,
+} = require("../utils/pricing");
 const { validateCouponForAmount } = require("../services/coupon.service");
 const {
   SLOT_LOCK_MINUTES,
@@ -303,6 +311,12 @@ exports.createBooking = async (req, res) => {
     const categorySlugCache = new Map();
     let totalDurationMinutes = 0;
     const allServiceCancellationTiers = [];
+    // Customization-configured (cake) services drive lead-time and the
+    // SINCE_BOOKING cancellation policy for the whole booking.
+    let hasCustomizedService = false;
+    let hasPlainService = false;
+    let maxMinLeadDays = 0;
+    let sinceBookingPolicy = null; // { tiers } from the first SINCE_BOOKING service
     const mehendiRestrictedFeetOnly = new Set(["feet", "basic feet", "ankle", "above ankle"]);
     const mehendiAllFeetOptions = new Set([
       "feet",
@@ -380,7 +394,49 @@ exports.createBooking = async (req, res) => {
           });
         }
 
-        const itemTotal = price * quantity;
+        // Customized services (cakes): options are validated against the
+        // Service's admin-managed customization config and priced entirely
+        // server-side — flavour/tier/addon deltas come from the DB record.
+        let resolvedOptions = null;
+        let customizedTotals = null;
+        if (hasCustomization(service)) {
+          const validation = validateCakeOptions(service, item.options || {});
+          if (!validation.ok) {
+            return res.status(400).json({
+              success: false,
+              message: validation.message,
+            });
+          }
+          resolvedOptions = validation.options;
+          customizedTotals = computeCakeLineTotal(service, resolvedOptions, quantity);
+
+          hasCustomizedService = true;
+          maxMinLeadDays = Math.max(maxMinLeadDays, Number(service.minLeadDays) || 0);
+          if (
+            service.cancellationPolicyType === "SINCE_BOOKING" &&
+            !sinceBookingPolicy &&
+            Array.isArray(service.sinceBookingTiers) &&
+            service.sinceBookingTiers.length > 0
+          ) {
+            sinceBookingPolicy = { tiers: service.sinceBookingTiers };
+          }
+        } else {
+          hasPlainService = true;
+        }
+
+        // Mehendi hand designs use tiered "package" pricing by number of hands
+        // (e.g. 2 hands of Minimal Mehendi = ₹699, not 2 × ₹399 = ₹798). The
+        // per-hand base price stays in `price`; only the line total is tiered.
+        // Everything else falls back to plain price × quantity.
+        const mehendiPricingRuleKey = getMehendiPricingRuleKey(service.name);
+        const mehendiPackageTotal = mehendiPricingRuleKey
+          ? getMehendiHandsPrice(mehendiPricingRuleKey, quantity)
+          : null;
+        const itemTotal = customizedTotals
+          ? customizedTotals.lineTotal
+          : mehendiPackageTotal != null
+            ? mehendiPackageTotal
+            : price * quantity;
         const categoryValue =
           categorySlug || (service.category ? String(service.category) : "");
         const subCategoryValue = service.subCategory
@@ -393,17 +449,28 @@ exports.createBooking = async (req, res) => {
         bookingServices.push({
           serviceId: service._id,
           name: service.name,
-          price,
+          price: customizedTotals ? customizedTotals.unitPrice : price,
           lineTotal: itemTotal,
           quantity,
           category: categoryValue,
           subCategory: subCategoryValue,
+          ...(resolvedOptions ? { options: resolvedOptions } : {}),
         });
 
         // Collect cancellation tiers from each service for snapshot
         if (Array.isArray(service.cancellationTiers) && service.cancellationTiers.length > 0) {
           allServiceCancellationTiers.push(service.cancellationTiers);
         }
+      }
+
+      // Customized (cake) orders can't be mixed with other services in one
+      // booking — lead time, cancellation policy, and baker capacity would
+      // become ambiguous for the combined cart.
+      if (hasCustomizedService && hasPlainService) {
+        return res.status(400).json({
+          success: false,
+          message: "Cake orders must be booked separately from other services",
+        });
       }
 
       // if primary service not provided → take first service
@@ -493,16 +560,36 @@ exports.createBooking = async (req, res) => {
         });
       }
 
+      // Customized services (cakes) need an options payload the legacy
+      // single-service format can't carry — require the multi-service flow.
+      if (hasCustomization(legacyService)) {
+        return res.status(400).json({
+          success: false,
+          message: "This service requires customization options. Please update your app to book it.",
+        });
+      }
+
       const legacyCategorySlug = await resolveServiceCategorySlug(legacyService);
 
-      // Push one representative entry so the outer zone check picks it up.
-      // Pricing stays on the legacy BASE_PRICE path below — this is for
-      // validation only.
+      // Pricing is ALWAYS taken from the server-side Service record — same
+      // rule as the multi-service flow. This path previously hardcoded ₹500,
+      // which let a replayed legacy-format request book ANY service at a flat
+      // ₹500 regardless of its real price.
+      const legacyPrice = Number(legacyService.price || 0);
+      if (legacyPrice <= 0) {
+        return res.status(400).json({
+          success: false,
+          message: `Invalid price configured for service: ${legacyService._id}`,
+        });
+      }
+      const legacyDuration =
+        Number(legacyService.duration) > 0 ? Number(legacyService.duration) : 60;
+
       bookingServices.push({
         serviceId: legacyService._id,
         name: legacyService.name,
-        price: 500,
-        lineTotal: 500,
+        price: legacyPrice,
+        lineTotal: legacyPrice,
         quantity: 1,
         category:
           legacyCategorySlug ||
@@ -512,10 +599,17 @@ exports.createBooking = async (req, res) => {
           : "",
       });
 
-      const BASE_PRICE = 500; // your existing logic
-      baseAmount = BASE_PRICE;
+      baseAmount = legacyPrice;
       finalPrimaryService = serviceId;
-      totalDurationMinutes = 60;
+      totalDurationMinutes = legacyDuration;
+
+      // Same cancellation-tier snapshot rule as the multi-service flow.
+      if (
+        Array.isArray(legacyService.cancellationTiers) &&
+        legacyService.cancellationTiers.length > 0
+      ) {
+        allServiceCancellationTiers.push(legacyService.cancellationTiers);
+      }
     }
 
     else {
@@ -538,6 +632,34 @@ exports.createBooking = async (req, res) => {
         success: false,
         message: "Selected service is not enabled in this pincode",
       });
+    }
+
+    // Advance-only orders (cakes): the scheduled date must be at least
+    // minLeadDays calendar days ahead of today (local server time — same
+    // semantics as buildDateTime/normalizeDateKey). "1 day ahead" means
+    // tomorrow is fine at any hour; today is never allowed.
+    if (maxMinLeadDays > 0) {
+      const now = new Date();
+      const earliestAllowed = new Date(
+        now.getFullYear(),
+        now.getMonth(),
+        now.getDate() + maxMinLeadDays
+      );
+      const sched = new Date(scheduledDate);
+      const scheduledDay = new Date(
+        sched.getFullYear(),
+        sched.getMonth(),
+        sched.getDate()
+      );
+      if (scheduledDay.getTime() < earliestAllowed.getTime()) {
+        return res.status(400).json({
+          success: false,
+          message:
+            maxMinLeadDays === 1
+              ? "Cake orders must be placed at least 1 day in advance. Please pick tomorrow or later."
+              : `This order must be placed at least ${maxMinLeadDays} days in advance.`,
+        });
+      }
     }
 
       /* =====================
@@ -642,6 +764,13 @@ exports.createBooking = async (req, res) => {
       payment: { status: "PENDING" },
       status: "PENDING_PAYMENT",
       cancellationTiersSnapshot,
+      cancellationPolicyTypeSnapshot: sinceBookingPolicy ? "SINCE_BOOKING" : "BEFORE_SERVICE",
+      sinceBookingTiersSnapshot: sinceBookingPolicy
+        ? sinceBookingPolicy.tiers.map((t) => ({
+            maxHoursAfterBooking: Number(t.maxHoursAfterBooking),
+            refundPercent: Number(t.refundPercent),
+          }))
+        : [],
     };
 
     const session = await mongoose.startSession();
@@ -949,6 +1078,31 @@ const PARTNER_REPORT_ISSUE_TYPES = [
 // these, both apps surface a cancel button: customer cancels → no refund;
 // partner cancels → penalty. The booking is NOT auto-cancelled.
 const CUSTOMER_FAULT_ISSUE_TYPES = ["CUSTOMER_NOT_AVAILABLE", "CUSTOMER_ASKED_LATER"];
+
+// Partner fields a customer is allowed to see on their own booking. Includes the
+// onboarding selfie so the customer knows who is coming (and can match the face
+// at the door). Shared like name/phone/rating — not gated behind the job-selfie
+// verification feature flag.
+const CUSTOMER_PARTNER_FIELDS = "name phone rating selfieUrl selfieVerificationStatus";
+
+// Only expose the selfie to the customer once the admin has verified it — they
+// should never match against an unverified/rejected photo. Mutates the lean
+// partner object in place (blanks the URL; keeps the status for the UI badge).
+function gateSelfieForCustomer(p) {
+  if (p && String(p.selfieVerificationStatus || "").toUpperCase() !== "APPROVED") {
+    p.selfieUrl = "";
+  }
+  return p;
+}
+
+function gateBookingSelfies(booking) {
+  if (!booking) return booking;
+  if (booking.partner) gateSelfieForCustomer(booking.partner);
+  if (Array.isArray(booking.additionalPartners)) {
+    booking.additionalPartners.forEach(gateSelfieForCustomer);
+  }
+  return booking;
+}
 
 exports.reportBookingIssue = async (req, res) => {
   try {
@@ -1287,12 +1441,30 @@ exports.completeBooking = async (req, res) => {
           return res.status(400).json({ success: false, message: "You have already completed your part." });
         }
 
+        // CREDIT BEFORE MARKING COMPLETE (crash safety). creditWallet is
+        // idempotent per { partner, booking } via the unique job_payment
+        // ledger index, so a concurrent double-tap can only ever write one
+        // credit. Crediting first means a crash between the two steps leaves
+        // the allocation un-completed — the partner's retry re-runs
+        // creditWallet (no-op) and then marks the allocation. The old order
+        // (mark COMPLETED first, credit second) permanently lost the
+        // partner's share if the process died in between: the COMPLETED
+        // allocation blocked the retry and no cron reconciled it.
+        currentPartnerShare = roundAmount(settlement.partnerEarningAmount * allocation.payoutRatio);
+        await creditWallet({
+          partnerId: partnerId,
+          amount: currentPartnerShare,
+          reason: "job_payment",
+          bookingId: booking._id,
+          description: `Earning from booking #${booking._id} (Pending 48h Settlement)`,
+          bucket: "pending",
+        });
+
         // ATOMIC ARRAY UPDATE: the $elemMatch guard requires this partner's
         // allocation to be not-yet-COMPLETED. Two concurrent completeBooking
         // calls from the same partner therefore can't both pass — only the
-        // first flips the element and reaches the payout below. The earlier
-        // allocation.status check is a stale in-memory read and cannot stop a
-        // true concurrent double-tap; this guard does.
+        // first flips the element and proceeds. The loser 409s, but the
+        // wallet stays correct because the credit above is idempotent.
         const arrayUpdate = await Booking.findOneAndUpdate(
           {
             _id: bookingId,
@@ -1306,17 +1478,7 @@ exports.completeBooking = async (req, res) => {
           return res.status(409).json({ success: false, message: "Booking state changed. Please refresh." });
         }
 
-        // Pay this individual immediately
-        currentPartnerShare = roundAmount(settlement.partnerEarningAmount * allocation.payoutRatio);
-        await creditWallet({
-          partnerId: partnerId,
-          amount: currentPartnerShare,
-          reason: "job_payment",
-          bookingId: booking._id,
-          description: `Earning from booking #${booking._id} (Pending 48h Settlement)`,
-          bucket: "pending",
-        });
-        
+
         // Free their individual calendar
         await syncPartnerOperationalState(partnerId);
 
@@ -1850,6 +2012,28 @@ function mergeCancellationTiers(tiersArrays) {
     .sort((a, b) => b.minHoursBefore - a.minHoursBefore);
 }
 
+// SINCE_BOOKING policy (cakes): refund keyed on hours ELAPSED since the
+// booking was created, not hours remaining until the service. Tiers ascend by
+// maxHoursAfterBooking; the first tier the elapsed time fits under wins.
+// e.g. [{1, 100}, {8760, 50}] → within 1h of booking = 100%, afterwards = 50%.
+function calculateSinceBookingRefund(totalAmount, hoursSinceBooking, tiers) {
+  if (!Array.isArray(tiers) || tiers.length === 0) return { percent: 0, amount: 0 };
+  const sorted = [...tiers].sort(
+    (a, b) => Number(a.maxHoursAfterBooking) - Number(b.maxHoursAfterBooking)
+  );
+  for (const tier of sorted) {
+    if (hoursSinceBooking <= Number(tier.maxHoursAfterBooking)) {
+      const percent = Number(tier.refundPercent) || 0;
+      return { percent, amount: Math.round(totalAmount * percent / 100) };
+    }
+  }
+  // Elapsed time beyond the last tier — apply the final (least generous) tier
+  // rather than silently refunding 0%.
+  const last = sorted[sorted.length - 1];
+  const percent = Number(last.refundPercent) || 0;
+  return { percent, amount: Math.round(totalAmount * percent / 100) };
+}
+
 // Resolves refund percent from tiers sorted descending by minHoursBefore.
 function calculateRefund(totalAmount, hoursToService, tiers) {
   if (hoursToService < 0) return { percent: 0, amount: 0 };
@@ -1910,6 +2094,20 @@ exports.cancelBookingByUser = async (req, res) => {
         // of rescheduling, they get a FULL refund with no late-cancellation penalty,
         // even though the original slot time has already passed (hoursToService < 0).
         refund = { percent: 100, amount: Number(booking.totalAmount || 0) };
+      } else if (
+        booking.cancellationPolicyTypeSnapshot === "SINCE_BOOKING" &&
+        Array.isArray(booking.sinceBookingTiersSnapshot) &&
+        booking.sinceBookingTiersSnapshot.length > 0
+      ) {
+        // Cake orders: refund depends on how long ago the booking was placed
+        // (free-cancel window right after booking), not on time to service.
+        const hoursSinceBooking =
+          (Date.now() - new Date(booking.createdAt).getTime()) / (1000 * 60 * 60);
+        refund = calculateSinceBookingRefund(
+          Number(booking.totalAmount || 0),
+          hoursSinceBooking,
+          booking.sinceBookingTiersSnapshot
+        );
       } else {
         refund = calculateRefund(
           Number(booking.totalAmount || 0),
@@ -1937,10 +2135,44 @@ exports.cancelBookingByUser = async (req, res) => {
     );
 
     if (!updatedBooking) {
-      return res.status(409).json({ 
-        success: false, 
-        message: "Booking state changed during cancellation. Please refresh." 
+      return res.status(409).json({
+        success: false,
+        message: "Booking state changed during cancellation. Please refresh."
       });
+    }
+
+    // Instant refund for the free-cancel window (cake orders cancelled within
+    // 1h of booking, 100% refund) — the customer shouldn't have to wait for
+    // manual back-office processing when they're getting their money back in
+    // full. Any other tier/percent still goes through the existing manual
+    // PENDING → back-office flow. Falls back to PENDING on any Razorpay error;
+    // the cancellation itself has already succeeded above regardless.
+    if (
+      refund.amount > 0 &&
+      refund.percent === 100 &&
+      booking.cancellationPolicyTypeSnapshot === "SINCE_BOOKING" &&
+      booking.payment?.razorpay_payment_id &&
+      process.env.RAZORPAY_KEY_ID &&
+      process.env.RAZORPAY_KEY_SECRET
+    ) {
+      try {
+        const Razorpay = require("razorpay");
+        const razorpay = new Razorpay({
+          key_id: process.env.RAZORPAY_KEY_ID,
+          key_secret: process.env.RAZORPAY_KEY_SECRET,
+        });
+        await razorpay.payments.refund(booking.payment.razorpay_payment_id, {
+          amount: Math.round(refund.amount * 100),
+        });
+        await Booking.updateOne(
+          { _id: booking._id },
+          { $set: { refundStatus: "PROCESSED", refundProcessedAt: new Date() } }
+        );
+        updatedBooking.refundStatus = "PROCESSED";
+      } catch (refundErr) {
+        console.error(`[refund] Auto-refund failed for booking ${booking._id}:`, refundErr.message);
+        // Leave refundStatus as PENDING (already set above) for manual processing.
+      }
     }
 
     await releaseSlotCapacityByBookingId(booking._id, {
@@ -2065,12 +2297,14 @@ exports.getMyBookings = async (req, res) => {
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limit)
-        .populate("partner", "name phone")
+        .populate("partner", CUSTOMER_PARTNER_FIELDS)
         .populate("services.serviceId", "name imageUrl duration")
         .populate("primaryService", "name imageUrl duration")
         .lean(),
       Booking.countDocuments({ user: req.user._id }),
     ]);
+
+    bookings.forEach(gateBookingSelfies);
 
     res.json({
       success: true,
@@ -2200,23 +2434,19 @@ exports.respondToEstimate = async (req, res) => {
 
 exports.getBookingById = async (req, res) => {
   try {
-    // When job selfie verification is on, include the partner's onboarding
-    // photo so the customer can match the face at the door.
-    const partnerFields = (await getJobSelfieFlag())
-      ? "name phone rating selfieUrl selfieVerificationStatus"
-      : "name phone rating";
-
     const booking = await Booking.findOne({
       _id: req.params.bookingId,
       user: req.user._id,
     })
-      .populate("partner", partnerFields)
-      .populate("additionalPartners", partnerFields)
+      .populate("partner", CUSTOMER_PARTNER_FIELDS)
+      .populate("additionalPartners", CUSTOMER_PARTNER_FIELDS)
       .lean();
 
     if (!booking) {
       return res.status(404).json({ success: false, message: "Booking not found" });
     }
+
+    gateBookingSelfies(booking);
 
     // Surface the latest unresolved "customer-fault" on-site report while the
     // partner is still at the door (ARRIVED), so the app can show a clear
@@ -2267,6 +2497,43 @@ exports.rescheduleBooking = async (req, res) => {
       return res.status(400).json({ success: false, message: "Please select a future time slot" });
     }
 
+    const newEnd = new Date(
+      newStart.getTime() + (booking.estimatedDurationMinutes || 60) * 60 * 1000
+    );
+
+    // Free the old slot's reserved capacity — the old window is dead whether
+    // or not the new reservation succeeds (NEEDS_RESCHEDULING is only entered
+    // after the original window already failed). Previously the old units were
+    // never released AND the new slot was never reserved, so reschedules both
+    // leaked capacity and could oversell the new window.
+    await releaseSlotCapacityByBookingId(booking._id, {
+      releaseReason: "rescheduled",
+    });
+
+    // Reserve capacity in the NEW slot — same oversell guarantee that
+    // createBooking gives. 409 if the chosen window is already full.
+    try {
+      await reserveSlotCapacityForBooking({
+        ...booking.toObject(),
+        scheduledDate: new Date(scheduledDate),
+        scheduledTime,
+        scheduledStartAt: newStart,
+        scheduledEndAt: newEnd,
+      });
+    } catch (reserveError) {
+      const code = reserveError?.statusCode === 409 ? 409 : reserveError?.statusCode || 500;
+      if (code !== 409) console.error("rescheduleBooking reserve error:", reserveError);
+      return res.status(code).json({
+        success: false,
+        message: reserveError.message || "Selected slot is no longer available",
+      });
+    }
+
+    // The booking is already paid (partners are only ever assigned after
+    // payment), so convert the fresh reservation to a permanent hold now —
+    // otherwise the 10-minute payment-lock cleanup cron would reap it.
+    await markSlotLockPaid(booking._id);
+
     // Atomic, guarded transition: apply the new slot only if the booking is STILL
     // NEEDS_RESCHEDULING. This optimistic lock stops a concurrent reassign (full-doc save)
     // from clobbering the reschedule, and vice-versa. Old-slot values come from the read
@@ -2280,10 +2547,14 @@ exports.rescheduleBooking = async (req, res) => {
           scheduledDate: new Date(scheduledDate),
           scheduledTime: scheduledTime,
           scheduledStartAt: newStart,
-          scheduledEndAt: new Date(newStart.getTime() + (booking.estimatedDurationMinutes || 60) * 60 * 1000),
+          scheduledEndAt: newEnd,
           status: "SEARCHING",
           partner: null,
           ackReceivedAt: null,
+          // The reservation above is a paid/permanent hold — clear the
+          // payment-lock expiry fields reserveSlotCapacityForBooking wrote.
+          lockedUntil: null,
+          slotReservationExpiresAt: null,
           // The customer chose to wait for a new slot — if it can't be filled, escalate to
           // ops, do NOT auto-cancel them out (clears any flag left by an earlier partner cancel).
           autoRefundIfUnassigned: false,
@@ -2293,12 +2564,20 @@ exports.rescheduleBooking = async (req, res) => {
     );
 
     if (!rescheduled) {
+      // Roll back the fresh reservation — the booking moved on concurrently
+      // (e.g. the user cancelled in another tab). Idempotent, so a concurrent
+      // cancel's own release racing this one is harmless.
+      await releaseSlotCapacityByBookingId(booking._id, {
+        releaseReason: "reschedule_race_rollback",
+      });
       return res.status(409).json({ success: false, message: "Booking state changed — please refresh and try again." });
     }
 
-    // Clear slot cache for both old and new pincode/date
-    const { clearSlotCache } = require("../services/scheduling_service");
+    // Clear slot cache for both old and new dates
     clearSlotCache(booking.pincode, scheduledDate);
+    if (booking.scheduledDate) {
+      clearSlotCache(booking.pincode, booking.scheduledDate);
+    }
 
     // Notify customer
     if (global.io) {

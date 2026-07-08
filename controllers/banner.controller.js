@@ -4,6 +4,12 @@ const Banner = require("../models/Banner");
 const asString = (value, fallback = "") => String(value ?? fallback).trim();
 const normalizePlacement = (value) => asString(value || "home").toLowerCase();
 
+const VALID_PLATFORMS = new Set(["all", "web", "app"]);
+const normalizePlatform = (value) => {
+  const v = asString(value || "all").toLowerCase();
+  return VALID_PLATFORMS.has(v) ? v : "all";
+};
+
 const isVisibleNow = (banner, now = new Date()) => {
   if (banner?.isActive === false) return false;
   if (banner?.startsAt && new Date(banner.startsAt) > now) return false;
@@ -17,6 +23,7 @@ const buildPatch = (body = {}) => {
   if (body.imageUrl !== undefined) patch.imageUrl = asString(body.imageUrl);
   if (body.linkUrl !== undefined) patch.linkUrl = asString(body.linkUrl);
   if (body.placement !== undefined) patch.placement = normalizePlacement(body.placement);
+  if (body.platform !== undefined) patch.platform = normalizePlatform(body.platform);
   if (body.sortOrder !== undefined) patch.sortOrder = Number(body.sortOrder) || 0;
   if (body.displayDurationSeconds !== undefined) {
     patch.displayDurationSeconds = Math.max(Number(body.displayDurationSeconds) || 5, 1);
@@ -27,9 +34,19 @@ const buildPatch = (body = {}) => {
   return patch;
 };
 
-async function listBanners({ placement = "home", activeOnly = true } = {}) {
+async function listBanners({ placement = "home", platform = null, activeOnly = true } = {}) {
   const query = { placement: normalizePlacement(placement) };
   if (activeOnly) query.isActive = true;
+  // Scope to a specific client when asked, but still include "all"-targeted
+  // banners and legacy rows saved before this field existed (no platform key
+  // at all) — otherwise every banner created before this feature would
+  // silently stop appearing once callers start passing a platform.
+  if (platform && platform !== "all") {
+    query.$or = [
+      { platform: { $in: [platform, "all"] } },
+      { platform: { $exists: false } },
+    ];
+  }
   const rows = await Banner.find(query).sort({ sortOrder: 1, createdAt: 1 }).lean();
   return activeOnly ? rows.filter((banner) => isVisibleNow(banner)) : rows;
 }
@@ -37,8 +54,13 @@ async function listBanners({ placement = "home", activeOnly = true } = {}) {
 exports.getPublicBanners = async (req, res) => {
   try {
     const placement = req.query.placement || "home";
-    const banners = await listBanners({ placement, activeOnly: true });
-    return res.json({ success: true, data: banners });
+    const platform = req.query.platform ? normalizePlatform(req.query.platform) : null;
+    const banners = await listBanners({ placement, platform, activeOnly: true });
+    // `banners` is a compat alias — both the app and web already read
+    // res.data.banners (a key this endpoint never actually returned), so the
+    // banner carousel has never rendered on either client. `data` matches the
+    // {success,data,error} shape every other endpoint in this file uses.
+    return res.json({ success: true, data: banners, banners });
   } catch (error) {
     return res.status(500).json({
       success: false,
@@ -83,6 +105,7 @@ exports.createBanner = async (req, res) => {
       imageUrl,
       linkUrl: asString(req.body.linkUrl),
       placement: normalizePlacement(req.body.placement || "home"),
+      platform: normalizePlatform(req.body.platform || "all"),
       sortOrder: Number(req.body.sortOrder) || 0,
       displayDurationSeconds: Math.max(Number(req.body.displayDurationSeconds) || 5, 1),
       isActive: req.body.isActive !== undefined ? Boolean(req.body.isActive) : true,

@@ -89,6 +89,24 @@ const bookingSchema = new mongoose.Schema(
         // For analytics + assignment + UI
         category: String,
         subCategory: String,
+
+        // Per-order customization snapshot (cakes) — resolved and priced
+        // server-side at booking time; addon prices frozen here.
+        options: {
+          flavour: String,
+          weight: String, // e.g. "1 kg" — resolved against Service.customization.weights
+          tiers: Number, // 1 | 2
+          addons: [
+            {
+              name: String,
+              price: Number,
+            },
+          ],
+          nameOnCake: { type: String, trim: true, maxlength: 40 },
+          // Customer-uploaded "make it look like this" photo — display only,
+          // not validated against any config (unlike flavour/weight/addons).
+          referencePhotoUrl: { type: String, trim: true },
+        },
       },
     ],
 
@@ -432,6 +450,26 @@ const bookingSchema = new mongoose.Schema(
       default: [],
     },
 
+    // BEFORE_SERVICE (default): refund from cancellationTiersSnapshot, keyed
+    // on hours remaining until the service. SINCE_BOOKING (cakes): refund from
+    // sinceBookingTiersSnapshot, keyed on hours elapsed since booking creation.
+    cancellationPolicyTypeSnapshot: {
+      type: String,
+      enum: ["BEFORE_SERVICE", "SINCE_BOOKING"],
+      default: "BEFORE_SERVICE",
+    },
+
+    // Ascending by maxHoursAfterBooking; first matching tier wins.
+    sinceBookingTiersSnapshot: {
+      type: [
+        {
+          maxHoursAfterBooking: { type: Number },
+          refundPercent:        { type: Number },
+        },
+      ],
+      default: [],
+    },
+
     /* ======================
        REFUND (for user cancels)
     ====================== */
@@ -471,6 +509,14 @@ const bookingSchema = new mongoose.Schema(
       default: null,
     },
 
+    // Set once the day-before "cake order due tomorrow" push has gone out to
+    // the assigned baker. Separate from preJobReminderSentAt, which fires only
+    // ~30 min before service — cake orders need an earlier heads-up.
+    cakeReminderSentAt: {
+      type: Date,
+      default: null,
+    },
+
     /* ======================
        POST-COMPLETION
     ====================== */
@@ -500,6 +546,17 @@ const bookingSchema = new mongoose.Schema(
     // Set when partner sends acknowledgeJob or acceptJob socket event.
     // handleAckTimeout checks this instead of an in-memory Set so restarts don't cause false reassignments.
     ackReceivedAt: {
+      type: Date,
+      default: null,
+    },
+
+    // When the current partner was attached (reset on every reassignment).
+    // Anchors the ACK deadline for ADVANCE assignments (start >3h away, e.g.
+    // cake orders assigned at payment): the partner may legitimately be
+    // offline, so instead of the 2-minute socket timer they get
+    // ADVANCE_ACK_WINDOW_MS from this timestamp to acknowledge — enforced by
+    // the enforceAdvanceAckDeadlines cron, restart-safe by construction.
+    assignedAt: {
       type: Date,
       default: null,
     },

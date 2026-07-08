@@ -8,10 +8,50 @@ const {
   sendOtp: sendOtpViaMsg91,
   verifyOtp: verifyOtpViaMsg91,
   verifyAccessToken: verifyMsg91AccessToken,
+  phoneMatchesVerified,
 } = require("../services/msg91Otp.service");
 
 const PARTNER_TOKEN_TTL = String(process.env.PARTNER_JWT_TTL || "90d");
 const IS_PRODUCTION = String(process.env.NODE_ENV || "").toLowerCase() === "production";
+
+// Phone-binding enforcement for the MSG91 access-token flows (register / login
+// exchange / password reset). The MSG91 token only proves that *some* phone
+// completed OTP — without binding it to the claimed number, a valid token for
+// one phone could be replayed to log in as, or reset the password of, ANY
+// partner (account takeover). Mirrors the customer flow in userOtp.controller.js.
+//   "enforce" (default) — reject when the verified phone differs from the claim.
+//   "off"               — skip the check (emergency kill-switch).
+const PHONE_BINDING_MODE = String(process.env.MSG91_PHONE_BINDING || "enforce").toLowerCase();
+
+const lastFour = (value) => {
+  const d = String(value || "").replace(/\D/g, "");
+  return d ? `…${d.slice(-4)}` : "(none)";
+};
+
+// True when the exchange must be REJECTED (verified phone ≠ claimed phone).
+// Fails OPEN (returns false) when no phone can be recovered from MSG91, so a
+// change in MSG91's response format degrades protection and logs loudly rather
+// than locking every partner out.
+const isPhoneBindingMismatch = (verification, phone) => {
+  if (PHONE_BINDING_MODE === "off") return false;
+  const verifiedPhones = verification?.verifiedPhones || [];
+  if (verifiedPhones.length === 0) {
+    console.error(
+      "[partner-auth] MSG91 phone binding could not be checked — no phone in token/response. Allowing for",
+      lastFour(phone)
+    );
+    return false;
+  }
+  if (!phoneMatchesVerified(verifiedPhones, phone)) {
+    console.warn(
+      "[partner-auth] MSG91 phone binding mismatch — rejected. claimed=%s verified=%s",
+      lastFour(phone),
+      verifiedPhones.map(lastFour).join(",")
+    );
+    return true;
+  }
+  return false;
+};
 
 /* =====================================================
    REGISTER PARTNER (UPDATED FOR PRODUCTION)
@@ -56,7 +96,13 @@ exports.registerPartner = async (req, res) => {
       String(process.env.SKIP_MSG91_SERVER_VERIFY || "").toLowerCase() === "true";
 
     if (!skipServerVerify) {
-      await verifyMsg91AccessToken(accessToken);
+      const verification = await verifyMsg91AccessToken(accessToken);
+      if (isPhoneBindingMismatch(verification, phone)) {
+        return res.status(401).json({
+          success: false,
+          message: "Phone number does not match the verified OTP",
+        });
+      }
     }
 
     const existing = await Partner.findOne({ phone });
@@ -308,7 +354,13 @@ exports.exchangePartnerMsg91AccessToken = async (req, res) => {
         "true";
 
     if (!skipServerVerify) {
-      await verifyMsg91AccessToken(accessToken);
+      const verification = await verifyMsg91AccessToken(accessToken);
+      if (isPhoneBindingMismatch(verification, phone)) {
+        return res.status(401).json({
+          success: false,
+          message: "Phone number does not match the verified OTP",
+        });
+      }
     }
 
     const partner = await Partner.findOne({ phone }).select("+password");
@@ -383,7 +435,13 @@ exports.resetPartnerPasswordWithMsg91 = async (req, res) => {
         "true";
 
     if (!skipServerVerify) {
-      await verifyMsg91AccessToken(accessToken);
+      const verification = await verifyMsg91AccessToken(accessToken);
+      if (isPhoneBindingMismatch(verification, phone)) {
+        return res.status(401).json({
+          success: false,
+          message: "Phone number does not match the verified OTP",
+        });
+      }
     }
 
     const partner = await Partner.findOne({ phone }).select("+password");

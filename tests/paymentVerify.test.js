@@ -137,6 +137,31 @@ describe("verifyRazorpayPayment", () => {
     expect(finalizePaidBooking).not.toHaveBeenCalled();
   });
 
+  test("rejects a valid signature for an order that isn't this booking's (order-binding guard)", async () => {
+    // The booking was created with order_test_123. The attacker submits a
+    // DIFFERENT order they legitimately paid (e.g. a cheap booking's order),
+    // with a genuine signature for that order. Signature is valid, but the order
+    // doesn't belong to this booking — must be rejected, never finalized.
+    const booking = await makeBooking();
+    const otherOrder = "order_attacker_cheap_999";
+    const req = {
+      user: { _id: booking.user },
+      body: {
+        bookingId: booking._id.toString(),
+        razorpay_order_id: otherOrder,
+        razorpay_payment_id: "pay_attacker_999",
+        razorpay_signature: sign(otherOrder, "pay_attacker_999"),
+      },
+    };
+    const res = mockRes();
+
+    await verifyRazorpayPayment(req, res);
+
+    expect(res.statusCode).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(finalizePaidBooking).not.toHaveBeenCalled();
+  });
+
   test("accepts a correctly signed payment and finalizes it", async () => {
     const booking = await makeBooking();
     const sig = sign("order_test_123", "pay_test_123");

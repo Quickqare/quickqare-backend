@@ -1,5 +1,6 @@
 const jwt = require("jsonwebtoken");
 const User = require("../models/User");
+const { readCookie, USER_TOKEN_COOKIE } = require("../utils/authCookie");
 
 /* =====================================================
    USER AUTH MIDDLEWARE (PRODUCTION SAFE)
@@ -7,26 +8,24 @@ const User = require("../models/User");
 module.exports = async (req, res, next) => {
   try {
     /* =====================
-       CHECK AUTH HEADER
+       EXTRACT TOKEN
+       Mobile apps send the JWT as `Authorization: Bearer <token>`; the web app
+       sends it as an httpOnly cookie. Accept either — Bearer takes precedence.
     ===================== */
     const authHeader = req.headers.authorization;
+    let token = null;
 
-    if (!authHeader || !authHeader.startsWith("Bearer ")) {
-      return res.status(401).json({
-        success: false,
-        message: "Authorization token required",
-      });
+    if (authHeader && authHeader.startsWith("Bearer ")) {
+      token = authHeader.split(" ")[1];
     }
-
-    /* =====================
-       EXTRACT TOKEN
-    ===================== */
-    const token = authHeader.split(" ")[1];
+    if (!token) {
+      token = readCookie(req.headers.cookie, USER_TOKEN_COOKIE);
+    }
 
     if (!token) {
       return res.status(401).json({
         success: false,
-        message: "Invalid authorization format",
+        message: "Authorization token required",
       });
     }
 
@@ -74,6 +73,19 @@ module.exports = async (req, res, next) => {
       return res.status(401).json({
         success: false,
         message: "User not found",
+      });
+    }
+
+    /* =====================
+       BLOCKED USER CHECK
+       A valid token alone isn't enough — re-check the account status on every
+       request so an admin block takes effect immediately, instead of the user
+       keeping access until their (90-day) token expires.
+    ===================== */
+    if (user.status === "BLOCKED") {
+      return res.status(403).json({
+        success: false,
+        message: "Your account has been blocked. Please contact support.",
       });
     }
 

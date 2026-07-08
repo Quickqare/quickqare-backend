@@ -49,6 +49,9 @@ router.patch("/settings", audit("admin.settings.update"), async (req, res) => {
     if (req.body.useH3Zones !== undefined) {
       settings.useH3Zones = Boolean(req.body.useH3Zones);
     }
+    if (req.body.defaultBannerEnabled !== undefined) {
+      settings.defaultBannerEnabled = Boolean(req.body.defaultBannerEnabled);
+    }
 
     // Pricing (platform fee + tax). Clamped to sane ranges.
     if (req.body.pricing !== undefined && typeof req.body.pricing === "object") {
@@ -93,9 +96,27 @@ router.patch("/settings", audit("admin.settings.update"), async (req, res) => {
           mehendiShimmer:     ci.mehendiShimmer     !== undefined ? Boolean(ci.mehendiShimmer)     : (cur.mehendiShimmer     !== false),
           electrician:        typeof ci.electrician === "string" ? ci.electrician.slice(0, 512) : (cur.electrician || ""),
           electricianShimmer: ci.electricianShimmer !== undefined ? Boolean(ci.electricianShimmer) : (cur.electricianShimmer !== false),
+          celebration:        typeof ci.celebration === "string" ? ci.celebration.slice(0, 512) : (cur.celebration || ""),
+          celebrationShimmer: ci.celebrationShimmer !== undefined ? Boolean(ci.celebrationShimmer) : (cur.celebrationShimmer !== false),
         };
         settings.markModified("homeTheme.categoryIcons");
       }
+    }
+
+    // Social media links (footer icons). Each is optional — an empty string
+    // hides that icon on the client rather than showing a dead link.
+    if (req.body.socialLinks !== undefined && typeof req.body.socialLinks === "object") {
+      const s = req.body.socialLinks;
+      const url = (v) => (typeof v === "string" ? v.trim().slice(0, 512) : "");
+      const cur = settings.socialLinks || {};
+      settings.socialLinks = {
+        whatsapp:  s.whatsapp  !== undefined ? url(s.whatsapp)  : (cur.whatsapp  || ""),
+        instagram: s.instagram !== undefined ? url(s.instagram) : (cur.instagram || ""),
+        facebook:  s.facebook  !== undefined ? url(s.facebook)  : (cur.facebook  || ""),
+        twitter:   s.twitter   !== undefined ? url(s.twitter)   : (cur.twitter   || ""),
+        youtube:   s.youtube   !== undefined ? url(s.youtube)   : (cur.youtube   || ""),
+      };
+      settings.markModified("socialLinks");
     }
 
     settings.updatedByAdminId = req.adminUser.id;
@@ -123,6 +144,8 @@ router.patch("/settings", audit("admin.settings.update"), async (req, res) => {
           mehendiShimmer:     t.categoryIcons?.mehendiShimmer     !== false,
           electrician:        t.categoryIcons?.electrician ?? "",
           electricianShimmer: t.categoryIcons?.electricianShimmer !== false,
+          celebration:        t.categoryIcons?.celebration ?? "",
+          celebrationShimmer: t.categoryIcons?.celebrationShimmer !== false,
         },
       });
     }

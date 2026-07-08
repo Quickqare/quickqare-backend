@@ -28,6 +28,18 @@ DRIVERS
 
 const ACK_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
 
+// A booking whose start is further away than this is an ADVANCE assignment
+// (cake orders assigned at payment, evening payments for a morning slot, …).
+// The partner may legitimately be offline when it lands, so the 2-minute
+// timer does not apply — they get ADVANCE_ACK_WINDOW_MS from assignedAt to
+// acknowledge, capped at T-ADVANCE_IMMINENT_MS. Enforced by the
+// enforceAdvanceAckDeadlines cron; guarded here too so any stray timer/queue
+// fire (post-restart resume, duplicate BullMQ job) is a safe no-op.
+// ADVANCE_IMMINENT_MS deliberately matches the QUEUED dispatch window
+// (DISPATCH_HOURS_BEFORE in cron.service.js).
+const ADVANCE_IMMINENT_MS = 3 * 60 * 60 * 1000; // 3 hours
+const ADVANCE_ACK_WINDOW_MS = 12 * 60 * 60 * 1000; // 12 hours
+
 /* Statuses that mean the booking is already handled */
 const TERMINAL_OR_ACCEPTED_STATUSES = new Set([
   "CONFIRMED",       // Auto-accepted — partner opted in, no manual ACK needed
@@ -48,7 +60,7 @@ async function handleAckTimeout(bookingId, partnerId) {
   try {
     const Booking = require("../models/Booking");
     const booking = await Booking.findById(bookingId)
-      .select("status ackReceivedAt")
+      .select("status ackReceivedAt assignedAt scheduledStartAt scheduledDate scheduledTime")
       .lean();
 
     if (!booking) return;
@@ -58,6 +70,26 @@ async function handleAckTimeout(bookingId, partnerId) {
 
     // Booking already progressed past the ACK gate
     if (TERMINAL_OR_ACCEPTED_STATUSES.has(booking.status)) return;
+
+    // ADVANCE assignment whose wider window is still open → not a timeout.
+    // The enforceAdvanceAckDeadlines cron re-fires this handler once the
+    // window closes (12h after assignment, or T-3h — whichever is earlier).
+    // Legacy rows without assignedAt fall through to the old behaviour.
+    let scheduledStart = booking.scheduledStartAt ? new Date(booking.scheduledStartAt) : null;
+    if (!scheduledStart && booking.scheduledDate && booking.scheduledTime) {
+      try {
+        const { buildDateTime } = require("./scheduling_service");
+        scheduledStart = buildDateTime(booking.scheduledDate, booking.scheduledTime);
+      } catch (_) { /* fall through — treated as imminent */ }
+    }
+    if (
+      scheduledStart &&
+      scheduledStart.getTime() - Date.now() > ADVANCE_IMMINENT_MS &&
+      booking.assignedAt &&
+      Date.now() - new Date(booking.assignedAt).getTime() < ADVANCE_ACK_WINDOW_MS
+    ) {
+      return;
+    }
 
     console.warn(
       `[ack-timeout] Booking ${bookingId} unacknowledged by partner ${partnerId}. Triggering reassignment.`
@@ -294,4 +326,7 @@ init().catch((err) =>
 module.exports = {
   scheduleAckTimeout,
   cancelAckTimeout,
+  handleAckTimeout,
+  ADVANCE_IMMINENT_MS,
+  ADVANCE_ACK_WINDOW_MS,
 };

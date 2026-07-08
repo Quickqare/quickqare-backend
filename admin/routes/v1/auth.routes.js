@@ -1,10 +1,13 @@
 const express = require("express");
+const crypto = require("crypto");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const AdminUser = require("../../models/AdminUser");
 const AdminSession = require("../../models/AdminSession");
+const AuditLog = require("../../models/AuditLog");
 const authenticateAdmin = require("../../middleware/authenticateAdmin");
 const audit = require("../../middleware/audit");
+const { authLimiter } = require("../../../middlewares/rateLimiter");
 const { getPermissionsForRole } = require("../../constants/permissions");
 const { asSingleString } = require("../../utils/common");
 const { sendAdminTwoFaCode } = require("../../services/email.service");
@@ -21,7 +24,33 @@ const {
 
 const router = express.Router();
 
-router.post("/login", audit("admin.auth.login"), async (req, res) => {
+const IS_PRODUCTION = String(process.env.NODE_ENV || "").toLowerCase() === "production";
+
+// Max wrong 2FA codes allowed per challenge before it is locked (forces re-login).
+const MAX_2FA_ATTEMPTS = 5;
+
+// Audit pre-auth attempts (login / 2FA) directly. The generic audit() middleware
+// no-ops here because it runs before authentication (no req.adminUser yet), and
+// it would also capture the raw request body — which includes the password. This
+// helper logs only safe fields and never touches the password.
+async function logAuthEvent(req, action, outcome, extra = {}) {
+  try {
+    await AuditLog.create({
+      actorAdminId: extra.adminUserId || null,
+      action,
+      entityType: "admin.auth",
+      entityId: null,
+      requestId: req.requestId || "n/a",
+      ipAddress: req.ip || "",
+      userAgent: asSingleString(req.headers["user-agent"]) || "",
+      metadata: JSON.stringify({ outcome, email: extra.email || null }),
+    });
+  } catch (error) {
+    console.error("[admin:auth-audit] failed", error.message);
+  }
+}
+
+router.post("/login", authLimiter, async (req, res) => {
   try {
     const email = String(req.body.email || "").trim().toLowerCase();
     const password = String(req.body.password || "");
@@ -34,6 +63,7 @@ router.post("/login", audit("admin.auth.login"), async (req, res) => {
 
     const admin = await AdminUser.findOne({ email, isActive: true }).select("+passwordHash");
     if (!admin) {
+      await logAuthEvent(req, "admin.auth.login", "invalid_email", { email });
       return fail(res, 401, "INVALID_CREDENTIALS", "Invalid admin credentials", null, {
         requestId: req.requestId,
       });
@@ -41,13 +71,21 @@ router.post("/login", audit("admin.auth.login"), async (req, res) => {
 
     const validPassword = await admin.verifyPassword(password);
     if (!validPassword) {
+      await logAuthEvent(req, "admin.auth.login", "invalid_password", {
+        email,
+        adminUserId: String(admin._id),
+      });
       return fail(res, 401, "INVALID_CREDENTIALS", "Invalid admin credentials", null, {
         requestId: req.requestId,
       });
     }
 
-    const randomCode = String(Math.floor(100000 + Math.random() * 900000));
-    const generatedCode = process.env.ADMIN_2FA_TEST_CODE || randomCode;
+    // A fixed test code (and echoing it back as devCode) is a 2FA bypass — only
+    // ever honour it outside production, regardless of whether the env is set.
+    const allowTestCode = !IS_PRODUCTION && Boolean(process.env.ADMIN_2FA_TEST_CODE);
+    const generatedCode = allowTestCode
+      ? String(process.env.ADMIN_2FA_TEST_CODE)
+      : String(crypto.randomInt(100000, 1000000)); // CSPRNG, always 6 digits
     const twoFaCodeHash = await bcrypt.hash(generatedCode, 10);
 
     const challengeExpiresAt = new Date(Date.now() + CHALLENGE_TTL_SECONDS * 1000);
@@ -74,12 +112,17 @@ router.post("/login", audit("admin.auth.login"), async (req, res) => {
       console.log(`[admin-2fa] code for ${email}: ${generatedCode}`);
     }
 
+    await logAuthEvent(req, "admin.auth.login", "password_ok_2fa_sent", {
+      email,
+      adminUserId: String(admin._id),
+    });
+
     const payload = {
       twoFaRequired: true,
       challengeToken,
       challengeExpiresAt,
-      // Include devCode only when a fixed test code is explicitly set
-      ...(process.env.ADMIN_2FA_TEST_CODE && { devCode: generatedCode }),
+      // Echo the code back only for the non-production test-code path.
+      ...(allowTestCode && { devCode: generatedCode }),
     };
 
     return success(res, payload, { requestId: req.requestId });
@@ -90,7 +133,7 @@ router.post("/login", audit("admin.auth.login"), async (req, res) => {
   }
 });
 
-router.post("/verify-2fa", audit("admin.auth.verify-2fa"), async (req, res) => {
+router.post("/verify-2fa", authLimiter, async (req, res) => {
   try {
     const challengeToken = String(req.body.challengeToken || "");
     const code = String(req.body.code || "");
@@ -115,8 +158,32 @@ router.post("/verify-2fa", audit("admin.auth.verify-2fa"), async (req, res) => {
       });
     }
 
+    // Lock the challenge once too many wrong codes have been tried, so the
+    // 6-digit code can't be brute-forced within the challenge window. The admin
+    // must start a fresh login (rate-limited) to get a new code.
+    if ((session.twoFaAttempts || 0) >= MAX_2FA_ATTEMPTS) {
+      session.isRevoked = true;
+      session.revokedAt = new Date();
+      await session.save();
+      await logAuthEvent(req, "admin.auth.verify-2fa", "locked_too_many_attempts", {
+        adminUserId: String(challengePayload.sub),
+      });
+      return fail(res, 429, "TOO_MANY_2FA_ATTEMPTS", "Too many incorrect codes. Please log in again.", null, {
+        requestId: req.requestId,
+      });
+    }
+
     const validCode = await bcrypt.compare(code, session.twoFaCodeHash || "");
     if (!validCode) {
+      session.twoFaAttempts = (session.twoFaAttempts || 0) + 1;
+      if (session.twoFaAttempts >= MAX_2FA_ATTEMPTS) {
+        session.isRevoked = true;
+        session.revokedAt = new Date();
+      }
+      await session.save();
+      await logAuthEvent(req, "admin.auth.verify-2fa", "invalid_code", {
+        adminUserId: String(challengePayload.sub),
+      });
       return fail(res, 401, "INVALID_2FA_CODE", "Invalid 2FA code", null, {
         requestId: req.requestId,
       });
@@ -129,7 +196,11 @@ router.post("/verify-2fa", audit("admin.auth.verify-2fa"), async (req, res) => {
       });
     }
 
-    const accessToken = signAccessToken({ adminUserId: String(admin._id), role: admin.role });
+    const accessToken = signAccessToken({
+      adminUserId: String(admin._id),
+      role: admin.role,
+      sessionId: String(session._id),
+    });
     const refreshToken = signRefreshToken({
       adminUserId: String(admin._id),
       role: admin.role,
@@ -141,10 +212,16 @@ router.post("/verify-2fa", audit("admin.auth.verify-2fa"), async (req, res) => {
     session.refreshExpiresAt = new Date(Date.now() + REFRESH_TTL_SECONDS * 1000);
     session.twoFaCodeHash = null;
     session.challengeExpiresAt = null;
+    session.twoFaAttempts = 0;
     await session.save();
 
     admin.lastLoginAt = new Date();
     await admin.save();
+
+    await logAuthEvent(req, "admin.auth.verify-2fa", "success", {
+      email: admin.email,
+      adminUserId: String(admin._id),
+    });
 
     return success(
       res,
@@ -167,7 +244,7 @@ router.post("/verify-2fa", audit("admin.auth.verify-2fa"), async (req, res) => {
   }
 });
 
-router.post("/refresh", audit("admin.auth.refresh"), async (req, res) => {
+router.post("/refresh", authLimiter, async (req, res) => {
   try {
     const refreshToken = String(req.body.refreshToken || "");
     if (!refreshToken) {
@@ -204,7 +281,11 @@ router.post("/refresh", audit("admin.auth.refresh"), async (req, res) => {
       });
     }
 
-    const nextAccessToken = signAccessToken({ adminUserId: String(admin._id), role: admin.role });
+    const nextAccessToken = signAccessToken({
+      adminUserId: String(admin._id),
+      role: admin.role,
+      sessionId: String(session._id),
+    });
     const nextRefreshToken = signRefreshToken({
       adminUserId: String(admin._id),
       role: admin.role,

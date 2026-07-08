@@ -4,6 +4,7 @@
 require("dotenv").config();
 
 const logger = require("./utils/logger");
+const { validateEnv } = require("./utils/validateEnv");
 
 /**
  * Process-level safety nets — must be registered before any async code.
@@ -23,6 +24,10 @@ process.on("uncaughtException", (err) => {
   process.exit(1);
 });
 
+// Fail fast on a misconfigured deploy: refuse to boot if core secrets/config
+// (MONGO_URI, JWT_SECRET) are missing, instead of serving 500s at first use.
+validateEnv();
+
 const express = require("express");
 const http = require("http");
 const mongoose = require("mongoose");
@@ -40,6 +45,10 @@ const Partner = require("./models/Partner");
 
 const app = express();
 
+// Validate admin auth secrets at boot. Non-fatal (won't take down the
+// customer/partner APIs) — admin login fails closed if these are missing.
+require("./admin/utils/tokens").assertAdminSecrets();
+
 const parseAllowedOrigins = () => {
   const raw = String(process.env.CORS_ALLOWED_ORIGINS || "").trim();
   if (!raw) return [];
@@ -53,6 +62,32 @@ const parseAllowedOrigins = () => {
 };
 
 const allowedOrigins = parseAllowedOrigins();
+
+const IS_PRODUCTION =
+  String(process.env.NODE_ENV || "").toLowerCase() === "production";
+
+// The exact Netlify site slug for this app (e.g. "quickqare-web" for
+// quickqare-web.netlify.app), if it's served from Netlify. When set, we trust
+// that site and its Netlify deploy previews ("<context>--<slug>.netlify.app"),
+// and NOTHING else on netlify.app / netlify.live. When unset (the default), no
+// *.netlify.app origin is trusted unless listed explicitly in
+// CORS_ALLOWED_ORIGINS.
+//
+// This replaces a substring match ("*quickqare*.netlify.app") that trusted any
+// attacker-registered Netlify site whose name merely contained "quickqare"
+// (e.g. quickqare-phish.netlify.app), from which authenticated cross-origin
+// requests against this API were possible.
+const NETLIFY_SITE_SLUG = String(process.env.NETLIFY_SITE_SLUG || "")
+  .trim()
+  .toLowerCase()
+  .replace(/[^a-z0-9-]/g, "");
+const netlifyOriginRe = NETLIFY_SITE_SLUG
+  ? new RegExp(
+      `^https://([a-z0-9-]+--)?${NETLIFY_SITE_SLUG}\\.netlify\\.(app|live)$`,
+      "i"
+    )
+  : null;
+
 const corsOptions = {
   origin(origin, callback) {
     if (!origin) {
@@ -60,16 +95,14 @@ const corsOptions = {
     }
 
     const isConfiguredOrigin = allowedOrigins.includes(origin);
+    // localhost is trusted only outside production (dev machines / CI). In prod,
+    // a page an attacker gets running on the victim's own localhost must not be
+    // a trusted, credentialed CORS origin.
     const isLocalOrigin =
-      /^http:\/\/localhost:\d+$/.test(origin) ||
-      /^http:\/\/127\.0\.0\.1:\d+$/.test(origin);
-    // Restrict to Netlify subdomains containing "quickqare" — the previous
-    // unrestricted /^[a-zA-Z0-9-]+\.netlify\.app$/ accepted ANY Netlify site,
-    // letting an attacker who hosts code on Netlify make authenticated
-    // cross-origin requests against this API.
-    const isNetlifyOrigin =
-      /^https:\/\/[a-zA-Z0-9-]*quickqare[a-zA-Z0-9-]*\.netlify\.app$/.test(origin) ||
-      /^https:\/\/[a-zA-Z0-9-]*quickqare[a-zA-Z0-9-]*\.netlify\.live$/.test(origin);
+      !IS_PRODUCTION &&
+      (/^http:\/\/localhost:\d+$/.test(origin) ||
+        /^http:\/\/127\.0\.0\.1:\d+$/.test(origin));
+    const isNetlifyOrigin = netlifyOriginRe ? netlifyOriginRe.test(origin) : false;
     const isQuickQareOrigin =
       /^https:\/\/[a-zA-Z0-9-]+\.quickqare\.in$/.test(origin) ||
       origin === "https://quickqare.in" ||
@@ -191,27 +224,8 @@ setSocketIO(io);
 // Optional JWT auth on handshake — clients that send a token get
 // socket.verifiedPartnerId / socket.verifiedUserId attached.
 // Clients without a token still connect (backward compat).
-const jwt = require("jsonwebtoken");
-io.use((socket, next) => {
-  const token = socket.handshake.auth?.token;
-  if (!token) return next();
-  try {
-    const partnerSecret = process.env.PARTNER_JWT_SECRET || process.env.JWT_SECRET;
-    const userSecret = process.env.JWT_SECRET;
-    let payload;
-    try { payload = jwt.verify(token, partnerSecret); } catch (_) {
-      try { payload = jwt.verify(token, userSecret); } catch (__) { return next(); }
-    }
-    // Partner tokens are signed { id, role: "partner" } — check role+id first,
-    // then fall back to a legacy partnerId field if ever used.
-    if (payload?.role === "partner" && (payload?.id || payload?.partnerId)) {
-      socket.verifiedPartnerId = String(payload?.id || payload?.partnerId);
-    } else if (payload?.userId || payload?.sub) {
-      socket.verifiedUserId = String(payload?.userId || payload?.sub);
-    }
-  } catch (_) { /* non-fatal — allow unauthenticated */ }
-  next();
-});
+const { handshakeAuth } = require("./socket/handshakeAuth");
+io.use(handshakeAuth);
 
 // Short-lived dedup set: prevents double-fire of acceptJob on flaky networks.
 // Key = `${partnerId}:${bookingId}`, cleared after 5 s.
@@ -416,3 +430,49 @@ const PORT = process.env.PORT || 4000;
 server.listen(PORT, "0.0.0.0", () => {
   logger.info(`Server started`, { port: PORT, env: process.env.NODE_ENV || "development" });
 });
+
+/* ======================
+   GRACEFUL SHUTDOWN
+   Docker sends SIGTERM on `docker stop` / `docker-compose down` / every
+   redeploy, then SIGKILL ~10s later if the process hasn't exited. Without this,
+   in-flight requests (including a payment verification mid-flight) get cut off
+   instantly instead of finishing.
+====================== */
+
+let shuttingDown = false;
+
+const gracefulShutdown = (signal) => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  logger.info(`${signal} received — shutting down gracefully`);
+
+  // Stop accepting new connections; existing requests are allowed to finish.
+  server.close(() => {
+    logger.info("HTTP server closed");
+
+    io.close(() => {
+      mongoose.connection
+        .close(false)
+        .then(() => {
+          logger.info("MongoDB connection closed — shutdown complete");
+          process.exit(0);
+        })
+        .catch((err) => {
+          logger.error("Error closing MongoDB connection", { error: err.message });
+          process.exit(1);
+        });
+    });
+  });
+
+  // Safety net: if something (a stuck socket, a long-running request) never
+  // resolves, force-exit before Docker's SIGKILL would anyway — this way we
+  // still log that it happened instead of dying silently.
+  setTimeout(() => {
+    logger.error("Graceful shutdown timed out — forcing exit");
+    process.exit(1);
+  }, 10_000).unref();
+};
+
+process.on("SIGTERM", gracefulShutdown);
+process.on("SIGINT", gracefulShutdown); // Ctrl+C during local development

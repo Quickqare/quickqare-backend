@@ -11,8 +11,9 @@ const { completeBooking } = require("./booking.controller");
 const { deriveH3Cell } = require("../utils/h3");
 const {
   filterServicesByZone,
+  filterServicesByHubs,
   resolveZoneForPincode,
-  resolveHubForLocation,
+  resolveHubsForLocation,
 } = require("../services/zone.service");
 const { getUseH3Flag } = require("../services/assignmentEngine");
 
@@ -61,11 +62,38 @@ function toPartnerJobPayload(booking, partnerId, { isPartnerCancelled = false } 
       }))
     : [];
 
+  // Line items with per-order customization (cakes: flavour, tiers, addons,
+  // name on cake) so the partner app can show exactly what to prepare.
+  const services = Array.isArray(booking?.services)
+    ? booking.services.map((s) => ({
+        name: String(s?.name || ""),
+        quantity: Number(s?.quantity || 1),
+        ...(s?.options && (s.options.flavour || s.options.nameOnCake)
+          ? {
+              options: {
+                flavour: String(s.options.flavour || ""),
+                weight: String(s.options.weight || ""),
+                tiers: Number(s.options.tiers) || 1,
+                addons: Array.isArray(s.options.addons)
+                  ? s.options.addons.map((a) => ({
+                      name: String(a?.name || ""),
+                      price: Number(a?.price) || 0,
+                    }))
+                  : [],
+                nameOnCake: String(s.options.nameOnCake || ""),
+                referencePhotoUrl: String(s.options.referencePhotoUrl || ""),
+              },
+            }
+          : {}),
+      }))
+    : [];
+
   return {
     id: String(booking?._id || ""),
     bookingId: String(booking?._id || ""),
     serviceName: String(firstServiceName),
     serviceCategory: booking?.serviceCategory || firstService?.category || "general",
+    services,
     customerName: booking?.user?.name || "Customer",
     customerPhone: booking?.user?.phone || "",
     address: String(booking?.address || "").trim(),
@@ -472,8 +500,14 @@ exports.getAvailableServicesForLocation = async (req, res) => {
 
     const useH3 = await getUseH3Flag();
     let serviceArea;
+    let locationHubs = null; // hub mode: every live hub covering this spot
     if (useH3) {
-      serviceArea = await resolveHubForLocation(latitude, longitude);
+      // Hubs are per-category and may overlap: fetch ALL partner-enabled hubs
+      // covering this cell, not findOne — the services list below is filtered
+      // to exactly these hubs' categories.
+      const hubsHere = await resolveHubsForLocation(latitude, longitude);
+      locationHubs = hubsHere.filter((h) => h.partnerAppEnabled !== false);
+      serviceArea = locationHubs[0] || null;
     } else {
       serviceArea = await resolveZoneForPincode(pincode);
     }
@@ -506,9 +540,12 @@ exports.getAvailableServicesForLocation = async (req, res) => {
       .sort({ createdAt: -1 })
       .lean();
 
-    // filterServicesByZone works for both zones and hubs — both have the same
-    // services structure ({ acRepair, plumbing, mehendi, electrician }).
-    const filteredServices = filterServicesByZone(services, serviceArea);
+    // Hub mode: a hub carries no per-service toggle map (its category IS its
+    // service), so filter to the categories of the hubs actually covering this
+    // spot. Zone mode keeps the zone's services map filter.
+    const filteredServices = useH3
+      ? filterServicesByHubs(services, locationHubs)
+      : filterServicesByZone(services, serviceArea);
 
     return res.json({
       success: true,
@@ -592,6 +629,69 @@ exports.getPartnerAppSettings = async (_req, res) => {
       success: false,
       message: "Server error",
     });
+  }
+};
+
+/**
+ * =====================================================
+ * GET MY UNAVAILABLE DATES
+ * Whole calendar days the partner has blocked off (e.g. a baker's day off).
+ * =====================================================
+ */
+exports.getUnavailableDates = async (req, res) => {
+  try {
+    const dates = Array.isArray(req.partner?.unavailableDates)
+      ? req.partner.unavailableDates
+      : [];
+    return res.json({
+      success: true,
+      unavailableDates: dates.map((d) => new Date(d).toISOString().slice(0, 10)),
+    });
+  } catch (err) {
+    console.error("getUnavailableDates error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
+/**
+ * =====================================================
+ * SET MY UNAVAILABLE DATES
+ * Body: { dates: ["2026-07-10", ...] } — replaces the full list. Past dates
+ * are dropped so the list doesn't grow forever with stale entries.
+ * =====================================================
+ */
+exports.setUnavailableDates = async (req, res) => {
+  try {
+    const rawDates = Array.isArray(req.body?.dates) ? req.body.dates : null;
+    if (!rawDates) {
+      return res.status(400).json({ success: false, message: "dates must be an array" });
+    }
+
+    const todayKey = new Date().toISOString().slice(0, 10);
+    const parsed = [];
+    for (const raw of rawDates) {
+      const key = String(raw || "").slice(0, 10);
+      const date = new Date(key);
+      if (Number.isNaN(date.getTime())) {
+        return res.status(400).json({ success: false, message: `Invalid date: ${raw}` });
+      }
+      if (key < todayKey) continue; // drop past dates
+      parsed.push(date);
+    }
+
+    // De-duplicate by date key.
+    const uniqueByKey = new Map(parsed.map((d) => [d.toISOString().slice(0, 10), d]));
+    const unavailableDates = [...uniqueByKey.values()];
+
+    await Partner.findByIdAndUpdate(req.partner._id, { $set: { unavailableDates } });
+
+    return res.json({
+      success: true,
+      unavailableDates: unavailableDates.map((d) => d.toISOString().slice(0, 10)),
+    });
+  } catch (err) {
+    console.error("setUnavailableDates error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
   }
 };
 

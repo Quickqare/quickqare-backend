@@ -4,6 +4,10 @@ const ReferralSettings = require("../models/ReferralSettings");
 
 const router = express.Router();
 
+const DEFAULT_SOCIAL_LINKS = {
+  whatsapp: "", instagram: "", facebook: "", twitter: "", youtube: "",
+};
+
 const DEFAULT_THEME = {
   isActive: false,
   themeName: "default",
@@ -49,6 +53,16 @@ router.get("/", async (_req, res) => {
         emergencyLockdown: Boolean(settings?.emergencyLockdown ?? false),
       },
       razorpayKeyId: process.env.RAZORPAY_KEY_ID || "",
+      // Web shows a built-in promo banner when no custom banner is live, unless
+      // this is explicitly turned off. Default true (undefined → true).
+      defaultBannerEnabled: settings?.defaultBannerEnabled !== false,
+      socialLinks: {
+        whatsapp:  settings?.socialLinks?.whatsapp  || DEFAULT_SOCIAL_LINKS.whatsapp,
+        instagram: settings?.socialLinks?.instagram || DEFAULT_SOCIAL_LINKS.instagram,
+        facebook:  settings?.socialLinks?.facebook  || DEFAULT_SOCIAL_LINKS.facebook,
+        twitter:   settings?.socialLinks?.twitter   || DEFAULT_SOCIAL_LINKS.twitter,
+        youtube:   settings?.socialLinks?.youtube   || DEFAULT_SOCIAL_LINKS.youtube,
+      },
       homeTheme: {
         isActive:        Boolean(theme.isActive),
         targetPlatform:  theme.targetPlatform  || "both",
@@ -69,6 +83,8 @@ router.get("/", async (_req, res) => {
           mehendiShimmer:     theme.categoryIcons?.mehendiShimmer     !== false,
           electrician:        theme.categoryIcons?.electrician ?? "",
           electricianShimmer: theme.categoryIcons?.electricianShimmer !== false,
+          celebration:        theme.categoryIcons?.celebration ?? "",
+          celebrationShimmer: theme.categoryIcons?.celebrationShimmer !== false,
         },
       },
     });
@@ -80,6 +96,8 @@ router.get("/", async (_req, res) => {
       referral: { isEnabled: true, referrerRewardAmount: 50, newUserDiscountAmount: 100 },
       emergency: { bookingsDisabled: false, paymentsFreezed: false, emergencyLockdown: false },
       razorpayKeyId: process.env.RAZORPAY_KEY_ID || "",
+      defaultBannerEnabled: true,
+      socialLinks: DEFAULT_SOCIAL_LINKS,
       homeTheme: DEFAULT_THEME,
     });
   }

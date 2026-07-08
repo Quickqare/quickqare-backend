@@ -105,6 +105,96 @@ const serviceSchema = new mongoose.Schema(
       default: [],
     },
 
+    // BEFORE_SERVICE: refund tiers keyed on hours remaining until the service
+    // (cancellationTiers above). SINCE_BOOKING: tiers keyed on hours elapsed
+    // since the booking was placed (sinceBookingTiers below) — used for
+    // advance-order categories like cakes.
+    cancellationPolicyType: {
+      type: String,
+      enum: ["BEFORE_SERVICE", "SINCE_BOOKING"],
+      default: "BEFORE_SERVICE",
+    },
+
+    // Ascending by maxHoursAfterBooking; first tier where
+    // hoursSinceBooking <= maxHoursAfterBooking wins.
+    // e.g. cake: [{ maxHoursAfterBooking: 1, refundPercent: 100 },
+    //             { maxHoursAfterBooking: 8760, refundPercent: 50 }]
+    sinceBookingTiers: {
+      type: [
+        {
+          maxHoursAfterBooking: { type: Number, required: true, min: 0 },
+          refundPercent:        { type: Number, required: true, min: 0, max: 100 },
+        },
+      ],
+      default: [],
+    },
+
+    /* =====================
+       CUSTOMIZATION (per-order options, e.g. cakes)
+       Base price = 1-tier cake with the cheapest flavour delta.
+    ===================== */
+    customization: {
+      // Weight/size tiers (e.g. "0.5 kg", "1 kg", "2 kg"). First entry is the
+      // base weight (priceDelta 0 by convention, not enforced). Optional —
+      // an empty array means the service has no weight choice.
+      weights: {
+        type: [
+          {
+            label:      { type: String, required: true, trim: true },
+            priceDelta: { type: Number, default: 0, min: 0 },
+          },
+        ],
+        default: [],
+      },
+      flavours: {
+        type: [
+          {
+            name:       { type: String, required: true, trim: true },
+            priceDelta: { type: Number, default: 0, min: 0 },
+          },
+        ],
+        default: [],
+      },
+      twoTierPriceDelta: { type: Number, default: 0, min: 0 },
+      addons: {
+        type: [
+          {
+            name:  { type: String, required: true, trim: true },
+            price: { type: Number, required: true, min: 0 },
+          },
+        ],
+        default: [],
+      },
+      nameOnCakeEnabled: { type: Boolean, default: true },
+    },
+
+    // Ingredients shown to the customer (e.g. cakes).
+    ingredients: {
+      type: [String],
+      default: [],
+    },
+
+    // Egg-free badge/filter shown to the customer (cakes).
+    isEggless: {
+      type: Boolean,
+      default: false,
+    },
+
+    // Ordered photo gallery shown to the customer (Cloudinary URLs) — kept as
+    // "media360" for backward compatibility, no longer a rotation-frame set.
+    media360: {
+      type: [String],
+      default: [],
+    },
+
+    // Minimum lead time in calendar days between booking and the scheduled
+    // date. 0 = same-day allowed; cakes use 1 (order at least a day ahead).
+    minLeadDays: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+
     duration: {
       type: Number, // minutes
       default: 60,
@@ -116,6 +206,21 @@ const serviceSchema = new mongoose.Schema(
        (Future ranking / sorting)
     ===================== */
     popularityScore: {
+      type: Number,
+      default: 0,
+    },
+
+    /* =====================
+       WEB "HIGHLIGHTS"
+       Admin-curated services shown in the Highlights row on the web home page.
+       highlightOrder controls their order (lower = first).
+    ===================== */
+    isHighlighted: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+    highlightOrder: {
       type: Number,
       default: 0,
     },

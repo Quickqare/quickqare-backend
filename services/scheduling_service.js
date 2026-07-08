@@ -7,6 +7,7 @@ const {
   resolveZoneForPincode,
 } = require("./zone.service");
 const { deriveH3Cell, getH3Ring } = require("../utils/h3");
+const { isCakeCategoryText } = require("../utils/categoryDetection");
 
 let _h3FlagCache = { value: false, expiresAt: 0 };
 async function getUseH3Flag() {
@@ -48,6 +49,25 @@ const FAIRNESS_LOOKBACK_HOURS = 12;
 
 // AC category detection slugs — extend this list as needed
 const AC_CATEGORY_SLUGS = ["ac", "air conditioner", "air-conditioner", "aircon"];
+
+// Cake/Celebration: a baker can hold at most this many cake orders per
+// scheduled calendar day. Enforced in findEligiblePartnersForBooking, which
+// also feeds slot listing and slot capacity — so full bakers automatically
+// stop appearing as available.
+const CAKE_MAX_ORDERS_PER_PARTNER_PER_DAY = 2;
+
+// Statuses that count toward the baker's daily cake cap. Pre-assignment
+// statuses are excluded (no partner attached yet); COMPLETED counts because a
+// cake delivered earlier the same day still consumed baking capacity.
+const CAKE_CAP_COUNT_STATUSES = [
+  "ASSIGNED",
+  "CONFIRMED",
+  "PARTNER_ACCEPTED",
+  "ON_THE_WAY",
+  "ARRIVED",
+  "IN_PROGRESS",
+  "COMPLETED",
+];
 
 // Statuses where a partner is committed to a booking and that booking's window
 // must block them from being assigned to overlapping work.
@@ -263,6 +283,18 @@ async function buildRequestContext({
     requestedCategories.some((c) => c.includes("mehendi")) ||
     normalizeText(booking?.serviceCategory || "").includes("mehendi");
 
+  // Determine if this is a Cake/Celebration booking — drives the per-baker
+  // daily order cap and the advance-only lead-time gate.
+  const isCake =
+    requestedCategories.some(isCakeCategoryText) ||
+    isCakeCategoryText(booking?.serviceCategory || "");
+
+  // Advance-only lead time (calendar days) — max across requested services.
+  const minLeadDays = Math.max(
+    0,
+    ...Array.from(serviceMap.values()).map((s) => Number(s?.minLeadDays) || 0)
+  );
+
   // For AC: derive the maximum required skill tier from the cart
   // Level 1 = general cleaning/filter wash
   // Level 2 = gas top-up, diagnosis
@@ -285,6 +317,8 @@ async function buildRequestContext({
     serviceMap,
     isAC,
     isMehendi,
+    isCake,
+    minLeadDays,
     requiredSkillTier,
   };
 }
@@ -814,9 +848,13 @@ ELIGIBLE PARTNER FINDER
  * @param {boolean} [opts.requireOnline=true] - false for slot-listing/booking-creation
  *   (booking may be hours/days away, partner doesn't need to be online RIGHT NOW);
  *   true for live assignment (we need someone reachable now).
+ * @param {ObjectId[]} [opts.precomputedHubIds] - hub mode only: the caller has
+ *   already resolved (and territorially gated) the hubs for this search, so the
+ *   per-call category + hub resolution here is skipped. Callers that pass this
+ *   own the home-hub pause gate.
  */
 async function findEligiblePartnersForBooking(booking, pincodes = [], opts = {}) {
-  const { requireOnline = true, useH3 = false } = opts;
+  const { requireOnline = true, useH3 = false, precomputedHubIds = null } = opts;
   const requestContext = await buildRequestContext({ booking });
   if (
     !requestContext.requestedServiceIds.length &&
@@ -829,25 +867,49 @@ async function findEligiblePartnersForBooking(booking, pincodes = [], opts = {})
   // Hub path (useH3): validate against Hub; pincode path: validate against Zone.
   let noZoneFallback = false;
   let hubIds = null; // resolved hub _ids when on the Hub path
-  if (useH3 && booking?.h3Cell) {
-    const { resolveHubForH3Cell, resolveHubsForCells } = require("./zone.service");
-    const hub = await resolveHubForH3Cell(booking.h3Cell);
-    if (!hub) {
-      // Booking's cell isn't inside any hub's exact shape. Widen via the
-      // supplied ring cells (stage 2/3) before giving up.
-      hubIds = await resolveHubsForCells(Array.isArray(pincodes) ? pincodes : []);
-      if (!hubIds.length) {
-        console.warn(`[assignment/Hub] No hub covers cell "${booking.h3Cell}" (booking ${booking?._id})`);
+  if (useH3 && booking?.h3Cell && Array.isArray(precomputedHubIds)) {
+    // Caller already resolved + gated the hubs for this search (assignment
+    // stage loop, slot listing, capacity scope) — don't re-query per call.
+    hubIds = precomputedHubIds;
+    if (!hubIds.length) return [];
+  } else if (useH3 && booking?.h3Cell) {
+    const {
+      resolveHubForH3Cell,
+      resolveHubsForCells,
+      resolveBookingCategories,
+    } = require("./zone.service");
+
+    // Hubs are per-category and may overlap the same cells: every hub lookup
+    // below is scoped to the booking's own categories so an overlapping hub of
+    // a DIFFERENT service can neither block this booking nor lend it partners.
+    // Legacy bookings whose category can't be resolved fall back to the old
+    // area-level (category-blind) behaviour.
+    const bookingCategories = await resolveBookingCategories(booking);
+    const categoryIds = bookingCategories.map((c) => c.id);
+
+    // Home-cell pause gate, per category: if the hub that owns this booking's
+    // cell is switched off for partner jobs, the booking must not be staffed
+    // at all — ring expansion into neighbouring hubs would bypass the pause.
+    for (const catId of categoryIds.length ? categoryIds : [null]) {
+      const hub = await resolveHubForH3Cell(booking.h3Cell, { categoryId: catId });
+      if (hub && hub.partnerAppEnabled === false) {
+        console.warn(`[assignment/Hub] Hub "${hub.name}" blocked: partnerAppEnabled=false (booking ${booking?._id})`);
         return [];
       }
-    } else if (hub.partnerAppEnabled === false) {
-      console.warn(`[assignment/Hub] Hub "${hub.name}" blocked: partnerAppEnabled=false`);
+    }
+
+    // Stage expansion may legitimately reach neighbouring hubs — resolve all
+    // partner-enabled hubs of the booking's categories intersecting the
+    // current stage's cells (the cells always include the home cell).
+    const stageCells =
+      Array.isArray(pincodes) && pincodes.length ? pincodes : [booking.h3Cell];
+    hubIds = await resolveHubsForCells(stageCells, {
+      categoryIds: categoryIds.length ? categoryIds : null,
+      requirePartnerApp: true,
+    });
+    if (!hubIds.length) {
+      console.warn(`[assignment/Hub] No partner-enabled hub of this booking's category covers cell "${booking.h3Cell}" (booking ${booking?._id})`);
       return [];
-    } else {
-      // Stage expansion may legitimately reach neighbouring hubs — resolve all
-      // hubs intersecting the current stage's cells, not just the home hub.
-      hubIds = await resolveHubsForCells(Array.isArray(pincodes) && pincodes.length ? pincodes : [booking.h3Cell]);
-      if (!hubIds.length) hubIds = [hub._id];
     }
   } else {
     const zone = await resolveZoneForPincode(booking?.pincode);
@@ -928,12 +990,96 @@ async function findEligiblePartnersForBooking(booking, pincodes = [], opts = {})
   // live GPS. Zone + service eligibility is the source of truth for slot
   // visibility; valid GPS is used later only for ranking/reachability.
 
-  const partners = await Partner.find(query);
+  let partners = await Partner.find(query);
   if (!partners.length) {
     console.warn(
       `[assignment] DB query returned 0 partners for booking ${booking?._id} (pincode: ${booking?.pincode}, requireOnline: ${requireOnline})`
     );
     return [];
+  }
+
+  // ── Partner self-declared days off ─────────────────────────────────────────
+  // A partner (e.g. a baker) can block whole calendar days via
+  // unavailableDates. Applies to any booking, not just cakes — filtered
+  // in-memory since the date is stored per-partner without a fixed
+  // time-of-day, so a Mongo range match per candidate isn't worth it here.
+  if (booking?.scheduledDate) {
+    const scheduledKey = normalizeDateKey(booking.scheduledDate);
+    const beforeCount = partners.length;
+    partners = partners.filter((p) => {
+      const blocked = Array.isArray(p.unavailableDates) ? p.unavailableDates : [];
+      return !blocked.some((d) => normalizeDateKey(d) === scheduledKey);
+    });
+    if (!partners.length && beforeCount > 0) {
+      console.warn(
+        `[assignment] Booking ${booking?._id}: all ${beforeCount} candidate partners have blocked ${scheduledKey}`
+      );
+      return [];
+    }
+  }
+
+  // ── Cake daily cap ─────────────────────────────────────────────────────────
+  // A baker can hold at most CAKE_MAX_ORDERS_PER_PARTNER_PER_DAY cake orders
+  // per scheduled calendar day. Counted by scheduledDate (not booking creation
+  // time) so future-dated orders are capped correctly.
+  if (requestContext.isCake && booking?.scheduledDate) {
+    const { start, end } = getDayBounds(booking.scheduledDate);
+    const partnerIds = partners.map((p) => p._id);
+    const cakeCategoryRegex = /celebration|cake/i;
+
+    const counts = await Booking.aggregate([
+      {
+        $match: {
+          scheduledDate: { $gte: start, $lt: end },
+          status: { $in: CAKE_CAP_COUNT_STATUSES },
+          ...(booking?._id ? { _id: { $ne: booking._id } } : {}),
+          $and: [
+            {
+              $or: [
+                { "services.category": cakeCategoryRegex },
+                { serviceCategory: cakeCategoryRegex },
+              ],
+            },
+            {
+              $or: [
+                { partner: { $in: partnerIds } },
+                { additionalPartners: { $in: partnerIds } },
+              ],
+            },
+          ],
+        },
+      },
+      {
+        $project: {
+          allPartners: {
+            $concatArrays: [
+              { $cond: [{ $ifNull: ["$partner", false] }, ["$partner"], []] },
+              { $ifNull: ["$additionalPartners", []] },
+            ],
+          },
+        },
+      },
+      { $unwind: "$allPartners" },
+      { $group: { _id: "$allPartners", count: { $sum: 1 } } },
+    ]);
+
+    const countByPartner = new Map(
+      counts.map((row) => [String(row._id), Number(row.count) || 0])
+    );
+
+    const before = partners.length;
+    partners = partners.filter(
+      (p) =>
+        (countByPartner.get(String(p._id)) || 0) <
+        CAKE_MAX_ORDERS_PER_PARTNER_PER_DAY
+    );
+
+    if (!partners.length) {
+      console.warn(
+        `[assignment/CakeCap] Booking ${booking?._id}: all ${before} candidate bakers already have ${CAKE_MAX_ORDERS_PER_PARTNER_PER_DAY} cake orders on ${normalizeDateKey(booking.scheduledDate)}`
+      );
+      return [];
+    }
   }
 
   const bookingWindow = await getBookingWindow(booking);
@@ -1097,6 +1243,26 @@ async function getAvailableSlotsForRequest({
     services,
   });
 
+  // Advance-only orders (cakes): no slots at all for dates inside the lead
+  // window. Calendar-day compare — "1 day ahead" allows tomorrow at any hour.
+  if (requestContext.minLeadDays > 0) {
+    const _now = new Date();
+    const earliestAllowed = new Date(
+      _now.getFullYear(),
+      _now.getMonth(),
+      _now.getDate() + requestContext.minLeadDays
+    );
+    const requested = new Date(date);
+    const requestedDay = new Date(
+      requested.getFullYear(),
+      requested.getMonth(),
+      requested.getDate()
+    );
+    if (requestedDay.getTime() < earliestAllowed.getTime()) {
+      return [];
+    }
+  }
+
   const durationMinutes = calculateDurationMinutesFromRequest(
     requestContext.requestServices,
     requestContext.serviceMap,
@@ -1110,6 +1276,7 @@ async function getAvailableSlotsForRequest({
   // disabled zone would hide every slot even though the hub is active.
   let requestH3Cell = null;
   let h3SearchCells = [];
+  let h3HubIds = null; // resolved once here; per-slot searches reuse it
   if (useH3) {
     // H3 mode: validate against the hub(s) covering the booking location — one
     // per service category, since hubs are per-service and may overlap. Showing
@@ -1162,6 +1329,20 @@ async function getAvailableSlotsForRequest({
     // Ring-1 cells absorb pincode-centroid fuzz (same k as the hub gate's
     // ringFallback above) and match the assignment engine's stage-2 reach.
     h3SearchCells = getH3Ring(requestH3Cell, 1);
+
+    // Resolve the partner pool's hubs ONCE for the whole request — scoped to
+    // the request's categories and to partner-enabled hubs — instead of
+    // re-resolving inside every per-slot search. The per-category gate above
+    // already enforced the home hub's pause flags.
+    const { resolveHubsForCells } = require("./zone.service");
+    const gateCategoryIds = neededCategories.map((c) => c.id).filter(Boolean);
+    h3HubIds = await resolveHubsForCells(h3SearchCells, {
+      categoryIds: gateCategoryIds.length ? gateCategoryIds : null,
+      requirePartnerApp: true,
+    });
+    if (!h3HubIds.length) {
+      return [];
+    }
   } else {
     const zone = await resolveZoneForPincode(pincode);
     if (
@@ -1234,7 +1415,9 @@ async function getAvailableSlotsForRequest({
         scheduledEndAt: slotEnd,
       },
       h3SearchCells,
-      { requireOnline: false, useH3 } // slot listing — partner may come online later
+      // Slot listing — partner may come online later. Hub mode reuses the
+      // request-level hub set resolved above (precomputedHubIds).
+      { requireOnline: false, useH3, precomputedHubIds: h3HubIds }
     );
 
     if (!rankedPartners.length) continue;

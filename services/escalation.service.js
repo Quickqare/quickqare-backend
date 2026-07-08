@@ -67,6 +67,20 @@ async function escalateUnassignedBooking(bookingId) {
         return { escalated: false, reason: "recovered" };
       }
 
+      // Give the slot's capacity back — a cancelled booking must not keep
+      // blocking other customers from booking this window. Lazy require to
+      // avoid a circular import (slotCapacity → assignmentEngine → here).
+      try {
+        const { releaseSlotCapacityByBookingId } = require("./slotCapacity.service");
+        await releaseSlotCapacityByBookingId(bookingId, {
+          releaseReason: "auto_cancel_no_replacement",
+        });
+      } catch (releaseErr) {
+        console.error(
+          `[escalation] Slot capacity release failed for booking ${bookingId}: ${releaseErr.message}`
+        );
+      }
+
       if (global.io) {
         global.io.to(`user_${booking.user}`).emit("booking_update", {
           bookingId: String(bookingId),

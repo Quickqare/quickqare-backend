@@ -91,6 +91,8 @@ router.post("/categories", audit("admin.services.category.create"), async (req, 
     if (!name) {
       return fail(res, 400, "VALIDATION_ERROR", "name is required", null, { requestId: req.requestId });
     }
+    const imageUrl = String(req.body.imageUrl || "").trim();
+    const webImageUrl = String(req.body.webImageUrl || "").trim();
 
     const slug = name.toLowerCase().replace(/\s+/g, "-");
     const existing = await Category.findOne({ $or: [{ name }, { slug }] }).lean();
@@ -98,7 +100,13 @@ router.post("/categories", audit("admin.services.category.create"), async (req, 
       return success(res, existing, { requestId: req.requestId });
     }
 
-    const row = await Category.create({ name, slug, isActive: true });
+    const row = await Category.create({
+      name,
+      slug,
+      isActive: true,
+      ...(imageUrl ? { imageUrl } : {}),
+      ...(webImageUrl ? { webImageUrl } : {}),
+    });
     return success(res, row, { requestId: req.requestId });
   } catch (error) {
     return fail(res, 500, "CATEGORY_CREATE_FAILED", "Unable to create category", error.message, {
@@ -120,6 +128,7 @@ router.patch("/categories/:id", audit("admin.services.category.update"), async (
       patch.slug = req.body.name.trim().toLowerCase().replace(/\s+/g, "-");
     }
     if (typeof req.body.imageUrl === "string") patch.imageUrl = req.body.imageUrl.trim();
+    if (typeof req.body.webImageUrl === "string") patch.webImageUrl = req.body.webImageUrl.trim();
     if (req.body.isActive !== undefined) patch.isActive = Boolean(req.body.isActive);
 
     const row = await Category.findByIdAndUpdate(categoryId, { $set: patch }, { new: true }).lean();
@@ -391,6 +400,11 @@ router.post("/seed-defaults", audit("admin.services.seed"), async (req, res) => 
         price,
         commissionPercent: Number.isFinite(commissionPercent) ? commissionPercent : 20,
         ...(Number.isFinite(duration) && duration > 0 ? { duration } : {}),
+        ...(Number(service.minLeadDays) > 0 ? { minLeadDays: Number(service.minLeadDays) } : {}),
+        ...(service.cancellationPolicyType ? { cancellationPolicyType: service.cancellationPolicyType } : {}),
+        ...(Array.isArray(service.sinceBookingTiers) ? { sinceBookingTiers: service.sinceBookingTiers } : {}),
+        ...(Array.isArray(service.ingredients) ? { ingredients: service.ingredients } : {}),
+        ...(service.customization ? { customization: service.customization } : {}),
         isActive: true,
       });
 
@@ -419,6 +433,23 @@ router.patch("/:id", audit("admin.services.update"), async (req, res) => {
     if (typeof req.body.webImageUrl === "string") patch.webImageUrl = req.body.webImageUrl;
     if (req.body.basePriceInr !== undefined) patch.price = Number(req.body.basePriceInr);
     if (req.body.commissionPercent !== undefined) patch.commissionPercent = Number(req.body.commissionPercent);
+    if (req.body.isHighlighted !== undefined) patch.isHighlighted = Boolean(req.body.isHighlighted);
+    if (req.body.highlightOrder !== undefined) patch.highlightOrder = Number(req.body.highlightOrder) || 0;
+    if (req.body.duration !== undefined && Number(req.body.duration) > 0) patch.duration = Number(req.body.duration);
+    if (req.body.minLeadDays !== undefined) patch.minLeadDays = Math.max(0, Number(req.body.minLeadDays) || 0);
+    if (req.body.isEggless !== undefined) patch.isEggless = Boolean(req.body.isEggless);
+    if (Array.isArray(req.body.ingredients)) {
+      patch.ingredients = req.body.ingredients
+        .map((item) => String(item || "").trim())
+        .filter(Boolean)
+        .slice(0, 50);
+    }
+    if (Array.isArray(req.body.media360)) {
+      patch.media360 = req.body.media360
+        .map((url) => String(url || "").trim())
+        .filter(Boolean)
+        .slice(0, 12);
+    }
 
     const row = await Service.findByIdAndUpdate(serviceId, { $set: patch }, { new: true }).lean();
     if (!row) {
@@ -456,6 +487,9 @@ router.patch("/:id/status", audit("admin.services.status"), async (req, res) => 
 
 // PATCH /:id/cancellation-policy — set per-service cancellation tiers
 // Body: { tiers: [{ minHoursBefore: 24, refundPercent: 100 }, ...] }
+// Optional: policyType ("BEFORE_SERVICE" | "SINCE_BOOKING") and
+// sinceBookingTiers: [{ maxHoursAfterBooking, refundPercent }, ...] for
+// advance-order categories (cakes).
 // Send tiers: [] to reset service to global defaults.
 router.patch("/:id/cancellation-policy", audit("admin.services.cancellation"), async (req, res) => {
   try {
@@ -481,10 +515,131 @@ router.patch("/:id/cancellation-policy", audit("admin.services.cancellation"), a
       }
     }
 
-    const sorted = [...tiers].sort((a, b) => b.minHoursBefore - a.minHoursBefore);
+    const set = {
+      cancellationTiers: [...tiers].sort((a, b) => b.minHoursBefore - a.minHoursBefore),
+    };
+
+    if (req.body.policyType !== undefined) {
+      const policyType = String(req.body.policyType);
+      if (!["BEFORE_SERVICE", "SINCE_BOOKING"].includes(policyType)) {
+        return fail(res, 400, "INVALID_POLICY_TYPE", "policyType must be BEFORE_SERVICE or SINCE_BOOKING", null, { requestId: req.requestId });
+      }
+      set.cancellationPolicyType = policyType;
+    }
+
+    if (req.body.sinceBookingTiers !== undefined) {
+      const sinceTiers = req.body.sinceBookingTiers;
+      if (!Array.isArray(sinceTiers)) {
+        return fail(res, 400, "INVALID_TIERS", "sinceBookingTiers must be an array", null, { requestId: req.requestId });
+      }
+      for (const t of sinceTiers) {
+        if (typeof t.maxHoursAfterBooking !== "number" || typeof t.refundPercent !== "number") {
+          return fail(res, 400, "INVALID_TIER", "Each tier must have numeric maxHoursAfterBooking and refundPercent", null, { requestId: req.requestId });
+        }
+        if (t.refundPercent < 0 || t.refundPercent > 100) {
+          return fail(res, 400, "INVALID_TIER", "refundPercent must be between 0 and 100", null, { requestId: req.requestId });
+        }
+        if (t.maxHoursAfterBooking < 0) {
+          return fail(res, 400, "INVALID_TIER", "maxHoursAfterBooking must be >= 0", null, { requestId: req.requestId });
+        }
+      }
+      set.sinceBookingTiers = [...sinceTiers].sort((a, b) => a.maxHoursAfterBooking - b.maxHoursAfterBooking);
+    }
+
+    const row = await Service.findByIdAndUpdate(serviceId, { $set: set }, { new: true }).lean();
+
+    if (!row) {
+      return fail(res, 404, "NOT_FOUND", "Service not found", null, { requestId: req.requestId });
+    }
+
+    return success(
+      res,
+      {
+        cancellationTiers: row.cancellationTiers,
+        cancellationPolicyType: row.cancellationPolicyType,
+        sinceBookingTiers: row.sinceBookingTiers,
+      },
+      { requestId: req.requestId }
+    );
+  } catch (error) {
+    return fail(res, 500, "CANCELLATION_POLICY_FAILED", "Unable to update cancellation policy", error.message, {
+      requestId: req.requestId,
+    });
+  }
+});
+
+// PATCH /:id/customization — set per-order customization options (cakes)
+// Body: { flavours: [{name, priceDelta}], twoTierPriceDelta, addons: [{name, price}], nameOnCakeEnabled }
+router.patch("/:id/customization", audit("admin.services.customization"), async (req, res) => {
+  try {
+    const serviceId = asSingleString(req.params.id);
+    if (!serviceId || !mongoose.Types.ObjectId.isValid(serviceId)) {
+      return fail(res, 400, "INVALID_ID", "Invalid service id", null, { requestId: req.requestId });
+    }
+
+    const body = req.body || {};
+
+    const weights = [];
+    if (body.weights !== undefined) {
+      if (!Array.isArray(body.weights)) {
+        return fail(res, 400, "INVALID_WEIGHTS", "weights must be an array", null, { requestId: req.requestId });
+      }
+      for (const w of body.weights) {
+        const label = String(w?.label || "").trim();
+        const priceDelta = Number(w?.priceDelta) || 0;
+        if (!label) {
+          return fail(res, 400, "INVALID_WEIGHT", "Each weight needs a label", null, { requestId: req.requestId });
+        }
+        if (priceDelta < 0) {
+          return fail(res, 400, "INVALID_WEIGHT", "priceDelta must be >= 0", null, { requestId: req.requestId });
+        }
+        weights.push({ label, priceDelta });
+      }
+    }
+
+    const flavours = [];
+    if (body.flavours !== undefined) {
+      if (!Array.isArray(body.flavours)) {
+        return fail(res, 400, "INVALID_FLAVOURS", "flavours must be an array", null, { requestId: req.requestId });
+      }
+      for (const f of body.flavours) {
+        const name = String(f?.name || "").trim();
+        const priceDelta = Number(f?.priceDelta) || 0;
+        if (!name) {
+          return fail(res, 400, "INVALID_FLAVOUR", "Each flavour needs a name", null, { requestId: req.requestId });
+        }
+        if (priceDelta < 0) {
+          return fail(res, 400, "INVALID_FLAVOUR", "priceDelta must be >= 0", null, { requestId: req.requestId });
+        }
+        flavours.push({ name, priceDelta });
+      }
+    }
+
+    const addons = [];
+    if (body.addons !== undefined) {
+      if (!Array.isArray(body.addons)) {
+        return fail(res, 400, "INVALID_ADDONS", "addons must be an array", null, { requestId: req.requestId });
+      }
+      for (const a of body.addons) {
+        const name = String(a?.name || "").trim();
+        const price = Number(a?.price);
+        if (!name || !Number.isFinite(price) || price < 0) {
+          return fail(res, 400, "INVALID_ADDON", "Each addon needs a name and a price >= 0", null, { requestId: req.requestId });
+        }
+        addons.push({ name, price });
+      }
+    }
+
+    const twoTierPriceDelta = Math.max(0, Number(body.twoTierPriceDelta) || 0);
+    const nameOnCakeEnabled = body.nameOnCakeEnabled !== false;
+
     const row = await Service.findByIdAndUpdate(
       serviceId,
-      { $set: { cancellationTiers: sorted } },
+      {
+        $set: {
+          customization: { weights, flavours, twoTierPriceDelta, addons, nameOnCakeEnabled },
+        },
+      },
       { new: true }
     ).lean();
 
@@ -492,9 +647,9 @@ router.patch("/:id/cancellation-policy", audit("admin.services.cancellation"), a
       return fail(res, 404, "NOT_FOUND", "Service not found", null, { requestId: req.requestId });
     }
 
-    return success(res, { cancellationTiers: row.cancellationTiers }, { requestId: req.requestId });
+    return success(res, { customization: row.customization }, { requestId: req.requestId });
   } catch (error) {
-    return fail(res, 500, "CANCELLATION_POLICY_FAILED", "Unable to update cancellation policy", error.message, {
+    return fail(res, 500, "CUSTOMIZATION_UPDATE_FAILED", "Unable to update customization", error.message, {
       requestId: req.requestId,
     });
   }
