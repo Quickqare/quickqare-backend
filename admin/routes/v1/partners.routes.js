@@ -196,7 +196,7 @@ router.get("/:id/stats", async (req, res) => {
     }
 
     const partner = await Partner.findById(partnerId)
-      .select("name phone email rating activeJobs maxJobsLimit currentPincode serviceAreas serviceCategories skillTier isOnline approvalStatus isBlocked plan commissionPercent subscriptionActive createdAt location assignedHubId mehendiSpecializations selfieUrl selfieVerificationStatus selfieRejectionReason")
+      .select("name phone email rating activeJobs maxJobsLimit currentPincode serviceAreas serviceCategories skillTier isOnline approvalStatus isBlocked plan commissionPercent subscriptionActive createdAt location assignedHubId mehendiSpecializations selfieUrl selfieVerificationStatus selfieRejectionReason services")
       .populate("assignedHubId", "name city state")
       .lean();
     if (!partner) {

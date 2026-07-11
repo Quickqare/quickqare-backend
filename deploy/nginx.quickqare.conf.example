@@ -117,7 +117,7 @@ server {
     add_header Referrer-Policy "strict-origin-when-cross-origin" always;
     add_header Permissions-Policy "camera=(), microphone=()" always;
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
-    add_header Content-Security-Policy "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'self'; form-action 'self'; script-src 'self' https://checkout.razorpay.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' https://api.quickqare.in wss://api.quickqare.in https://control.msg91.com https://*.razorpay.com; frame-src https://api.razorpay.com https://*.razorpay.com" always;
+    add_header Content-Security-Policy "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'self'; form-action 'self'; script-src 'self' https://checkout.razorpay.com https://cdn.razorpay.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' https://api.quickqare.in wss://api.quickqare.in https://control.msg91.com https://*.razorpay.com; frame-src https://api.razorpay.com https://*.razorpay.com" always;
 
     # Serve static assets with long cache headers.
     location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|map)$ {

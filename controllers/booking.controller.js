@@ -7,6 +7,7 @@ const { creditWallet, debitWallet } = require("./partnerWallet.controller");
 const { getAvailableSlots } = require("../services/slotAvailability_service");
 const { assignBooking, reassignBooking } = require("../services/assignmentEngine");
 const { deriveH3Cell } = require("../utils/h3");
+const { fileToPublicUrl } = require("../utils/fileUrl");
 const { forwardGeocode } = require("../services/geocode.service");
 const {
   getZoneServiceKeysFromValues,
@@ -1230,16 +1231,8 @@ exports.uploadStartSelfie = async (req, res) => {
       });
     }
 
-    // Cloudinary storage puts the hosted URL in file.path; local storage needs
-    // the public /uploads URL built (same pattern as uploadController.js).
-    const filePath = String(req.file.path || "");
-    const isRemote = filePath.startsWith("http://") || filePath.startsWith("https://");
-    const configuredBaseUrl = String(process.env.PUBLIC_BASE_URL || "").trim().replace(/\/+$/, "");
-    const selfieUrl = isRemote
-      ? filePath
-      : configuredBaseUrl
-        ? `${configuredBaseUrl}/uploads/${req.file.filename}`
-        : `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`;
+    // Public URL of the uploaded selfie (R2 / Cloudinary / local — see utils/fileUrl).
+    const selfieUrl = fileToPublicUrl(req, req.file);
 
     // GPS tie-in: multer parses multipart text fields into req.body.
     const latitude = Number(req.body?.latitude);
@@ -2292,8 +2285,22 @@ exports.getMyBookings = async (req, res) => {
     const limit = Math.min(50, Number(req.query.limit) || 20);
     const skip  = (page - 1) * limit;
 
+    // A booking the customer never paid for is not a booking from their
+    // perspective. An abandoned/failed checkout leaves a PENDING_PAYMENT row
+    // (created before Razorpay opens) until the stale cron cancels it — hide
+    // both that row and its later system-cancelled form from My Bookings.
+    // Paid bookings always show, including cancelled ones (they carry refund
+    // info the customer needs); payment.status never leaves "PAID" once set.
+    const visibleToCustomer = {
+      user: req.user._id,
+      $nor: [
+        { status: "PENDING_PAYMENT" },
+        { status: "CANCELLED", "payment.status": { $ne: "PAID" } },
+      ],
+    };
+
     const [bookings, total] = await Promise.all([
-      Booking.find({ user: req.user._id })
+      Booking.find(visibleToCustomer)
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limit)
@@ -2301,7 +2308,7 @@ exports.getMyBookings = async (req, res) => {
         .populate("services.serviceId", "name imageUrl duration")
         .populate("primaryService", "name imageUrl duration")
         .lean(),
-      Booking.countDocuments({ user: req.user._id }),
+      Booking.countDocuments(visibleToCustomer),
     ]);
 
     bookings.forEach(gateBookingSelfies);

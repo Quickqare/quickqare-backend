@@ -17,6 +17,9 @@ const r2Upload = multer({
     s3: r2Client,
     bucket: process.env.R2_BUCKET_NAME,
     contentType: multerS3.AUTO_CONTENT_TYPE,
+    // Keys are unique and never rewritten (a re-upload mints a new key), so
+    // clients may cache forever — saves R2 Class B reads on repeat views.
+    cacheControl: "public, max-age=31536000, immutable",
     key: (_req, file, cb) => {
       const ext = file.originalname.split(".").pop().toLowerCase() || "jpg";
       const folder = file.fieldname === "selfie" ? "selfies" : "kyc";

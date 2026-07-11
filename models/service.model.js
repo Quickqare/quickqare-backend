@@ -166,6 +166,17 @@ const serviceSchema = new mongoose.Schema(
         default: [],
       },
       nameOnCakeEnabled: { type: Boolean, default: true },
+
+      // Per-section admin toggles — when false the customer can't pick that
+      // option for this cake (section hidden client-side, mismatching values
+      // rejected server-side). Flavours stay configured even when selection
+      // is disabled: the first flavour then applies as the fixed default,
+      // and a non-empty flavours list is what marks a service as a cake.
+      flavoursEnabled:       { type: Boolean, default: true },
+      weightsEnabled:        { type: Boolean, default: true },
+      tiersEnabled:          { type: Boolean, default: true },
+      addonsEnabled:         { type: Boolean, default: true },
+      referencePhotoEnabled: { type: Boolean, default: true },
     },
 
     // Ingredients shown to the customer (e.g. cakes).
@@ -182,9 +193,33 @@ const serviceSchema = new mongoose.Schema(
 
     // Ordered photo gallery shown to the customer (Cloudinary URLs) — kept as
     // "media360" for backward compatibility, no longer a rotation-frame set.
+    // Shown in the MOBILE APP only (cakes are the exception: their Cake Setup
+    // gallery is shared with the web cake customizer).
     media360: {
       type: [String],
       default: [],
+    },
+
+    // Separate ordered photo gallery for the WEB service cards — mirrors the
+    // imageUrl/webImageUrl split so admins control each platform independently.
+    webMedia360: {
+      type: [String],
+      default: [],
+    },
+
+    // When false, gallery photos stay on the first photo instead of
+    // auto-sliding (app thumbnails/hero and web card carousel).
+    autoSlideEnabled: {
+      type: Boolean,
+      default: true,
+    },
+
+    // Seconds each photo stays before sliding to the next (app + web).
+    autoSlideSeconds: {
+      type: Number,
+      default: 3,
+      min: 1,
+      max: 30,
     },
 
     // Minimum lead time in calendar days between booking and the scheduled

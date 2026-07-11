@@ -56,6 +56,9 @@ router.get("/", async (_req, res) => {
       // Web shows a built-in promo banner when no custom banner is live, unless
       // this is explicitly turned off. Default true (undefined → true).
       defaultBannerEnabled: settings?.defaultBannerEnabled !== false,
+      // Customer app: staggered slide-up entrance on the home category icons.
+      // Off = icons render static. Default true (undefined → true).
+      homeIconAnimationEnabled: settings?.homeIconAnimationEnabled !== false,
       socialLinks: {
         whatsapp:  settings?.socialLinks?.whatsapp  || DEFAULT_SOCIAL_LINKS.whatsapp,
         instagram: settings?.socialLinks?.instagram || DEFAULT_SOCIAL_LINKS.instagram,
@@ -97,6 +100,7 @@ router.get("/", async (_req, res) => {
       emergency: { bookingsDisabled: false, paymentsFreezed: false, emergencyLockdown: false },
       razorpayKeyId: process.env.RAZORPAY_KEY_ID || "",
       defaultBannerEnabled: true,
+      homeIconAnimationEnabled: true,
       socialLinks: DEFAULT_SOCIAL_LINKS,
       homeTheme: DEFAULT_THEME,
     });

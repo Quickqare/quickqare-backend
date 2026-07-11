@@ -97,6 +97,9 @@ const CUSTOMER_STATUS_MESSAGES = {
   ARRIVED:          { title: "Partner Arrived",    body: "Your partner has arrived at your location." },
   IN_PROGRESS:      { title: "Service Started",    body: "Your service has started." },
   COMPLETED:        { title: "Service Completed",  body: "Your service is complete — please rate your experience." },
+  // Sent by admin force-reschedule and the escalation cron. Tapping the push
+  // opens the booking, where the app shows the "Select New Time" action.
+  NEEDS_RESCHEDULING: { title: "Action Needed — Reschedule", body: "Your selected time is no longer available. Please pick a new time for your booking." },
 };
 
 async function sendBookingStatusPush(token, status, bookingId) {
@@ -129,6 +132,30 @@ async function notifyCustomerOfBookingStatus(userId, status, bookingId) {
   }
 }
 
+/* ── Promotional broadcast (topic-based) ──
+   The customer app subscribes every logged-in device to this FCM topic
+   (see project1 src/services/fcm.ts). One send here fans out to all
+   subscribed devices — no token iteration, and new installs are covered
+   automatically once they log in. Unlike the transactional senders above,
+   this THROWS on failure so the admin endpoint can surface the error. */
+const PROMO_TOPIC = "promos";
+
+async function sendPromoBroadcast({ title, body, imageUrl }) {
+  if (!admin.apps.length) throw new Error("Firebase is not configured on this server");
+
+  return admin.messaging().send({
+    topic: PROMO_TOPIC,
+    notification: { title, body },
+    data: { type: "PROMO" },
+    // Promotional traffic is deliberately normal priority — FCM throttles
+    // apps that abuse high priority for non-time-sensitive messages.
+    android: {
+      priority: "normal",
+      ...(imageUrl ? { notification: { imageUrl } } : {}),
+    },
+  });
+}
+
 module.exports = {
   sendPushNotification,
   sendJobAssignedPush,
@@ -136,4 +163,5 @@ module.exports = {
   sendJobCompletedPush,
   sendBookingStatusPush,
   notifyCustomerOfBookingStatus,
+  sendPromoBroadcast,
 };

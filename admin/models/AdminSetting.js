@@ -80,6 +80,15 @@ const adminSettingSchema = new mongoose.Schema(
     defaultBannerEnabled: { type: Boolean, default: true },
 
     /* =============================================
+       APP HOME ICON ANIMATION
+       When true (default), the customer app's category
+       quick-access icons play a staggered slide-up
+       entrance on the home screen. Off = icons render
+       static with no motion.
+    ============================================= */
+    homeIconAnimationEnabled: { type: Boolean, default: true },
+
+    /* =============================================
        HOME SCREEN THEME  (festival / campaign UI)
        All color values are CSS hex strings.
        isActive = false  →  app uses its default

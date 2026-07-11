@@ -438,6 +438,10 @@ router.patch("/:id", audit("admin.services.update"), async (req, res) => {
     if (req.body.duration !== undefined && Number(req.body.duration) > 0) patch.duration = Number(req.body.duration);
     if (req.body.minLeadDays !== undefined) patch.minLeadDays = Math.max(0, Number(req.body.minLeadDays) || 0);
     if (req.body.isEggless !== undefined) patch.isEggless = Boolean(req.body.isEggless);
+    if (req.body.autoSlideEnabled !== undefined) patch.autoSlideEnabled = Boolean(req.body.autoSlideEnabled);
+    if (req.body.autoSlideSeconds !== undefined) {
+      patch.autoSlideSeconds = Math.min(30, Math.max(1, Number(req.body.autoSlideSeconds) || 3));
+    }
     if (Array.isArray(req.body.ingredients)) {
       patch.ingredients = req.body.ingredients
         .map((item) => String(item || "").trim())
@@ -446,6 +450,12 @@ router.patch("/:id", audit("admin.services.update"), async (req, res) => {
     }
     if (Array.isArray(req.body.media360)) {
       patch.media360 = req.body.media360
+        .map((url) => String(url || "").trim())
+        .filter(Boolean)
+        .slice(0, 12);
+    }
+    if (Array.isArray(req.body.webMedia360)) {
+      patch.webMedia360 = req.body.webMedia360
         .map((url) => String(url || "").trim())
         .filter(Boolean)
         .slice(0, 12);
@@ -569,7 +579,8 @@ router.patch("/:id/cancellation-policy", audit("admin.services.cancellation"), a
 });
 
 // PATCH /:id/customization — set per-order customization options (cakes)
-// Body: { flavours: [{name, priceDelta}], twoTierPriceDelta, addons: [{name, price}], nameOnCakeEnabled }
+// Body: { weights, flavours: [{name, priceDelta}], twoTierPriceDelta, addons: [{name, price}], nameOnCakeEnabled,
+//         flavoursEnabled, weightsEnabled, tiersEnabled, addonsEnabled, referencePhotoEnabled }
 router.patch("/:id/customization", audit("admin.services.customization"), async (req, res) => {
   try {
     const serviceId = asSingleString(req.params.id);
@@ -633,11 +644,29 @@ router.patch("/:id/customization", audit("admin.services.customization"), async 
     const twoTierPriceDelta = Math.max(0, Number(body.twoTierPriceDelta) || 0);
     const nameOnCakeEnabled = body.nameOnCakeEnabled !== false;
 
+    // Per-section customer-facing toggles (default enabled).
+    const flavoursEnabled = body.flavoursEnabled !== false;
+    const weightsEnabled = body.weightsEnabled !== false;
+    const tiersEnabled = body.tiersEnabled !== false;
+    const addonsEnabled = body.addonsEnabled !== false;
+    const referencePhotoEnabled = body.referencePhotoEnabled !== false;
+
     const row = await Service.findByIdAndUpdate(
       serviceId,
       {
         $set: {
-          customization: { weights, flavours, twoTierPriceDelta, addons, nameOnCakeEnabled },
+          customization: {
+            weights,
+            flavours,
+            twoTierPriceDelta,
+            addons,
+            nameOnCakeEnabled,
+            flavoursEnabled,
+            weightsEnabled,
+            tiersEnabled,
+            addonsEnabled,
+            referencePhotoEnabled,
+          },
         },
       },
       { new: true }

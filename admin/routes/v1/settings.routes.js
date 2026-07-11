@@ -52,6 +52,9 @@ router.patch("/settings", audit("admin.settings.update"), async (req, res) => {
     if (req.body.defaultBannerEnabled !== undefined) {
       settings.defaultBannerEnabled = Boolean(req.body.defaultBannerEnabled);
     }
+    if (req.body.homeIconAnimationEnabled !== undefined) {
+      settings.homeIconAnimationEnabled = Boolean(req.body.homeIconAnimationEnabled);
+    }
 
     // Pricing (platform fee + tax). Clamped to sane ranges.
     if (req.body.pricing !== undefined && typeof req.body.pricing === "object") {

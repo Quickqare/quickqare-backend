@@ -177,18 +177,36 @@ function validateCakeOptions(service, rawOptions = {}) {
     return { ok: false, message: "This service has no customization options" };
   }
 
+  // Flavour — when selection is disabled the first flavour is the fixed
+  // default; an explicit different flavour (e.g. an older client) is rejected.
   const flavourName = String(rawOptions.flavour || "").trim();
-  const flavour = config.flavours.find(
-    (f) => normalizeText(f.name) === normalizeText(flavourName)
-  );
-  if (!flavour) {
-    return { ok: false, message: `Invalid flavour: ${flavourName || "(none)"}` };
+  let flavour;
+  if (config.flavoursEnabled === false) {
+    flavour = config.flavours[0];
+    if (flavourName && normalizeText(flavourName) !== normalizeText(flavour.name)) {
+      return { ok: false, message: "Flavour selection is not available for this service" };
+    }
+  } else {
+    flavour = config.flavours.find(
+      (f) => normalizeText(f.name) === normalizeText(flavourName)
+    );
+    if (!flavour) {
+      return { ok: false, message: `Invalid flavour: ${flavourName || "(none)"}` };
+    }
   }
 
   // Weight/size is optional per service — only validated when the service has
-  // weight tiers configured. Falls back to the first (base) weight if omitted.
+  // weight tiers configured and selection is enabled. Falls back to the first
+  // (base) weight if omitted. When disabled, only the base weight (or none)
+  // is accepted and no weight is recorded.
   let weight = null;
-  if (Array.isArray(config.weights) && config.weights.length > 0) {
+  if (config.weightsEnabled === false) {
+    const rawWeight = String(rawOptions.weight || "").trim();
+    const baseWeight = Array.isArray(config.weights) ? config.weights[0] : null;
+    if (rawWeight && (!baseWeight || normalizeText(rawWeight) !== normalizeText(baseWeight.label))) {
+      return { ok: false, message: "Weight selection is not available for this service" };
+    }
+  } else if (Array.isArray(config.weights) && config.weights.length > 0) {
     const weightLabel = String(rawOptions.weight || "").trim() || config.weights[0].label;
     const matchedWeight = config.weights.find(
       (w) => normalizeText(w.label) === normalizeText(weightLabel)
@@ -203,8 +221,14 @@ function validateCakeOptions(service, rawOptions = {}) {
   if (tiers !== 1 && tiers !== 2) {
     return { ok: false, message: "tiers must be 1 or 2" };
   }
+  if (tiers === 2 && config.tiersEnabled === false) {
+    return { ok: false, message: "Two-tier is not available for this service" };
+  }
 
   const addonNames = Array.isArray(rawOptions.addons) ? rawOptions.addons : [];
+  if (addonNames.length > 0 && config.addonsEnabled === false) {
+    return { ok: false, message: "Add-ons are not available for this service" };
+  }
   const addons = [];
   for (const rawName of addonNames) {
     const addon = (config.addons || []).find(
@@ -230,6 +254,9 @@ function validateCakeOptions(service, rawOptions = {}) {
   const referencePhotoUrl = String(rawOptions.referencePhotoUrl || "")
     .trim()
     .slice(0, MAX_REFERENCE_PHOTO_URL_LENGTH);
+  if (referencePhotoUrl && config.referencePhotoEnabled === false) {
+    return { ok: false, message: "Reference photos are not available for this service" };
+  }
 
   return {
     ok: true,
@@ -262,7 +289,10 @@ function computeCakeLineTotal(service, options, quantity = 1) {
     : null;
   const weightDelta = Number(weightEntry?.priceDelta) || 0;
 
-  const tierDelta = Number(options.tiers) === 2 ? Number(config.twoTierPriceDelta) || 0 : 0;
+  const tierDelta =
+    Number(options.tiers) === 2 && config.tiersEnabled !== false
+      ? Number(config.twoTierPriceDelta) || 0
+      : 0;
   const addonsTotal = (options.addons || []).reduce(
     (total, addon) => total + (Number(addon.price) || 0),
     0

@@ -137,7 +137,8 @@ app.post(
 );
 
 app.use(express.json({ limit: "1mb" }));
-app.use("/uploads", express.static(path.join(__dirname, "uploads")));
+// Filenames are timestamp-unique, never rewritten — safe to cache forever.
+app.use("/uploads", express.static(path.join(__dirname, "uploads"), { maxAge: "365d", immutable: true }));
 
 app.get("/health", async (_req, res) => {
   const mongoReadyState = mongoose.connection.readyState;

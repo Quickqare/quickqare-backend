@@ -9,6 +9,7 @@ const { syncPartnerOperationalState } = require("../services/scheduling_service"
 const { emitBookingUpdate } = require("../socket/emitters");
 const { completeBooking } = require("./booking.controller");
 const { deriveH3Cell } = require("../utils/h3");
+const { fileToPublicUrl } = require("../utils/fileUrl");
 const {
   filterServicesByZone,
   filterServicesByHubs,
@@ -579,25 +580,8 @@ exports.uploadMySelfie = async (req, res) => {
       return res.status(400).json({ success: false, message: "Selfie image is required" });
     }
 
-    // multer-s3 (R2) puts the public URL in file.location.
-    // Cloudinary puts it in file.path.
-    // Local disk needs the URL built from PUBLIC_BASE_URL.
-    let selfieUrl;
-    if (req.file.location) {
-      // R2 via multer-s3 — swap the internal storage endpoint for the public R2 URL
-      const key = req.file.key || req.file.Key || "";
-      const publicBase = String(process.env.R2_PUBLIC_URL || "").trim().replace(/\/+$/, "");
-      selfieUrl = publicBase ? `${publicBase}/${key}` : req.file.location;
-    } else {
-      const filePath = String(req.file.path || "");
-      const isRemote = filePath.startsWith("http://") || filePath.startsWith("https://");
-      const configuredBaseUrl = String(process.env.PUBLIC_BASE_URL || "").trim().replace(/\/+$/, "");
-      selfieUrl = isRemote
-        ? filePath
-        : configuredBaseUrl
-          ? `${configuredBaseUrl}/uploads/${req.file.filename}`
-          : `${req.protocol}://${req.get("host")}/uploads/${req.file.filename}`;
-    }
+    // Public URL of the uploaded selfie (R2 / Cloudinary / local — see utils/fileUrl).
+    const selfieUrl = fileToPublicUrl(req, req.file);
 
     req.partner.selfieUrl = selfieUrl;
     req.partner.selfieVerificationStatus = "PENDING";

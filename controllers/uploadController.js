@@ -1,14 +1,4 @@
-function toPublicUrl(req, file) {
-  const filePath = String(file.path || "");
-  const isRemote = filePath.startsWith("http://") || filePath.startsWith("https://");
-  const host = req.get("host");
-  const configuredBaseUrl = String(process.env.PUBLIC_BASE_URL || "").trim().replace(/\/+$/, "");
-  return isRemote
-    ? filePath
-    : configuredBaseUrl
-      ? `${configuredBaseUrl}/uploads/${file.filename}`
-      : `${req.protocol}://${host}/uploads/${file.filename}`;
-}
+const { fileToPublicUrl } = require("../utils/fileUrl");
 
 exports.uploadImage = async (req, res) => {
   try {
@@ -18,7 +8,7 @@ exports.uploadImage = async (req, res) => {
 
     res.json({
       success: true,
-      imageUrl: toPublicUrl(req, req.file),
+      imageUrl: fileToPublicUrl(req, req.file),
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -34,7 +24,7 @@ exports.uploadImages = async (req, res) => {
 
     res.json({
       success: true,
-      imageUrls: req.files.map((file) => toPublicUrl(req, file)),
+      imageUrls: req.files.map((file) => fileToPublicUrl(req, file)),
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
