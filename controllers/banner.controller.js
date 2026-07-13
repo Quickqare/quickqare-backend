@@ -1,5 +1,6 @@
 const mongoose = require("mongoose");
 const Banner = require("../models/Banner");
+const { isSafeLinkUrl } = require("../utils/safeUrl");
 
 const asString = (value, fallback = "") => String(value ?? fallback).trim();
 const normalizePlacement = (value) => asString(value || "home").toLowerCase();
@@ -100,6 +101,19 @@ exports.createBanner = async (req, res) => {
       });
     }
 
+    if (!isSafeLinkUrl(req.body.linkUrl)) {
+      return res.status(400).json({
+        success: false,
+        data: null,
+        error: {
+          code: "VALIDATION_ERROR",
+          message: "linkUrl must be an absolute http:// or https:// URL",
+          details: null,
+        },
+        meta: { requestId: req.requestId },
+      });
+    }
+
     const row = await Banner.create({
       title: asString(req.body.title),
       imageUrl,
@@ -134,6 +148,19 @@ exports.updateBanner = async (req, res) => {
         success: false,
         data: null,
         error: { code: "INVALID_ID", message: "Invalid banner id", details: null },
+        meta: { requestId: req.requestId },
+      });
+    }
+
+    if (!isSafeLinkUrl(req.body.linkUrl)) {
+      return res.status(400).json({
+        success: false,
+        data: null,
+        error: {
+          code: "VALIDATION_ERROR",
+          message: "linkUrl must be an absolute http:// or https:// URL",
+          details: null,
+        },
         meta: { requestId: req.requestId },
       });
     }

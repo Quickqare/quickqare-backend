@@ -20,8 +20,9 @@ const createComplaint = async (req, res) => {
       });
     }
 
-    // Check if booking exists and belongs to user
-    const booking = await Booking.findOne({ _id: orderId, userId });
+    // Check if booking exists and belongs to user.
+    // NB: the Booking schema stores the customer in `user`, not `userId`.
+    const booking = await Booking.findOne({ _id: orderId, user: userId });
     if (!booking) {
       return res.status(404).json({
         success: false,

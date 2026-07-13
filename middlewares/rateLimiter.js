@@ -1,6 +1,36 @@
 const rateLimit = require("express-rate-limit");
 
 /* =====================================================
+   GLOBAL FLOOR LIMITER
+   Applied once to every /api route in index.js as a broad abuse ceiling.
+   Deliberately generous (a real user's booking flow, or an admin clicking
+   through the dashboard, must never hit it) — the strict controls live in the
+   per-endpoint limiters below. Its only job is to stop a scripted flood of the
+   many endpoints that would otherwise have no limiter at all.
+
+   NOTE: in-memory store — per process. Fine for a single container; switch to
+   rate-limit-redis before running multiple replicas or this silently stops
+   working across them.
+===================================================== */
+exports.globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  // Per IP (~66/min sustained at the default). Tunable via env without a code
+  // change — raise it if legitimate users behind a shared/carrier-NAT IP ever
+  // trip it, lower it to tighten the floor.
+  max: Number(process.env.GLOBAL_RATE_LIMIT_MAX || 1000),
+
+  standardHeaders: true,
+  legacyHeaders: false,
+
+  handler: (req, res) => {
+    res.status(429).json({
+      success: false,
+      message: "Too many requests. Please slow down.",
+    });
+  },
+});
+
+/* =====================================================
    GENERAL API LIMITER
    Protects all APIs from abuse
 ===================================================== */
@@ -107,6 +137,38 @@ exports.mapsLimiter = rateLimit({
     res.status(429).json({
       success: false,
       message: "Too many location lookups. Please slow down.",
+    });
+  },
+});
+
+/* =====================================================
+   PER-PHONE LOGIN LIMITER (PARTNER PASSWORD LOGIN)
+   authLimiter is IP-keyed, so an attacker rotating IPs
+   could grind one account's password indefinitely. This
+   limiter keys on the target phone number instead: the
+   account itself locks after too many failed attempts,
+   no matter where they come from. Successful logins
+   don't count, so a legit partner is never locked out
+   by their own typos plus a later correct password.
+===================================================== */
+exports.phoneLoginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10,                  // max 10 failed logins per phone
+
+  standardHeaders: true,
+  legacyHeaders: false,
+
+  skipSuccessfulRequests: true,
+
+  keyGenerator: (req) => {
+    const phone = String(req.body?.phone || "").replace(/\s+/g, "").replace(/^\+/, "");
+    return `login:${phone || req.ip}`;
+  },
+
+  handler: (req, res) => {
+    res.status(429).json({
+      success: false,
+      message: "Too many failed login attempts for this account. Try again in 15 minutes.",
     });
   },
 });

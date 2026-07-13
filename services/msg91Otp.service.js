@@ -168,26 +168,56 @@ const decodeJwtPayload = (token) => {
 // own widget uses `identifier` for the mobile, so that's the most likely one.
 const PHONE_KEY_RE = /(phone|mobile|msisdn|identifier|^number$|contact|^to$)/i;
 
-// Walk any JSON value and collect digit-strings that look like phone numbers,
-// but ONLY when they sit under a phone-named key. This deliberately ignores
-// numeric JWT claims like `exp`/`iat` (10-digit unix timestamps) and random
-// numeric IDs, which would otherwise masquerade as phones and cause false
-// mismatches.
-const collectPhoneCandidates = (value, out = new Set(), underPhoneKey = false) => {
+// MSG91 also returns bare payloads in `message` rather than a named field — the
+// web client's own parser relies on exactly this, pulling both the reqId and the
+// access token out of `message`. So a `message` whose entire value is a phone
+// number counts as a candidate too. A human-readable message ("OTP verified
+// successfully") does not, because it isn't phone-shaped.
+const LOOSE_PHONE_KEY_RE = /^(message|msg)$/i;
+
+const isPhoneShaped = (digits) => digits.length >= 10 && digits.length <= 15;
+
+// True only when the value is *nothing but* a phone number, allowing the "+",
+// spaces and dashes MSG91 sometimes formats with. Guards the loose `message`
+// path from swallowing prose that merely contains digits.
+const isBarePhoneString = (value) => {
+  const raw = String(value).trim();
+  if (!/^\+?[\d\s-]+$/.test(raw)) return false;
+  return isPhoneShaped(raw.replace(/\D/g, ""));
+};
+
+// Walk any JSON value and collect digit-strings that look like phone numbers.
+// A value counts when it sits under a phone-named key (at any depth), or when it
+// is a bare phone number under `message`. This deliberately ignores numeric JWT
+// claims like `exp`/`iat` (10-digit unix timestamps) and random numeric IDs,
+// which would otherwise masquerade as phones and cause false mismatches.
+//
+// `keyKind` is "phone" inside a phone-named subtree, "loose" for the immediate
+// value of a `message` key, and null otherwise.
+const collectPhoneCandidates = (value, out = new Set(), keyKind = null) => {
   if (value == null) return out;
   if (typeof value === "string" || typeof value === "number") {
-    if (!underPhoneKey) return out;
     const digits = String(value).replace(/\D/g, "");
-    if (digits.length >= 10 && digits.length <= 15) out.add(digits);
+    if (keyKind === "phone" && isPhoneShaped(digits)) out.add(digits);
+    else if (keyKind === "loose" && isBarePhoneString(value)) out.add(digits);
     return out;
   }
   if (Array.isArray(value)) {
-    for (const item of value) collectPhoneCandidates(item, out, underPhoneKey);
+    for (const item of value) collectPhoneCandidates(item, out, keyKind);
     return out;
   }
   if (typeof value === "object") {
     for (const key of Object.keys(value)) {
-      collectPhoneCandidates(value[key], out, underPhoneKey || PHONE_KEY_RE.test(key));
+      // Once inside a phone-named key, every descendant stays "phone". "loose"
+      // never propagates — it only ever applies to the scalar at `message`.
+      const childKind = PHONE_KEY_RE.test(key)
+        ? "phone"
+        : LOOSE_PHONE_KEY_RE.test(key)
+        ? "loose"
+        : keyKind === "phone"
+        ? "phone"
+        : null;
+      collectPhoneCandidates(value[key], out, childKind);
     }
   }
   return out;

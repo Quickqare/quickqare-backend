@@ -1,6 +1,7 @@
 const multer = require("multer");
 const multerS3 = require("multer-s3");
 const r2Client = require("./r2");
+const { extFromMime } = require("../utils/imageExt");
 
 const ALLOWED_MIME_TYPES = ["image/jpeg", "image/png", "image/webp"];
 
@@ -21,7 +22,8 @@ const r2Upload = multer({
     // clients may cache forever — saves R2 Class B reads on repeat views.
     cacheControl: "public, max-age=31536000, immutable",
     key: (_req, file, cb) => {
-      const ext = file.originalname.split(".").pop().toLowerCase() || "jpg";
+      // Extension from the verified MIME type, not the client filename.
+      const ext = extFromMime(file.mimetype);
       const folder = file.fieldname === "selfie" ? "selfies" : "kyc";
       const filename = `${folder}/${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
       cb(null, filename);

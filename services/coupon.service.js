@@ -93,13 +93,31 @@ const validateCouponForAmount = async ({ code, amount, customerId = null, servic
     throw err;
   }
 
-  if (
-    coupon.usageLimit &&
-    Number(coupon.usedCount || 0) >= Number(coupon.usageLimit || 0)
-  ) {
-    const err = new Error("Coupon usage limit reached");
-    err.statusCode = 400;
-    throw err;
+  if (coupon.usageLimit) {
+    // usedCount is the committed redemption count, bumped atomically only after
+    // payment. As with the per-user check below, unpaid bookings holding a live
+    // payment lock must ALSO count toward the global limit — otherwise N
+    // customers can each open a PENDING_PAYMENT booking with the same limited
+    // coupon before any redemption lands, then all pay and all receive the
+    // discount, overshooting usageLimit. (recordCouponRedemption's atomic guard
+    // then rejects the losers, but the discount was already baked into their
+    // booking total at creation, so the promo budget still leaks.) Counting
+    // in-flight locks here shrinks that window to the booking-commit instant,
+    // matching the guarantee the per-user path already provides.
+    const globalInFlight = await Booking.countDocuments({
+      couponId: coupon._id,
+      status: "PENDING_PAYMENT",
+      lockedUntil: { $gt: new Date() },
+    });
+
+    if (
+      Number(coupon.usedCount || 0) + globalInFlight >=
+      Number(coupon.usageLimit || 0)
+    ) {
+      const err = new Error("Coupon usage limit reached");
+      err.statusCode = 400;
+      throw err;
+    }
   }
 
   // Service restriction check — only runs if coupon targets specific services

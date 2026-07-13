@@ -6,7 +6,7 @@ const authenticateAdmin = require("../../middleware/authenticateAdmin");
 const authorize = require("../../middleware/authorize");
 const audit = require("../../middleware/audit");
 const { PERMISSIONS } = require("../../constants/permissions");
-const { asSingleString, getPagination } = require("../../utils/common");
+const { asSingleString, getPagination, escapeRegex } = require("../../utils/common");
 const { success, fail } = require("../../utils/response");
 
 const router = express.Router();
@@ -18,12 +18,13 @@ router.get("/", async (req, res) => {
     const q = String(asSingleString(req.query.q) || "").trim();
     const { page, pageSize, skip, limit } = getPagination(req);
 
+    const qSafe = escapeRegex(q);
     const where = q
       ? {
           $or: [
-            { name: { $regex: q, $options: "i" } },
-            { phone: { $regex: q, $options: "i" } },
-            { email: { $regex: q, $options: "i" } },
+            { name: { $regex: qSafe, $options: "i" } },
+            { phone: { $regex: qSafe, $options: "i" } },
+            { email: { $regex: qSafe, $options: "i" } },
           ],
         }
       : {};

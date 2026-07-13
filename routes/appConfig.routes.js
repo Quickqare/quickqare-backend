@@ -8,6 +8,13 @@ const DEFAULT_SOCIAL_LINKS = {
   whatsapp: "", instagram: "", facebook: "", twitter: "", youtube: "",
 };
 
+const ICON_ANIM_STYLES = ["none", "bob", "bounce", "tada"];
+// Legacy values (booleans from the earlier on/off version) map to bob/none.
+const iconAnimStyle = (v) => {
+  if (v === false) return "none";
+  return ICON_ANIM_STYLES.includes(v) ? v : "bob";
+};
+
 const DEFAULT_THEME = {
   isActive: false,
   themeName: "default",
@@ -56,9 +63,19 @@ router.get("/", async (_req, res) => {
       // Web shows a built-in promo banner when no custom banner is live, unless
       // this is explicitly turned off. Default true (undefined → true).
       defaultBannerEnabled: settings?.defaultBannerEnabled !== false,
-      // Customer app: staggered slide-up entrance on the home category icons.
+      // Customer app + web: home category icon animation (entrance + loop).
       // Off = icons render static. Default true (undefined → true).
       homeIconAnimationEnabled: settings?.homeIconAnimationEnabled !== false,
+      // Per-icon animation style ("none" | "bob" | "bounce" | "tada") —
+      // only consulted when the master switch above is on.
+      homeIconAnimation: {
+        acRepair:    iconAnimStyle(settings?.homeIconAnimation?.acRepair),
+        plumbing:    iconAnimStyle(settings?.homeIconAnimation?.plumbing),
+        mehendi:     iconAnimStyle(settings?.homeIconAnimation?.mehendi),
+        electrician: iconAnimStyle(settings?.homeIconAnimation?.electrician),
+        celebration: iconAnimStyle(settings?.homeIconAnimation?.celebration),
+        offers:      iconAnimStyle(settings?.homeIconAnimation?.offers),
+      },
       socialLinks: {
         whatsapp:  settings?.socialLinks?.whatsapp  || DEFAULT_SOCIAL_LINKS.whatsapp,
         instagram: settings?.socialLinks?.instagram || DEFAULT_SOCIAL_LINKS.instagram,
@@ -101,6 +118,10 @@ router.get("/", async (_req, res) => {
       razorpayKeyId: process.env.RAZORPAY_KEY_ID || "",
       defaultBannerEnabled: true,
       homeIconAnimationEnabled: true,
+      homeIconAnimation: {
+        acRepair: "bob", plumbing: "bob", mehendi: "bob",
+        electrician: "bob", celebration: "bob", offers: "bob",
+      },
       socialLinks: DEFAULT_SOCIAL_LINKS,
       homeTheme: DEFAULT_THEME,
     });

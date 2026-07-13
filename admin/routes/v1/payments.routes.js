@@ -13,6 +13,7 @@ const PayoutBatch = require("../../models/PayoutBatch");
 const { PERMISSIONS } = require("../../constants/permissions");
 const { getPagination, asSingleString } = require("../../utils/common");
 const { success, fail } = require("../../utils/response");
+const { decryptBankDetails } = require("../../../utils/fieldCrypto");
 const { debitWallet } = require("../../../controllers/partnerWallet.controller");
 
 const router = express.Router();
@@ -142,6 +143,12 @@ router.get(
           .lean(),
         Withdrawal.countDocuments(filter),
       ]);
+
+      // Decrypt the at-rest bank details so the admin sees the real account
+      // number/IFSC needed to make the payout. rows are lean → mutate in place.
+      for (const row of rows) {
+        if (row.bankDetails) row.bankDetails = decryptBankDetails(row.bankDetails);
+      }
 
       return success(res, rows, {
         requestId: req.requestId,

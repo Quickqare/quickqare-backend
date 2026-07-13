@@ -10,6 +10,7 @@ const { emitBookingUpdate } = require("../socket/emitters");
 const { completeBooking } = require("./booking.controller");
 const { deriveH3Cell } = require("../utils/h3");
 const { fileToPublicUrl } = require("../utils/fileUrl");
+const { getSensitiveFileUrl } = require("../utils/sensitiveFileUrl");
 const {
   filterServicesByZone,
   filterServicesByHubs,
@@ -580,7 +581,7 @@ exports.uploadMySelfie = async (req, res) => {
       return res.status(400).json({ success: false, message: "Selfie image is required" });
     }
 
-    // Public URL of the uploaded selfie (R2 / Cloudinary / local — see utils/fileUrl).
+    // Stored URL of the uploaded selfie (R2 / Cloudinary / local — see utils/fileUrl).
     const selfieUrl = fileToPublicUrl(req, req.file);
 
     req.partner.selfieUrl = selfieUrl;
@@ -588,7 +589,11 @@ exports.uploadMySelfie = async (req, res) => {
     req.partner.selfieRejectionReason = "";
     await req.partner.save();
 
-    return res.json({ success: true, selfieUrl, selfieVerificationStatus: "PENDING" });
+    // Hand the client a viewable URL. When R2_PRIVATE_UPLOADS is on this is a
+    // short-lived signed URL; otherwise it's the stored URL unchanged.
+    const viewableUrl = await getSensitiveFileUrl(selfieUrl);
+
+    return res.json({ success: true, selfieUrl: viewableUrl, selfieVerificationStatus: "PENDING" });
   } catch (err) {
     console.error("uploadMySelfie error:", err);
     return res.status(500).json({ success: false, message: "Failed to upload selfie" });

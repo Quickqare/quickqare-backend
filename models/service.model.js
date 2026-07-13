@@ -207,15 +207,31 @@ const serviceSchema = new mongoose.Schema(
       default: [],
     },
 
-    // When false, gallery photos stay on the first photo instead of
-    // auto-sliding (app thumbnails/hero and web card carousel).
+    // When false, the APP gallery (media360) stays on the first photo
+    // instead of auto-sliding. Controlled independently from the web toggle
+    // below — admins can turn one platform's slideshow off without affecting
+    // the other.
     autoSlideEnabled: {
       type: Boolean,
       default: true,
     },
 
-    // Seconds each photo stays before sliding to the next (app + web).
+    // Seconds each photo stays before sliding to the next, APP only.
     autoSlideSeconds: {
+      type: Number,
+      default: 3,
+      min: 1,
+      max: 30,
+    },
+
+    // Same as autoSlideEnabled/autoSlideSeconds above, but for the WEB card
+    // carousel (webMedia360) — mirrors the imageUrl/webImageUrl split.
+    webAutoSlideEnabled: {
+      type: Boolean,
+      default: true,
+    },
+
+    webAutoSlideSeconds: {
       type: Number,
       default: 3,
       min: 1,

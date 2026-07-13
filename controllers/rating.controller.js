@@ -5,12 +5,42 @@ const Service = require("../models/service.model");
 
 exports.submitRating = async (req, res) => {
   try {
-    const { bookingId, serviceId, partnerId, rating, tags, reviewText } = req.body;
+    // partnerId / serviceId are NEVER taken from the client — they are derived
+    // from the booking below, so a caller can't attribute a rating to an
+    // arbitrary partner/service they didn't actually book.
+    const { bookingId, rating, tags, reviewText } = req.body;
     const customerId = req.user.id;
 
-    if (!bookingId || !rating) {
+    if (!bookingId || rating === undefined || rating === null) {
       return res.status(400).json({ success: false, message: "Missing required fields" });
     }
+
+    const ratingValue = Number(rating);
+    if (!Number.isFinite(ratingValue) || ratingValue < 1 || ratingValue > 5) {
+      return res.status(400).json({ success: false, message: "rating must be between 1 and 5" });
+    }
+
+    // Ownership + eligibility: the booking must belong to the caller and be
+    // completed. This is the IDOR gate — without it any user could rate any
+    // booking and skew any partner's/service's aggregate score.
+    const booking = await Booking.findOne({ _id: bookingId, user: customerId })
+      .select("partner primaryService serviceId services status")
+      .lean();
+
+    if (!booking) {
+      return res.status(404).json({ success: false, message: "Booking not found" });
+    }
+    if (booking.status !== "COMPLETED") {
+      return res.status(400).json({ success: false, message: "Only completed bookings can be rated" });
+    }
+
+    // Derive the rated entities from the booking, not the request body.
+    const partnerId = booking.partner || null;
+    const serviceId =
+      booking.primaryService ||
+      booking.serviceId ||
+      booking.services?.[0]?.serviceId ||
+      null;
 
     // Prevent duplicate ratings
     const existing = await Rating.findOne({ bookingId });
@@ -23,7 +53,7 @@ exports.submitRating = async (req, res) => {
       serviceId,
       partnerId,
       customerId,
-      rating,
+      rating: ratingValue,
       tags,
       reviewText,
     });
@@ -35,7 +65,7 @@ exports.submitRating = async (req, res) => {
       if (partner) {
         const totalReviews = partner.totalReviews || 0;
         const oldAvg = partner.rating || 0;
-        const newAvg = (oldAvg * totalReviews + rating) / (totalReviews + 1);
+        const newAvg = (oldAvg * totalReviews + ratingValue) / (totalReviews + 1);
 
         partner.rating = parseFloat(newAvg.toFixed(2));
         partner.totalReviews = totalReviews + 1;
@@ -49,7 +79,7 @@ exports.submitRating = async (req, res) => {
       if (service) {
         const totalReviews = service.totalReviews || 0;
         const oldAvg = service.rating || 0;
-        const newAvg = (oldAvg * totalReviews + rating) / (totalReviews + 1);
+        const newAvg = (oldAvg * totalReviews + ratingValue) / (totalReviews + 1);
 
         service.rating = parseFloat(newAvg.toFixed(2));
         service.totalReviews = totalReviews + 1;

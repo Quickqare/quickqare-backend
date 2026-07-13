@@ -34,6 +34,10 @@ const mongoose = require("mongoose");
 const cors = require("cors");
 const helmet = require("helmet");
 const path = require("path");
+const qs = require("qs");
+
+const { sanitizeMongo, sanitizeInPlace } = require("./middlewares/sanitizeMongo");
+const { globalLimiter } = require("./middlewares/rateLimiter");
 
 const { setSocketIO } = require("./socket/emitters");
 const { ensureBootstrapAdmin } = require("./services/adminBootstrap.service");
@@ -123,6 +127,13 @@ const corsOptions = {
 
 app.set("trust proxy", 1); // important for rate limit + deployment
 
+// Sanitising query parser: parse the query string with qs (Express's default
+// "extended" parser) then strip any MongoDB operator ($..) / dotted keys before
+// req.query is ever read. Doing it here — not in a middleware — is the only
+// effective place, because Express re-derives req.query from the URL on each
+// access, so mutating it in a middleware wouldn't stick.
+app.set("query parser", (str) => sanitizeInPlace(qs.parse(str)));
+
 app.use(helmet());
 app.use(cors(corsOptions));
 
@@ -137,6 +148,19 @@ app.post(
 );
 
 app.use(express.json({ limit: "1mb" }));
+
+// NoSQL-injection guard on parsed bodies/params (defense-in-depth). Runs after
+// express.json so req.body is populated, and after the raw webhook mount above
+// so the webhook's raw Buffer body is never touched.
+app.use(sanitizeMongo);
+
+// Global rate-limit floor across the whole API. Per-endpoint limiters
+// (auth/OTP/payment/maps) still stack on top with their stricter caps — this is
+// only a ceiling that stops a broad flood of otherwise-unlimited endpoints
+// (booking, addresses, profile reads, …). Scoped to /api so /health and
+// /uploads are never throttled.
+app.use("/api", globalLimiter);
+
 // Filenames are timestamp-unique, never rewritten — safe to cache forever.
 app.use("/uploads", express.static(path.join(__dirname, "uploads"), { maxAge: "365d", immutable: true }));
 

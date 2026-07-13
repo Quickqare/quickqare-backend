@@ -88,6 +88,19 @@ const adminSettingSchema = new mongoose.Schema(
     ============================================= */
     homeIconAnimationEnabled: { type: Boolean, default: true },
 
+    /* Per-icon animation style for the home category icons (app + web).
+       Only consulted when homeIconAnimationEnabled (the master switch) is
+       true. "none" = that icon stays static even with the master on.
+       "offers" is the app-only Offers icon at the end of the quick-row. */
+    homeIconAnimation: {
+      acRepair:    { type: String, enum: ["none", "bob", "bounce", "tada"], default: "bob" },
+      plumbing:    { type: String, enum: ["none", "bob", "bounce", "tada"], default: "bob" },
+      mehendi:     { type: String, enum: ["none", "bob", "bounce", "tada"], default: "bob" },
+      electrician: { type: String, enum: ["none", "bob", "bounce", "tada"], default: "bob" },
+      celebration: { type: String, enum: ["none", "bob", "bounce", "tada"], default: "bob" },
+      offers:      { type: String, enum: ["none", "bob", "bounce", "tada"], default: "bob" },
+    },
+
     /* =============================================
        HOME SCREEN THEME  (festival / campaign UI)
        All color values are CSS hex strings.

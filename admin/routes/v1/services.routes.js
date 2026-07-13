@@ -442,6 +442,10 @@ router.patch("/:id", audit("admin.services.update"), async (req, res) => {
     if (req.body.autoSlideSeconds !== undefined) {
       patch.autoSlideSeconds = Math.min(30, Math.max(1, Number(req.body.autoSlideSeconds) || 3));
     }
+    if (req.body.webAutoSlideEnabled !== undefined) patch.webAutoSlideEnabled = Boolean(req.body.webAutoSlideEnabled);
+    if (req.body.webAutoSlideSeconds !== undefined) {
+      patch.webAutoSlideSeconds = Math.min(30, Math.max(1, Number(req.body.webAutoSlideSeconds) || 3));
+    }
     if (Array.isArray(req.body.ingredients)) {
       patch.ingredients = req.body.ingredients
         .map((item) => String(item || "").trim())

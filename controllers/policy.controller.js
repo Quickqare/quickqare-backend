@@ -53,7 +53,7 @@ const updatePolicy = async (req, res) => {
   try {
     const { type } = req.params;
     const { title, content } = req.body;
-    const adminId = req.user ? req.user.id : null; 
+    const adminId = req.adminUser ? req.adminUser.id : null;
     const fallback = resolveDefaultPolicy(type);
 
     let policy = await Policy.findOne({ type });

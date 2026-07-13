@@ -4,7 +4,8 @@
 //     file.key the object key. R2 buckets aren't publicly reachable at that endpoint,
 //     so we prefer R2_PUBLIC_URL (the bucket's public/custom domain) + key. We fall
 //     back to file.location only if R2_PUBLIC_URL isn't configured.
-//   - Cloudinary (multer-storage-cloudinary): file.path is the hosted https URL.
+//   - Any storage that returns a fully-qualified https URL in file.path is passed
+//     through as-is.
 //   - Local disk (USE_LOCAL_UPLOADS): build from PUBLIC_BASE_URL (or the request host)
 //     + /uploads/<filename>.
 //
@@ -20,7 +21,7 @@ function fileToPublicUrl(req, file) {
     return publicBase && key ? `${publicBase}/${key}` : file.location;
   }
 
-  // Cloudinary already returns a fully-qualified https URL in file.path
+  // Any backend that hands back a fully-qualified https URL in file.path
   const filePath = String(file.path || "");
   if (filePath.startsWith("http://") || filePath.startsWith("https://")) {
     return filePath;

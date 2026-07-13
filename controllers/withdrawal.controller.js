@@ -1,6 +1,7 @@
 const Withdrawal = require("../models/Withdrawal");
 const PartnerWallet = require("../models/PartnerWallet");
 const WalletTransaction = require("../models/WalletTransaction");
+const { encryptBankDetails, maskAccountNumber } = require("../utils/fieldCrypto");
 
 const roundAmount = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
 
@@ -93,7 +94,9 @@ exports.requestWithdrawal = async (req, res) => {
     const withdrawal = await Withdrawal.create({
       partnerId,
       amount,
-      bankDetails: req.partner.bankDetails,
+      // Encrypt the snapshot at rest. Idempotent: if req.partner.bankDetails is
+      // already encrypted (saved via saveBankDetails), this is a no-op.
+      bankDetails: encryptBankDetails(req.partner.bankDetails),
       status: "PENDING",
     });
 
@@ -139,19 +142,26 @@ exports.saveBankDetails = async (req, res) => {
       });
     }
 
-    req.partner.bankDetails = {
+    // Encrypt sensitive fields (account number, IFSC) before persisting.
+    req.partner.bankDetails = encryptBankDetails({
       accountHolderName,
       accountNumber,
       ifsc,
       bankName,
-    };
+    });
 
     await req.partner.save();
 
+    // Never echo the full account number back — confirm with a masked value.
     res.json({
       success: true,
       message: "Bank details saved successfully",
-      bankDetails: req.partner.bankDetails,
+      bankDetails: {
+        accountHolderName,
+        accountNumber: maskAccountNumber(accountNumber),
+        ifsc,
+        bankName,
+      },
     });
   } catch (error) {
     console.error("Save bank details error:", error);

@@ -20,8 +20,15 @@ const getPagination = (req, defaults = { page: 1, pageSize: 20, maxPageSize: 100
 
 const newRequestId = () => crypto.randomUUID();
 
+// Escape regex metacharacters so a user-supplied search term is matched
+// literally in a Mongo $regex query. Without this, input like ".*" or a
+// catastrophic-backtracking pattern is interpreted as a regex and can pin the
+// DB CPU (ReDoS). Callers still control anchoring / $options.
+const escapeRegex = (value) => String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 module.exports = {
   asSingleString,
   getPagination,
   newRequestId,
+  escapeRegex,
 };

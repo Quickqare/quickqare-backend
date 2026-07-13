@@ -5,8 +5,11 @@ const authorize = require("../../middleware/authorize");
 const audit = require("../../middleware/audit");
 const { PERMISSIONS } = require("../../constants/permissions");
 const { success, fail } = require("../../utils/response");
+const { isSafeLinkUrl } = require("../../../utils/safeUrl");
 
 const router = express.Router();
+
+const SOCIAL_LINK_KEYS = ["whatsapp", "instagram", "facebook", "twitter", "youtube"];
 
 router.use(authenticateAdmin, authorize(PERMISSIONS.SETTINGS_MANAGE));
 
@@ -54,6 +57,19 @@ router.patch("/settings", audit("admin.settings.update"), async (req, res) => {
     }
     if (req.body.homeIconAnimationEnabled !== undefined) {
       settings.homeIconAnimationEnabled = Boolean(req.body.homeIconAnimationEnabled);
+    }
+
+    // Per-icon home icon animation style. Unknown keys/values are ignored;
+    // legacy booleans (old on/off version) map to bob/none.
+    if (req.body.homeIconAnimation !== undefined && typeof req.body.homeIconAnimation === "object") {
+      const iconKeys = ["acRepair", "plumbing", "mehendi", "electrician", "celebration", "offers"];
+      const styles = ["none", "bob", "bounce", "tada"];
+      for (const k of iconKeys) {
+        let v = req.body.homeIconAnimation[k];
+        if (v === true) v = "bob";
+        if (v === false) v = "none";
+        if (styles.includes(v)) settings.homeIconAnimation[k] = v;
+      }
     }
 
     // Pricing (platform fee + tax). Clamped to sane ranges.
@@ -111,6 +127,23 @@ router.patch("/settings", audit("admin.settings.update"), async (req, res) => {
     if (req.body.socialLinks !== undefined && typeof req.body.socialLinks === "object") {
       const s = req.body.socialLinks;
       const url = (v) => (typeof v === "string" ? v.trim().slice(0, 512) : "");
+
+      // These render straight into an <a href> in the web footer, so a
+      // `javascript:` URL here would be stored XSS. See utils/safeUrl.js.
+      const badLink = SOCIAL_LINK_KEYS.find(
+        (key) => s[key] !== undefined && !isSafeLinkUrl(url(s[key]))
+      );
+      if (badLink) {
+        return fail(
+          res,
+          400,
+          "VALIDATION_ERROR",
+          `socialLinks.${badLink} must be an absolute http:// or https:// URL`,
+          null,
+          { requestId: req.requestId }
+        );
+      }
+
       const cur = settings.socialLinks || {};
       settings.socialLinks = {
         whatsapp:  s.whatsapp  !== undefined ? url(s.whatsapp)  : (cur.whatsapp  || ""),

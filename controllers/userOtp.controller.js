@@ -20,14 +20,27 @@ const {
 const USER_TOKEN_TTL = String(process.env.USER_JWT_TTL || "90d");
 const IS_PRODUCTION = String(process.env.NODE_ENV || "").toLowerCase() === "production";
 
-// Phone-binding enforcement for the MSG91 access-token exchange:
-//   "enforce" (default) — reject when the verified token belongs to a different
-//                         phone than the one being claimed (the account-takeover fix).
-//   "off"               — skip the check (legacy behaviour / emergency kill-switch).
-// In every mode we ALLOW the request when no phone could be recovered from MSG91
-// (so a format change on MSG91's side can never lock all users out — it only
-// degrades the protection, and logs loudly so it's caught).
-const PHONE_BINDING_MODE = String(process.env.MSG91_PHONE_BINDING || "enforce").toLowerCase();
+// Phone-binding enforcement for the MSG91 access-token exchange.
+//
+// The access token only certifies that *some* phone completed an OTP. Without
+// binding it to the phone being claimed, an attacker can OTP their own number,
+// then POST {phone: <victim>, accessToken: <their own valid token>} and get a
+// session as the victim. Modes:
+//
+//   "strict" (default) — reject on mismatch AND when no phone could be recovered
+//                        from MSG91. Fails closed: an unverifiable token never
+//                        mints a session.
+//   "enforce"          — reject on mismatch, but ALLOW when no phone could be
+//                        recovered. Fails open. Only use this as a temporary
+//                        mitigation if MSG91 changes its response format and
+//                        strict mode starts rejecting real logins — it leaves
+//                        the takeover above exploitable, so treat it as an
+//                        incident, not a setting.
+//   "off"              — skip the check entirely (emergency kill-switch).
+//
+// If a deploy of strict mode breaks logins, the fix is to make extraction work
+// (services/msg91Otp.service.js), not to sit on "enforce".
+const PHONE_BINDING_MODE = String(process.env.MSG91_PHONE_BINDING || "strict").toLowerCase();
 
 const lastFour = (value) => {
   const d = String(value || "").replace(/\D/g, "");
@@ -119,6 +132,11 @@ exports.verifyOtp = async (req, res) => {
 
     return res.json({
       success: true,
+      // Whether this login just created the account. Clients use it to decide
+      // whether to show the "complete your profile" step — without it they were
+      // left guessing from the user's fields, which misfired for anyone who has
+      // no gender set (a legitimate choice).
+      isNewUser,
       token,
       user,
     });
@@ -152,12 +170,25 @@ exports.exchangeMsg91AccessToken = async (req, res) => {
       if (PHONE_BINDING_MODE !== "off") {
         const verifiedPhones = verification?.verifiedPhones || [];
         if (verifiedPhones.length === 0) {
-          // Couldn't recover the verified phone from MSG91 — fail open (don't
-          // lock users out) but log so this is noticed and investigated.
+          // No phone in the token or the verifyAccessToken response, so the
+          // binding can't be checked at all.
+          if (PHONE_BINDING_MODE === "strict") {
+            console.error(
+              "[auth] MSG91 phone binding could not be checked — no phone in token/response. " +
+                "Rejecting exchange for %s. MSG91's verifyAccessToken format has likely changed; " +
+                "fix extraction in services/msg91Otp.service.js.",
+              lastFour(phone)
+            );
+            return res.status(401).json({
+              message: "Could not verify the phone number for this OTP. Please try again.",
+            });
+          }
           console.error(
             "[auth] MSG91 phone binding could not be checked — no phone in token/response. " +
-              "Verify MSG91's verifyAccessToken format. Allowing exchange for",
-            lastFour(phone)
+              "ALLOWING exchange for %s because MSG91_PHONE_BINDING=%s (fail-open). " +
+              "Account takeover is possible while this is set — fix extraction and return to strict.",
+            lastFour(phone),
+            PHONE_BINDING_MODE
           );
         } else if (!phoneMatchesVerified(verifiedPhones, phone)) {
           // Verified phone differs from the claimed phone → reject.
@@ -226,6 +257,11 @@ exports.exchangeMsg91AccessToken = async (req, res) => {
 
     return res.json({
       success: true,
+      // Whether this login just created the account. Clients use it to decide
+      // whether to show the "complete your profile" step — without it they were
+      // left guessing from the user's fields, which misfired for anyone who has
+      // no gender set (a legitimate choice).
+      isNewUser,
       token,
       user,
     });

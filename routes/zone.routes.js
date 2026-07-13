@@ -6,6 +6,8 @@ const zoneController = require("../controllers/zone.controller");
 // Admin-panel JWT (ADMIN_JWT_ACCESS_SECRET) — the legacy shared-secret
 // adminAuth middleware was removed; only real admin accounts pass this.
 const adminAuth = require("../admin/middleware/authenticateAdmin");
+const authorize = require("../admin/middleware/authorize");
+const { PERMISSIONS } = require("../admin/constants/permissions");
 
 /* =====================================================
    ZONE ROUTES (PRODUCTION READY)
@@ -123,6 +125,7 @@ router.get("/:id", zoneController.getZone);
 router.post(
   "/",
   adminAuth,
+  authorize(PERMISSIONS.ZONES_MANAGE),
   zoneController.createZone
 );
 
@@ -132,6 +135,7 @@ router.post(
 router.put(
   "/:id",
   adminAuth,
+  authorize(PERMISSIONS.ZONES_MANAGE),
   zoneController.updateZone
 );
 
@@ -141,6 +145,7 @@ router.put(
 router.delete(
   "/:id",
   adminAuth,
+  authorize(PERMISSIONS.ZONES_MANAGE),
   zoneController.deleteZone
 );
 

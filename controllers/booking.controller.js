@@ -825,49 +825,6 @@ exports.createBooking = async (req, res) => {
   }
 };
 /* =======================
-   PAYMENT VERIFIED → AUTO ASSIGN PARTNER
-======================= */
-exports.afterPaymentSuccess = async (req, res) => {
-  try {
-    const { bookingId } = req.params;
-
-    const booking = await Booking.findById(bookingId);
-    if (!booking) return res.status(404).json({ message: "Booking not found" });
-
-    booking.payment.status = "PAID";
-    booking.lockedUntil = null; // Convert lock to permanent capacity
-    booking.slotReservationExpiresAt = null;
-    await markSlotLockPaid(booking._id);
-
-    const scheduledStart = booking.scheduledStartAt 
-      ? new Date(booking.scheduledStartAt) 
-      : buildDateTime(booking.scheduledDate, booking.scheduledTime);
-
-    // Always try instant assignment. If no partner is found right now, assignBooking
-    // falls back to QUEUED (via queueOnFailure) so the cron retries automatically.
-    booking.status = "SEARCHING";
-    await booking.save();
-
-    if (global.io) {
-      global.io.to(`user_${booking.user}`).emit("booking_update", {
-        bookingId: booking._id.toString(),
-        status: "SEARCHING",
-        paymentConfirmed: true,
-      });
-    }
-
-    await assignBooking(booking._id, { queueOnFailure: true });
-
-    res.json({
-      success: true,
-      message: "Payment verified. Searching for partner.",
-    });
-  } catch (err) {
-    res.status(500).json({ message: err.message });
-  }
-};
-
-/* =======================
    GET AVAILABLE SLOTS
 ======================= */
 exports.getAvailableSlots = async (req, res) => {

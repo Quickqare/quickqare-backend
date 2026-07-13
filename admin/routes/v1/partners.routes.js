@@ -8,8 +8,9 @@ const authenticateAdmin = require("../../middleware/authenticateAdmin");
 const authorize = require("../../middleware/authorize");
 const audit = require("../../middleware/audit");
 const { PERMISSIONS } = require("../../constants/permissions");
-const { asSingleString, getPagination } = require("../../utils/common");
+const { asSingleString, getPagination, escapeRegex } = require("../../utils/common");
 const { success, fail } = require("../../utils/response");
+const { getSensitiveFileUrl } = require("../../../utils/sensitiveFileUrl");
 const { trackApiCall } = require("../../../services/apiCallTracker.service");
 
 const router = express.Router();
@@ -33,10 +34,11 @@ router.get("/", async (req, res) => {
 
     const q = String(asSingleString(req.query.q) || "").trim();
     if (q) {
+      const qSafe = escapeRegex(q);
       where.$or = [
-        { name:  { $regex: q, $options: "i" } },
-        { phone: { $regex: q, $options: "i" } },
-        { email: { $regex: q, $options: "i" } },
+        { name:  { $regex: qSafe, $options: "i" } },
+        { phone: { $regex: qSafe, $options: "i" } },
+        { email: { $regex: qSafe, $options: "i" } },
       ];
     }
 
@@ -203,6 +205,10 @@ router.get("/:id/stats", async (req, res) => {
       return fail(res, 404, "NOT_FOUND", "Partner not found", null, { requestId: req.requestId });
     }
 
+    // Sign the selfie URL for admin review when private uploads are enabled
+    // (no-op otherwise). The selfie is identity data, not public media.
+    if (partner.selfieUrl) partner.selfieUrl = await getSensitiveFileUrl(partner.selfieUrl);
+
     const pid = new mongoose.Types.ObjectId(partnerId);
     const [totalJobs, pendingJobs, completedJobs, earningsAgg, wallet, activeBookings] = await Promise.all([
       Booking.countDocuments({ partner: pid, status: { $nin: ["PENDING_PAYMENT", "CANCELLED"] } }),
@@ -328,6 +334,8 @@ router.patch("/:id/selfie-verification", audit("admin.partners.selfie_verificati
     if (!updated) {
       return fail(res, 404, "NOT_FOUND", "Partner not found", null, { requestId: req.requestId });
     }
+
+    if (updated.selfieUrl) updated.selfieUrl = await getSensitiveFileUrl(updated.selfieUrl);
 
     // Notify partner via socket if connected
     if (global.io) {

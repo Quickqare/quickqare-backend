@@ -1,10 +1,12 @@
 const express = require("express");
 const ApiCallStat = require("../../../models/ApiCallStat");
 const authenticateAdmin = require("../../middleware/authenticateAdmin");
+const authorize = require("../../middleware/authorize");
+const { PERMISSIONS } = require("../../constants/permissions");
 const { success, fail } = require("../../utils/response");
 
 const router = express.Router();
-router.use(authenticateAdmin);
+router.use(authenticateAdmin, authorize(PERMISSIONS.ANALYTICS_READ));
 
 const GOOGLE_SOURCES = [
   "partner_heartbeat",

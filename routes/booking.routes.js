@@ -42,6 +42,23 @@ router.get(
   bookingController.getActiveCart
 );
 
+// Get available slots.
+//
+// Declared BEFORE "/:bookingId": Express matches in registration order, so with
+// the param route first, GET /api/booking/available-slots was swallowed by
+// getBookingById — which then looked up "available-slots" as an ObjectId. The
+// GET route was effectively dead (web uses the POST variant, which is why this
+// went unnoticed). Any new static path under /api/booking must go above the
+// param route too.
+router.get(
+  "/available-slots",
+  bookingController.getAvailableSlots
+);
+router.post(
+  "/available-slots",
+  bookingController.getAvailableSlots
+);
+
 // Get a single booking by ID
 router.get(
   "/:bookingId",
@@ -68,16 +85,6 @@ router.post(
   "/:bookingId/estimate/respond",
   userAuth,
   bookingController.respondToEstimate
-);
-
-// Get available slots
-router.get(
-  "/available-slots",
-  bookingController.getAvailableSlots
-);
-router.post(
-  "/available-slots",
-  bookingController.getAvailableSlots
 );
 
 /* =========================

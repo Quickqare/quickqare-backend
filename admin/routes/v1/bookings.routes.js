@@ -9,7 +9,7 @@ const BookingAssignment = require("../../models/BookingAssignment");
 const BookingTimeline = require("../../models/BookingTimeline");
 const Refund = require("../../models/Refund");
 const { PERMISSIONS } = require("../../constants/permissions");
-const { asSingleString, getPagination } = require("../../utils/common");
+const { asSingleString, getPagination, escapeRegex } = require("../../utils/common");
 const { success, fail } = require("../../utils/response");
 
 const router = express.Router();
@@ -85,8 +85,9 @@ router.get("/", async (req, res) => {
     if (q) {
       // Search by booking ID (exact), customer phone, or customer name
       const isObjectId = mongoose.Types.ObjectId.isValid(q);
+      const qSafe = escapeRegex(q);
       const userMatches = await require("../../../models/User")
-        .find({ $or: [{ phone: { $regex: q, $options: "i" } }, { name: { $regex: q, $options: "i" } }] })
+        .find({ $or: [{ phone: { $regex: qSafe, $options: "i" } }, { name: { $regex: qSafe, $options: "i" } }] })
         .select("_id").lean();
       const userIds = userMatches.map((u) => u._id);
       const orClauses = [{ user: { $in: userIds } }];

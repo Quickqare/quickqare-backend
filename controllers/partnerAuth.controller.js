@@ -28,6 +28,19 @@ const lastFour = (value) => {
   return d ? `…${d.slice(-4)}` : "(none)";
 };
 
+// Same policy registerPartnerValidator enforces — reset must not be a way to
+// downgrade to a weaker password. Returns an error message, or null when valid.
+const passwordPolicyError = (password) => {
+  const value = String(password || "");
+  if (value.length < 8) {
+    return "Password must be at least 8 characters";
+  }
+  if (!/^(?=.*[A-Z])(?=.*\d)/.test(value)) {
+    return "Password must contain at least one uppercase letter and one number";
+  }
+  return null;
+};
+
 // True when the exchange must be REJECTED (verified phone ≠ claimed phone).
 // Fails OPEN (returns false) when no phone can be recovered from MSG91, so a
 // change in MSG91's response format degrades protection and logs loudly rather
@@ -92,7 +105,11 @@ exports.registerPartner = async (req, res) => {
       });
     }
 
+    // Never honoured in production — same rule as MSG91_SKIP_ACCESS_TOKEN_VERIFY
+    // in the login/reset flows. Without the gate, a leftover test flag on the
+    // server would let anyone register partners with an unverified phone.
     const skipServerVerify =
+      !IS_PRODUCTION &&
       String(process.env.SKIP_MSG91_SERVER_VERIFY || "").toLowerCase() === "true";
 
     if (!skipServerVerify) {
@@ -185,11 +202,16 @@ exports.registerPartner = async (req, res) => {
       { expiresIn: PARTNER_TOKEN_TTL }
     );
 
+    // `select: false` on password only applies to queries — the document
+    // returned by create() still carries the hash, so strip it like login does.
+    const safePartner = partner.toObject();
+    delete safePartner.password;
+
     res.status(201).json({
       success: true,
       message: "Partner registered successfully",
       token,
-      partner,
+      partner: safePartner,
     });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -422,10 +444,11 @@ exports.resetPartnerPasswordWithMsg91 = async (req, res) => {
       });
     }
 
-    if (String(newPassword).length < 6) {
+    const policyError = passwordPolicyError(newPassword);
+    if (policyError) {
       return res.status(400).json({
         success: false,
-        message: "Password must be at least 6 characters long",
+        message: policyError,
       });
     }
 
@@ -483,10 +506,11 @@ exports.resetPartnerPassword = async (req, res) => {
       });
     }
 
-    if (String(newPassword).length < 6) {
+    const policyError = passwordPolicyError(newPassword);
+    if (policyError) {
       return res.status(400).json({
         success: false,
-        message: "Password must be at least 6 characters long",
+        message: policyError,
       });
     }
 

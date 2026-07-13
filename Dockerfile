@@ -1,4 +1,12 @@
-FROM node:20-alpine
+# Pinned to a specific patch release for reproducible builds (the floating
+# `node:20-alpine` tag silently moves to a new Node/Alpine patch on every rebuild).
+#
+# HARDEN FURTHER (recommended before launch): pin by immutable digest so a
+# compromised/retagged upstream can't slip in, and scan the image in CI:
+#   docker buildx imagetools inspect node:20.18.1-alpine   # copy the sha256 digest
+#   FROM node:20.18.1-alpine@sha256:<digest>
+#   docker scout cves <image>        # or: trivy image <image>
+FROM node:20.18.1-alpine
 
 WORKDIR /app
 

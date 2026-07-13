@@ -1,4 +1,5 @@
 const Booking = require("../models/Booking");
+const logger = require("../utils/logger");
 const { assignBooking } = require("./assignmentEngine");
 const { buildDateTime } = require("./scheduling_service");
 const { markSlotLockPaid } = require("./slotCapacity.service");
@@ -82,10 +83,24 @@ async function finalizePaidBooking(booking, payment = {}) {
           0,
       });
     } catch (couponErr) {
-      console.error(
-        "[payment-finalize] recordCouponRedemption failed (non-fatal):",
-        couponErr.message
-      );
+      // A customer who already paid must keep their booking regardless — so this
+      // stays fail-soft. But an over-the-limit redemption means the discount was
+      // granted beyond the coupon's budget (the in-flight guard in
+      // validateCouponForAmount should make this rare): log it at error with a
+      // stable tag so ops can alert/reconcile, distinct from a generic tracking
+      // failure.
+      const isLimitOverrun = couponErr?.statusCode === 400;
+      logger.error("[payment-finalize] recordCouponRedemption failed (non-fatal)", {
+        tag: isLimitOverrun ? "COUPON_BUDGET_OVERRUN" : "COUPON_TRACKING_ERROR",
+        bookingId: updatedBooking._id.toString(),
+        couponId: String(updatedBooking.couponId),
+        couponCode: updatedBooking.couponCode,
+        discountInr:
+          updatedBooking.discountAmount ||
+          updatedBooking.couponDiscountAmount ||
+          0,
+        error: couponErr.message,
+      });
     }
   }
 

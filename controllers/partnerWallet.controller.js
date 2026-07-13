@@ -2,6 +2,7 @@ const PartnerWallet = require("../models/PartnerWallet");
 const WalletTransaction = require("../models/WalletTransaction");
 const Withdrawal = require("../models/Withdrawal");
 const Partner = require("../models/Partner");
+const { encryptBankDetails } = require("../utils/fieldCrypto");
 
 const roundAmount = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
 
@@ -204,12 +205,16 @@ exports.requestWithdrawal = async (req, res) => {
         amount,
         status: "PENDING",
         balanceHeld: true,
-        bankDetails: {
+        // Encrypt the snapshot at rest. bankDetails comes from a .lean() Partner
+        // read above, so its account number is already ciphertext when the
+        // partner saved it encrypted; encryptBankDetails is idempotent and also
+        // covers any legacy plaintext row.
+        bankDetails: encryptBankDetails({
           accountHolderName: bankDetails.accountHolderName || "",
           accountNumber: bankDetails.accountNumber,
           ifsc: bankDetails.ifsc,
           bankName: bankDetails.bankName || "",
-        },
+        }),
       });
     } catch (createErr) {
       // Creation failed after the hold — return the reserved funds so they
