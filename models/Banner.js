@@ -5,6 +5,9 @@ const bannerSchema = new mongoose.Schema(
     title: { type: String, default: "", trim: true },
     imageUrl: { type: String, required: true, trim: true },
     linkUrl: { type: String, default: "", trim: true },
+    // Admin-chosen in-app tap target: a Service _id. When set, clients navigate
+    // to that service instead of opening linkUrl (which stays as the fallback).
+    serviceId: { type: String, default: "", trim: true },
     placement: { type: String, default: "home", index: true, trim: true },
     // Which client(s) this banner should appear on. "all" (default) shows on
     // both so existing/legacy banners keep working without a migration.

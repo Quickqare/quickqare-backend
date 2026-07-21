@@ -22,6 +22,18 @@ const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours — pincodes rarely change
 const GEOCODE_REQUEST_TIMEOUT_MS = 5000; // give up on a slow/hung Google call after 5s
 const geocodeCache = new Map();
 
+// Hard ceiling so a flood of distinct coordinates can't grow the Map unbounded
+// between the 6-hour TTL sweeps. Map preserves insertion order → evicting the
+// first key drops the oldest (approx-LRU, no extra dependency).
+const GEOCODE_CACHE_MAX_ENTRIES = Number(process.env.GEOCODE_CACHE_MAX_ENTRIES || 5000);
+function geocodeCacheSet(key, value) {
+  if (geocodeCache.size >= GEOCODE_CACHE_MAX_ENTRIES) {
+    const oldest = geocodeCache.keys().next().value;
+    if (oldest !== undefined) geocodeCache.delete(oldest);
+  }
+  geocodeCache.set(key, value);
+}
+
 // Round to 4 decimal places ≈ 11m grid precision
 function coordCacheKey(lat, lng) {
   return `${lat.toFixed(4)},${lng.toFixed(4)}`;
@@ -169,7 +181,7 @@ async function reverseGeocode(latitude, longitude, source = "unknown") {
     area: extractArea(components),
     google: { status: googleStatus || "OK", errorMessage: googleErrorMessage || "" },
   };
-  geocodeCache.set(cacheKey, { result, ts: Date.now() });
+  geocodeCacheSet(cacheKey, { result, ts: Date.now() });
   trackApiCall(source, { cacheHit: false });
   return result;
 }
@@ -246,7 +258,7 @@ async function forwardGeocode(query, source = "forward_geocode") {
     pincode: extractPincodeFromResult(first),
     address: String(first?.formatted_address || "").trim(),
   };
-  geocodeCache.set(cacheKey, { result, ts: Date.now() });
+  geocodeCacheSet(cacheKey, { result, ts: Date.now() });
   trackApiCall(source, { cacheHit: false });
   return result;
 }

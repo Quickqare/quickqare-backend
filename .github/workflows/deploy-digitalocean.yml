@@ -5,7 +5,30 @@ on:
     branches: ["main"]
 
 jobs:
+  # Gate: the deploy job only runs if tests + lint pass. A commit that breaks
+  # the suite (or fails to lint) must never reach production. Cheap insurance —
+  # the suite runs against an in-memory Mongo and takes well under a minute.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+        env:
+          NODE_ENV: test
+      # Fails the build on any known-vulnerable dependency (prod deps only —
+      # matches what actually ships). --omit=optional is explicit here too:
+      # npm's CLI --omit flag replaces rather than merges with .npmrc, so this
+      # must not be dropped even though .npmrc also sets it (see .npmrc).
+      - run: npm audit --omit=dev --omit=optional --audit-level=moderate
+
   deploy:
+    needs: test # blocks deploy on a red test/lint run
     runs-on: ubuntu-latest
     steps:
       - name: Deploy over SSH
@@ -21,3 +44,16 @@ jobs:
             git pull origin main
             docker compose up -d --build
             docker image prune -f
+
+            # Post-deploy health gate: wait for the new container to report
+            # healthy on /health. If it never does, fail the job LOUDLY so the
+            # operator knows the deploy is bad (nginx is already serving the
+            # maintenance page). Roll back with: git checkout <prev-sha> && docker compose up -d --build
+            echo "Waiting for backend health…"
+            for i in $(seq 1 20); do
+              code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:4000/health || true)
+              if [ "$code" = "200" ]; then echo "Backend healthy."; exit 0; fi
+              echo "attempt $i: /health -> $code"; sleep 3
+            done
+            echo "ERROR: backend did not become healthy after deploy." >&2
+            exit 1

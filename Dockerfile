@@ -8,11 +8,29 @@
 #   docker scout cves <image>        # or: trivy image <image>
 FROM node:20.18.1-alpine
 
+# All calendar-day business logic (cake minLeadDays, baker daily caps,
+# partner unavailableDates) uses server-local time. Alpine defaults to UTC,
+# which shifts "today"/"tomorrow" by 5.5h for IST customers — e.g. between
+# midnight and 05:30 IST a UTC clock still says "yesterday", letting same-day
+# cake orders through the advance-only gate. tzdata makes the zone available
+# to the OS; TZ makes Node's Date use it.
+RUN apk add --no-cache tzdata
+ENV TZ=Asia/Kolkata
+
 WORKDIR /app
 
-# Install prod deps first for better Docker layer caching
-COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+# Install prod deps first for better Docker layer caching.
+# .npmrc (omit=optional) MUST be copied before npm ci runs, or the image would
+# pull in firebase-admin's optional @google-cloud/firestore|storage deps and
+# their vulnerable transitive chain back in (see .npmrc for why).
+#
+# --omit=optional is ALSO passed explicitly here, not left to .npmrc alone:
+# npm's CLI --omit flag replaces the config value instead of merging with it,
+# so `npm ci --omit=dev` on its own silently re-installs the optional deps
+# .npmrc was supposed to exclude (verified empirically — do not remove either
+# --omit flag).
+COPY package.json package-lock.json .npmrc ./
+RUN npm ci --omit=dev --omit=optional
 
 # Copy app source
 COPY . .

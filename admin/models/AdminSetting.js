@@ -63,6 +63,51 @@ const adminSettingSchema = new mongoose.Schema(
     },
 
     /* =============================================
+       ASSIGNMENT BUSINESS KNOBS
+    ============================================= */
+    assignment: {
+      // Max cake/celebration orders one baker can hold per scheduled calendar
+      // day (counted by scheduledDate across active + completed statuses).
+      cakeMaxOrdersPerPartnerPerDay: { type: Number, default: 2, min: 1 },
+    },
+
+    /* =============================================
+       MEHENDI HAND-PACKAGE PRICING
+       Tiered line totals by number of hands: tierPrices[0] = 1 hand,
+       tierPrices[1] = 2 hands, ...; beyond the last tier the total is
+       round(hands × overflowPerHand) — the discounted per-hand bulk rate.
+       Defaults mirror utils/pricing.js DEFAULT_MEHENDI_HANDS_PRICING; a rule
+       with no positive tier price falls back to those code defaults, so a
+       blank/partial admin edit can never zero out live pricing.
+    ============================================= */
+    mehendiHandsPricing: {
+      mehendi_minimal_hands: {
+        tierPrices: { type: [Number], default: [399, 699, 999, 1199] },
+        overflowPerHand: { type: Number, default: 299 },
+      },
+      mehendi_palm_length_hands: {
+        tierPrices: { type: [Number], default: [499, 798, 1149, 1499] },
+        overflowPerHand: { type: Number, default: 399 },
+      },
+      mehendi_bangle_length_hands: {
+        tierPrices: { type: [Number], default: [799, 1199, 1699, 2199] },
+        overflowPerHand: { type: Number, default: 569.05 },
+      },
+      mehendi_mid_length_hands: {
+        tierPrices: { type: [Number], default: [999, 1499, 2099, 2599] },
+        overflowPerHand: { type: Number, default: 629 },
+      },
+      mehendi_elbow_bridal_hands: {
+        tierPrices: { type: [Number], default: [1799, 3000] },
+        overflowPerHand: { type: Number, default: 1349.25 },
+      },
+      mehendi_above_elbow_bridal_hands: {
+        tierPrices: { type: [Number], default: [2000, 3500] },
+        overflowPerHand: { type: Number, default: 1500 },
+      },
+    },
+
+    /* =============================================
        EMERGENCY SAFETY CONTROLS
        All default false — must be explicitly enabled.
     ============================================= */

@@ -6,18 +6,7 @@ const {
   isZoneServiceEnabled,
   getZoneCoveragePincodes,
 } = require("./zone.service");
-
-let _h3FlagCache = { value: false, expiresAt: 0 };
-async function getUseH3Flag() {
-  if (Date.now() < _h3FlagCache.expiresAt) return _h3FlagCache.value;
-  try {
-    const s = await AdminSetting.findOne().select("useH3Zones").lean();
-    _h3FlagCache = { value: Boolean(s?.useH3Zones), expiresAt: Date.now() + 60_000 };
-  } catch {
-    _h3FlagCache.expiresAt = Date.now() + 10_000;
-  }
-  return _h3FlagCache.value;
-}
+const { getUseH3Flag } = require("./useH3Flag.service");
 
 /**
  * Given a customer's location and a set of candidate Celebration cake

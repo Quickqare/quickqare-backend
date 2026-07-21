@@ -4,6 +4,7 @@ const router = express.Router();
 const partnerAuth = require("../middlewares/partnerAuth");
 const partnerController = require("../controllers/partner.controller");
 const walletController = require("../controllers/partnerWallet.controller");
+const guestAddonController = require("../controllers/guestAddon.controller");
 const upload = require("../config/multer");
 const r2Upload = require("../config/multerR2");
 
@@ -171,6 +172,20 @@ router.post(
   "/booking/complete",
   partnerAuth,
   partnerController.markCompleted
+);
+
+/**
+ * ======================================
+ * ADD GUEST MEHENDI ON THE SPOT
+ * Creates a separate, pre-assigned booking pending customer approval.
+ * ======================================
+ * POST /api/partner/booking/add-guest-mehendi
+ * Body: { parentBookingId, quantity }
+ */
+router.post(
+  "/booking/add-guest-mehendi",
+  partnerAuth,
+  guestAddonController.createGuestAddon
 );
 
 /* =====================================================

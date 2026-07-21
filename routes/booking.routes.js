@@ -1,12 +1,26 @@
 const express = require("express");
+const mongoose = require("mongoose");
 const router = express.Router();
 const bookingController = require("../controllers/booking.controller");
+const guestAddonController = require("../controllers/guestAddon.controller");
+
+// Reject a malformed :bookingId up front (400) for EVERY route in this router,
+// instead of letting an invalid ObjectId become a CastError that controllers
+// catch and report as a 500. Applies to both the /:bookingId reads and the
+// partner-lifecycle routes below.
+router.param("bookingId", (req, res, next, value) => {
+  if (!mongoose.Types.ObjectId.isValid(String(value || ""))) {
+    return res.status(400).json({ success: false, message: "Invalid bookingId" });
+  }
+  return next();
+});
 
 const userAuth = require("../middlewares/userAuth");
 const partnerAuth = require("../middlewares/partnerAuth");
 
 const validate = require("../middlewares/validate");
 const { createBookingValidator } = require("../middlewares/validators");
+const { bookingCreateLimiter, slotsLimiter } = require("../middlewares/rateLimiter");
 const upload = require("../config/multer");
 
 /* =========================
@@ -23,6 +37,7 @@ Now supports:
 router.post(
   "/create",
   userAuth,
+  bookingCreateLimiter,
   createBookingValidator,
   validate,
   bookingController.createBooking
@@ -52,10 +67,12 @@ router.get(
 // param route too.
 router.get(
   "/available-slots",
+  slotsLimiter,
   bookingController.getAvailableSlots
 );
 router.post(
   "/available-slots",
+  slotsLimiter,
   bookingController.getAvailableSlots
 );
 
@@ -85,6 +102,36 @@ router.post(
   "/:bookingId/estimate/respond",
   userAuth,
   bookingController.respondToEstimate
+);
+
+// Estimate: pay for an approved estimate (Razorpay order + verify).
+// Settlement includes the estimate only once this payment reaches PAID.
+router.post(
+  "/:bookingId/estimate/create-order",
+  userAuth,
+  bookingController.createEstimateOrder
+);
+router.post(
+  "/:bookingId/estimate/verify",
+  userAuth,
+  bookingController.verifyEstimatePayment
+);
+
+/* Guest mehendi add-on (partner added on-site) — customer approve & pay / decline */
+router.post(
+  "/:bookingId/guest-addon/create-order",
+  userAuth,
+  guestAddonController.createGuestAddonOrder
+);
+router.post(
+  "/:bookingId/guest-addon/verify",
+  userAuth,
+  guestAddonController.verifyGuestAddonPayment
+);
+router.post(
+  "/:bookingId/guest-addon/decline",
+  userAuth,
+  guestAddonController.declineGuestAddon
 );
 
 /* =========================

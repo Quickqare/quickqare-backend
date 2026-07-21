@@ -28,6 +28,31 @@ const ASSIGNABLE_STATES = [
 // socket events the partner app listens for (jobAssigned / job_assigned — see
 // mobile/src/services/socket.ts), with a full job payload, plus a push for
 // backgrounded apps. Best-effort: never throws into the request flow.
+// Tell a partner their job was taken away (admin cancel / reassign). Without
+// this, a force-reassigned partner's app kept showing the job — they could
+// still show up at the customer's door. Socket for the open app, push for a
+// backgrounded one. Best-effort: never throws into the request flow.
+async function notifyPartnerOfRemoval(partnerId, bookingId, reason) {
+  try {
+    if (!partnerId) return;
+    if (global.io) {
+      // "job_cancelled" is the event the partner app actually handles.
+      global.io.to(`partner_${partnerId}`).emit("job_cancelled", {
+        bookingId: String(bookingId),
+        cancelledBy: "admin",
+        reason: reason || "Reassigned by support",
+      });
+    }
+    const removed = await Partner.findById(partnerId).select("fcmToken").lean();
+    if (removed?.fcmToken) {
+      const { sendJobCancelledPush } = require("../../../services/pushNotification.service");
+      sendJobCancelledPush(removed.fcmToken, String(bookingId));
+    }
+  } catch (err) {
+    console.error("notifyPartnerOfRemoval error:", err.message);
+  }
+}
+
 async function notifyPartnerOfAssignment(booking, partner) {
   try {
     await booking.populate([
@@ -97,9 +122,12 @@ router.get("/", async (req, res) => {
 
     const [rows, total] = await Promise.all([
       Booking.find(where)
-        .populate("user")
-        .populate("partner")
-        .populate("primaryService")
+        // Field-projected populates — the list view only needs identity/summary
+        // fields, not the full user/partner documents (which include large or
+        // sensitive nested data). Lighter payloads + less data exposure.
+        .populate("user", "name phone email")
+        .populate("partner", "name phone approvalStatus rating selfieUrl")
+        .populate("primaryService", "name imageUrl duration price")
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(limit)
@@ -205,25 +233,48 @@ router.post("/:id/assign", audit("admin.bookings.assign"), async (req, res) => {
     }
 
     const previousPartnerId = booking.partner;
+    const previousAdditional = (booking.additionalPartners || []).map(String);
 
-    booking.partner = partner._id;
-    booking.status = "ASSIGNED";
-    if (Array.isArray(booking.assignmentAudit)) {
-      booking.assignmentAudit.push({
-        stage: booking.assignmentStage || 1,
-        event: "admin_manual_assign",
-        selectedPartnerId: partner._id,
-        notes: `Manually assigned by admin (${req.adminUser?.email || req.adminUser?.id})${reason ? `. Reason: ${reason}` : ""}`,
-      });
+    // GUARDED atomic assignment (not a full-doc save): a concurrent transition
+    // (cancel, partner accept, engine assign) must not be overwritten.
+    //
+    // assignedAt anchors the advance-ACK deadline cron for the NEW partner;
+    // ackReceivedAt is reset so a previous partner's acknowledgement can't
+    // satisfy the new one's ACK gate — previously a manually assigned partner
+    // who ignored the job was never auto-reassigned. Manual assignment is
+    // single-partner, so stale team state is cleared too.
+    const assigned = await Booking.findOneAndUpdate(
+      { _id: booking._id, status: { $in: ASSIGNABLE_STATES } },
+      {
+        $set: {
+          partner: partner._id,
+          status: "ASSIGNED",
+          assignedAt: new Date(),
+          ackReceivedAt: null,
+          additionalPartners: [],
+          teamAllocations: [],
+        },
+        $push: {
+          assignmentAudit: {
+            stage: booking.assignmentStage || 1,
+            event: "admin_manual_assign",
+            selectedPartnerId: partner._id,
+            notes: `Manually assigned by admin (${req.adminUser?.email || req.adminUser?.id})${reason ? `. Reason: ${reason}` : ""}`,
+          },
+        },
+      },
+      { new: true }
+    );
+    if (!assigned) {
+      return fail(res, 409, "STATUS_CONFLICT", "Booking status changed concurrently — refresh and try again", null, { requestId: req.requestId });
     }
-    await booking.save();
 
     // activeJobs / busySlots are derived from committed bookings — recompute them
-    // for both partners instead of hand-incrementing (which drifts from reality).
+    // for every affected partner instead of hand-incrementing (which drifts).
     try {
       const { syncPartnerOperationalState } = require("../../../services/scheduling_service");
-      if (previousPartnerId && String(previousPartnerId) !== String(partner._id)) {
-        await syncPartnerOperationalState(previousPartnerId);
+      for (const pid of new Set([String(previousPartnerId || ""), ...previousAdditional].filter(Boolean))) {
+        if (pid !== String(partner._id)) await syncPartnerOperationalState(pid);
       }
       await syncPartnerOperationalState(partner._id);
     } catch (syncErr) {
@@ -245,11 +296,28 @@ router.post("/:id/assign", audit("admin.bookings.assign"), async (req, res) => {
       }),
     ]);
 
+    // Displaced partner must learn the job is no longer theirs.
+    if (previousPartnerId && String(previousPartnerId) !== String(partner._id)) {
+      await notifyPartnerOfRemoval(previousPartnerId, bookingId, reason);
+    }
+    for (const pid of previousAdditional) {
+      await notifyPartnerOfRemoval(pid, bookingId, reason);
+    }
+
+    // Customer sees the assignment immediately instead of a stale SEARCHING /
+    // NO_PARTNER_AVAILABLE screen.
+    if (global.io) {
+      global.io.to(`user_${assigned.user}`).emit("booking_update", {
+        bookingId: String(assigned._id),
+        status: "ASSIGNED",
+      });
+    }
+
     // Notify the assigned partner in real time + push. The old handler emitted
     // nothing, so manually-assigned partners only saw the job on a manual refresh.
-    await notifyPartnerOfAssignment(booking, partner);
+    await notifyPartnerOfAssignment(assigned, partner);
 
-    return success(res, booking, { requestId: req.requestId });
+    return success(res, assigned, { requestId: req.requestId });
   } catch (error) {
     return fail(res, 500, "BOOKING_ASSIGN_FAILED", "Unable to assign booking", error.message, {
       requestId: req.requestId,
@@ -305,30 +373,53 @@ router.post("/:id/reassign", audit("admin.bookings.reassign"), async (req, res) 
       return fail(res, 400, "SAME_PARTNER", "Booking is already assigned to this partner", null, { requestId: req.requestId });
     }
 
-    // Release old partner's active job slot
     const oldPartnerId = booking.partner;
-    if (oldPartnerId) {
-      await Partner.findByIdAndUpdate(oldPartnerId, { $inc: { activeJobs: -1 } });
+    const oldAdditional = (booking.additionalPartners || []).map(String);
+
+    // GUARDED atomic reassignment — same shape as /assign. The old partner
+    // goes onto rejectedPartners so the auto-engine can never hand this
+    // booking back to them; assignedAt/ackReceivedAt give the NEW partner a
+    // fresh ACK window; stale team state is cleared.
+    const reassigned = await Booking.findOneAndUpdate(
+      { _id: booking._id, status: { $in: ASSIGNABLE_STATES } },
+      {
+        $set: {
+          partner: newPartner._id,
+          status: "ASSIGNED",
+          assignedAt: new Date(),
+          ackReceivedAt: null,
+          additionalPartners: [],
+          teamAllocations: [],
+        },
+        ...(oldPartnerId ? { $addToSet: { rejectedPartners: oldPartnerId } } : {}),
+        $push: {
+          assignmentAudit: {
+            stage: booking.assignmentStage || 1,
+            event: "admin_force_reassign",
+            selectedPartnerId: newPartner._id,
+            notes: `Force-reassigned by admin (${req.adminUser?.email || req.adminUser?.id}). Reason: ${reason}`,
+          },
+        },
+      },
+      { new: true }
+    );
+    if (!reassigned) {
+      return fail(res, 409, "STATUS_CONFLICT", "Booking status changed concurrently — refresh and try again", null, { requestId: req.requestId });
     }
 
-    // Assign to new partner and record in audit log
-    booking.partner = newPartner._id;
-    booking.status = "ASSIGNED";
-    if (Array.isArray(booking.assignmentAudit)) {
-      booking.assignmentAudit.push({
-        stage: booking.assignmentStage || 1,
-        event: "admin_force_reassign",
-        selectedPartnerId: newPartner._id,
-        notes: `Force-reassigned by admin (${req.adminUser?.email || req.adminUser?.id}). Reason: ${reason}`,
-      });
+    // Recompute activeJobs/busySlots from committed bookings for everyone
+    // touched — the old raw $inc could drive activeJobs negative for a partner
+    // who had never accepted, permanently skewing their load score.
+    try {
+      const { syncPartnerOperationalState } = require("../../../services/scheduling_service");
+      for (const pid of new Set([String(oldPartnerId || ""), ...oldAdditional].filter(Boolean))) {
+        await syncPartnerOperationalState(pid);
+      }
+      await syncPartnerOperationalState(newPartner._id);
+    } catch (syncErr) {
+      console.error("reassign syncPartnerOperationalState error:", syncErr.message);
     }
-    await booking.save();
-
-    // Give new partner the job slot
-    await Partner.findByIdAndUpdate(newPartner._id, {
-      $inc: { activeJobs: 1 },
-      $set: { lastAssignedAt: new Date() },
-    });
+    await Partner.updateOne({ _id: newPartner._id }, { $set: { lastAssignedAt: new Date() } });
 
     // Persist in BookingAssignment + Timeline
     await Promise.all([
@@ -351,15 +442,30 @@ router.post("/:id/reassign", audit("admin.bookings.reassign"), async (req, res) 
       }),
     ]);
 
+    // The DISPLACED partner must learn the job is gone — previously only the
+    // new partner was notified, so the old one's app kept showing the job and
+    // they could still show up at the customer's door.
+    if (oldPartnerId) await notifyPartnerOfRemoval(oldPartnerId, bookingId, reason);
+    for (const pid of oldAdditional) {
+      await notifyPartnerOfRemoval(pid, bookingId, reason);
+    }
+
+    if (global.io) {
+      global.io.to(`user_${reassigned.user}`).emit("booking_update", {
+        bookingId: String(reassigned._id),
+        status: "ASSIGNED",
+      });
+    }
+
     // Notify the new partner — uses the events the partner app actually listens
     // for (jobAssigned / job_assigned), with a full job payload + push. The old
     // "booking_assigned" event was never handled by the app, so reassigned
     // partners were never alerted in real time.
-    await notifyPartnerOfAssignment(booking, newPartner);
+    await notifyPartnerOfAssignment(reassigned, newPartner);
 
     return success(res, {
-      bookingId: booking._id,
-      status: booking.status,
+      bookingId: reassigned._id,
+      status: reassigned.status,
       newPartnerId: newPartner._id,
       newPartnerName: newPartner.name,
     }, { requestId: req.requestId });
@@ -383,9 +489,18 @@ router.post("/:id/cancel", audit("admin.bookings.cancel"), async (req, res) => {
 
     // Guard against re-transitioning a terminal booking — a COMPLETED job must not be
     // flipped to CANCELLED (it corrupts reporting and implies a refund on delivered work).
+    // cancelledBy/cancelledAt/cancelReason are recorded so the cancel is attributable —
+    // previously this route set the status only.
     const booking = await Booking.findOneAndUpdate(
       { _id: bookingId, status: { $nin: ["CANCELLED", "COMPLETED"] } },
-      { $set: { status: "CANCELLED" } },
+      {
+        $set: {
+          status: "CANCELLED",
+          cancelledBy: "admin",
+          cancelledAt: new Date(),
+          cancelReason: reason,
+        },
+      },
       { new: true }
     ).lean();
     if (!booking) {
@@ -394,6 +509,39 @@ router.post("/:id/cancel", audit("admin.bookings.cancel"), async (req, res) => {
         return fail(res, 404, "NOT_FOUND", "Booking not found", null, { requestId: req.requestId });
       }
       return fail(res, 409, "ALREADY_TERMINAL", "Booking is already completed or cancelled", null, { requestId: req.requestId });
+    }
+
+    // Full cleanup — previously this "soft" cancel released nothing: the slot's
+    // reserved capacity stayed consumed FOREVER (no other path releases a
+    // cancelled booking's lock), the ACK timer could still fire, the partner's
+    // calendar stayed blocked, and neither side was told.
+    try {
+      const { releaseSlotCapacityByBookingId } = require("../../../services/slotCapacity.service");
+      await releaseSlotCapacityByBookingId(booking._id, { releaseReason: "admin_cancel" });
+    } catch (_) { /* non-fatal */ }
+    try {
+      const { cancelAckTimeout } = require("../../../services/ackTimeout.service");
+      await cancelAckTimeout(bookingId);
+    } catch (_) { /* non-fatal */ }
+    try {
+      const { syncPartnerOperationalState } = require("../../../services/scheduling_service");
+      for (const pid of [booking.partner, ...(booking.additionalPartners || [])].filter(Boolean)) {
+        await syncPartnerOperationalState(pid);
+      }
+    } catch (syncErr) {
+      console.error("cancel syncPartnerOperationalState error:", syncErr.message);
+    }
+
+    if (global.io) {
+      global.io.to(`user_${booking.user}`).emit("booking_update", {
+        bookingId: String(booking._id),
+        status: "CANCELLED",
+        cancelledBy: "admin",
+        cancelReason: reason,
+      });
+    }
+    for (const pid of [booking.partner, ...(booking.additionalPartners || [])].filter(Boolean)) {
+      await notifyPartnerOfRemoval(pid, bookingId, reason);
     }
 
     await BookingTimeline.create({
@@ -459,11 +607,17 @@ router.post("/:id/force-cancel", audit("admin.bookings.force_cancel"), async (re
       return fail(res, 409, "STATUS_CONFLICT", "Booking status changed concurrently — refresh and try again", null, { requestId: req.requestId });
     }
 
-    // Release partner's active job slot
-    if (assignedPartnerId) {
-      await Partner.findByIdAndUpdate(assignedPartnerId, {
-        $inc: { activeJobs: -1 },
-      });
+    // Release every attached partner's calendar — recomputed from committed
+    // bookings (the old raw $inc could drive activeJobs negative for a partner
+    // who had never accepted).
+    const teamPartnerIds = [assignedPartnerId, ...(booking.additionalPartners || [])].filter(Boolean);
+    try {
+      const { syncPartnerOperationalState } = require("../../../services/scheduling_service");
+      for (const pid of teamPartnerIds) {
+        await syncPartnerOperationalState(pid);
+      }
+    } catch (syncErr) {
+      console.error("force-cancel syncPartnerOperationalState error:", syncErr.message);
     }
 
     // Cancel any pending ACK timeout so it doesn't fire after cancellation
@@ -478,22 +632,16 @@ router.post("/:id/force-cancel", audit("admin.bookings.force_cancel"), async (re
       await releaseSlotCapacityByBookingId(booking._id, { releaseReason: "admin_force_cancel" });
     } catch (_) { /* non-fatal */ }
 
-    // Notify customer and partner via socket
+    // Notify customer and the whole partner team (socket + push).
     if (global.io) {
       global.io.to(`user_${updated.user}`).emit("booking_update", {
         bookingId: updated._id.toString(),
         status: "CANCELLED",
         cancelReason: reason,
       });
-      if (assignedPartnerId) {
-        // The partner app listens for "job_cancelled" (not "booking_cancelled"),
-        // and reads cancelledBy/bookingId off the payload to clear the job.
-        global.io.to(`partner_${assignedPartnerId}`).emit("job_cancelled", {
-          bookingId: updated._id.toString(),
-          cancelledBy: "admin",
-          reason,
-        });
-      }
+    }
+    for (const pid of teamPartnerIds) {
+      await notifyPartnerOfRemoval(pid, bookingId, reason);
     }
 
     await BookingTimeline.create({

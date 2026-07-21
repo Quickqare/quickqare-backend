@@ -22,6 +22,10 @@ const PERMISSIONS = Object.freeze({
   COMPLAINTS_VIEW: "complaints.view",
   COMPLAINTS_UPDATE: "complaints.update",
   SERVICES_MANAGE: "services.manage",
+  // Destructive, SuperAdmin-only: wipes all transactional data. Granted solely
+  // via SUPER_ADMIN's Object.values(PERMISSIONS) below — never added to any
+  // other role's list, so OpsAdmin/FinanceAdmin/SupportAdmin can't invoke it.
+  SYSTEM_RESET: "system.reset",
 });
 
 const ROLE_PERMISSIONS = Object.freeze({

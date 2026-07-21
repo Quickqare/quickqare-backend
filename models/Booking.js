@@ -1,10 +1,23 @@
 const mongoose = require("mongoose");
+const crypto = require("crypto");
+
+// Random uppercase [A-Z0-9] string using a CSPRNG (crypto.randomInt), not
+// Math.random — used for the booking reference suffix and, more importantly,
+// the service start code, which gates starting a job and must be unguessable.
+const RAND_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+function randomAlphaNum(length) {
+  let out = "";
+  for (let i = 0; i < length; i += 1) {
+    out += RAND_ALPHABET[crypto.randomInt(RAND_ALPHABET.length)];
+  }
+  return out;
+}
 
 /* Short, user-friendly booking reference shown on UI / SMS / support calls */
 function generateBookingNumber() {
   const year = String(new Date().getFullYear()).slice(-2);
   const ts = Date.now().toString(36).slice(-5).toUpperCase();
-  const rnd = Math.random().toString(36).slice(2, 4).toUpperCase();
+  const rnd = randomAlphaNum(2);
   return `QQ${year}${ts}${rnd}`;
 }
 
@@ -32,6 +45,24 @@ const bookingSchema = new mongoose.Schema(
     partner: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Partner",
+      default: null,
+    },
+
+    // How the booking was created. "partner_onspot" = a guest-mehendi add-on a
+    // partner added at the venue during an in-progress booking (pre-assigned to
+    // that same partner, needs customer approval + payment). Everything else is
+    // the normal customer-initiated flow.
+    origin: {
+      type: String,
+      enum: ["customer", "partner_onspot"],
+      default: "customer",
+    },
+
+    // For a partner_onspot add-on: the in-progress booking it was added onto.
+    // Lets the apps group the two orders from the same visit together.
+    parentBooking: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Booking",
       default: null,
     },
 
@@ -96,6 +127,7 @@ const bookingSchema = new mongoose.Schema(
           flavour: String,
           weight: String, // e.g. "1 kg" — resolved against Service.customization.weights
           tiers: Number, // 1 | 2
+          eggless: { type: Boolean, default: false },
           addons: [
             {
               name: String,
@@ -275,6 +307,13 @@ const bookingSchema = new mongoose.Schema(
         type: String,
         default: null,
       },
+      // Razorpay refund id (rfnd_...) from the instant auto-refund path.
+      // Lets back office reconcile against the Razorpay dashboard and proves
+      // a refund was already issued if the PROCESSED status write was lost.
+      razorpay_refund_id: {
+        type: String,
+        default: null,
+      },
       status: {
         type: String,
         enum: ["PENDING", "PAID", "FAILED"],
@@ -317,6 +356,9 @@ const bookingSchema = new mongoose.Schema(
     status: {
       type: String,
       enum: [
+        // Partner-created guest mehendi add-on, waiting for the customer to
+        // approve & pay. Only ever used by origin === "partner_onspot" bookings.
+        "PENDING_APPROVAL",
         "PENDING_PAYMENT",
         "PENDING_ASSIGNMENT",
         "QUEUED",
@@ -470,6 +512,16 @@ const bookingSchema = new mongoose.Schema(
       default: [],
     },
 
+    // Grace-period free-cancel deadline, computed at creation from the
+    // services' cancellationGrace config (orders placed with little notice
+    // get a short window to cancel at 100%). Null = no grace applies.
+    // Cancelling at or before this instant refunds 100% regardless of the
+    // tier the cancel would otherwise land in.
+    freeCancelUntil: {
+      type: Date,
+      default: null,
+    },
+
     /* ======================
        REFUND (for user cancels)
     ====================== */
@@ -493,6 +545,19 @@ const bookingSchema = new mongoose.Schema(
        ARRIVAL TRACKING
     ====================== */
     estimatedArrivalAt: {
+      type: Date,
+      default: null,
+    },
+
+    // Lifecycle timestamps for SLA tracking. These were previously written by
+    // the partner lifecycle endpoints but silently DROPPED by strict mode
+    // because the fields didn't exist in the schema.
+    onTheWayAt: {
+      type: Date,
+      default: null,
+    },
+
+    inProgressAt: {
       type: Date,
       default: null,
     },
@@ -638,7 +703,12 @@ const bookingSchema = new mongoose.Schema(
               distanceMeters: Number,
               activeJobs: Number,
               rating: Number,
+              // Per-component scores — the full breakdown the weight-shadow
+              // report replays to recompute rankings under alternate weights.
               fairnessScore: Number,
+              earningsScore: Number,
+              distanceScore: Number,
+              skillScore: Number,
               reliabilityScore: Number,
               inPrimaryPincode: Boolean,
               autoAccept: Boolean,
@@ -705,6 +775,55 @@ const bookingSchema = new mongoose.Schema(
       default: null,
     },
 
+    /* ======================
+       ESTIMATE PAYMENT
+       Razorpay collection for an approved on-site estimate. A separate order
+       from the main booking payment (razorpay_order_id here never collides with
+       payment.razorpay_order_id — the webhook checks both). Amounts are frozen
+       at order-creation time so the charge stays reconcilable even if pricing
+       settings change later. Settlement includes the estimate only when this
+       reaches PAID.
+    ====================== */
+    estimatePayment: {
+      razorpay_order_id: {
+        type: String,
+        default: null,
+      },
+      razorpay_payment_id: {
+        type: String,
+        default: null,
+      },
+      razorpay_signature: {
+        type: String,
+        default: null,
+      },
+      status: {
+        type: String,
+        enum: ["NONE", "PENDING", "PAID", "FAILED"],
+        default: "NONE",
+      },
+      paidAt: {
+        type: Date,
+        default: null,
+      },
+      baseAmount: {
+        type: Number,
+        default: 0,
+      },
+      platformFeeAmount: {
+        type: Number,
+        default: 0,
+      },
+      gstAmount: {
+        type: Number,
+        default: 0,
+      },
+      totalAmount: {
+        type: Number,
+        default: 0,
+      },
+    },
+
     // Tracks whether wallet credits ran after COMPLETED status was set.
     // "pending"  → booking marked COMPLETED but credits not yet confirmed
     // "credited" → all partner wallet credits succeeded
@@ -713,6 +832,14 @@ const bookingSchema = new mongoose.Schema(
     payoutStatus: {
       type: String,
       enum: ["pending", "credited", "failed"],
+    },
+
+    // Failed wallet-credit attempts by the retry cron. "failed" is only set
+    // once this reaches PAYOUT_MAX_RETRIES — a single transient error must not
+    // permanently strand the partner's earnings behind manual intervention.
+    payoutRetryCount: {
+      type: Number,
+      default: 0,
     },
 
     /* ======================
@@ -747,12 +874,44 @@ const bookingSchema = new mongoose.Schema(
 bookingSchema.index({ location: "2dsphere" });
 
 /* ======================
+   QUERY INDEXES
+   Without these, the hottest Booking queries are full collection scans —
+   invisible at launch volume, but every one degrades linearly as the
+   collection grows toward 100k+ rows.
+====================== */
+
+// Per-user concurrent-unpaid cap in createBooking — runs on EVERY booking
+// create ({ user, status: "PENDING_PAYMENT", lockedUntil: { $gt: now } }).
+// Prefix { user, status } also serves any per-user status-filtered lookup.
+bookingSchema.index({ user: 1, status: 1, lockedUntil: 1 });
+
+// Customer "My Bookings" list: equality on user + sort { createdAt: -1 }
+// (getMyBookings). The index walks the user's rows already in sort order, so
+// pagination never re-sorts.
+bookingSchema.index({ user: 1, createdAt: -1 });
+
+// Partner job lists and getBlockingWindowsByPartner's $or branches
+// ({ partner|additionalPartners: { $in }, status: { $in }, scheduledDate:
+// range }) — run on every slot listing AND every assignment attempt.
+// additionalPartners is an array → multikey index.
+bookingSchema.index({ partner: 1, status: 1, scheduledDate: 1 });
+bookingSchema.index({ additionalPartners: 1, status: 1, scheduledDate: 1 });
+
+// Status-led periodic scans: cancelStaleBookings, dispatchQueuedBookings,
+// detectNoShowPartners, reminder crons, and resumePendingAckTimeouts all lead
+// with an equality/$in on status (± a time bound). The status prefix alone
+// cuts each scan from the whole collection to just the rows in that status.
+bookingSchema.index({ status: 1, scheduledStartAt: 1 });
+
+/* ======================
    PRE-SAVE: AUTO-GENERATE BOOKING NUMBER
    Retries on the rare collision (uniqueness backed by index).
 ====================== */
 bookingSchema.pre("save", async function (next) {
   if (!this.serviceStartCode) {
-    this.serviceStartCode = String(Math.floor(1000 + Math.random() * 9000));
+    // CSPRNG 4-digit code (1000–9999) — the partner must enter it to start the
+    // job, so it must not be predictable from Math.random's weak PRNG.
+    this.serviceStartCode = String(crypto.randomInt(1000, 10000));
   }
   if (this.bookingNumber) return next();
   for (let attempt = 0; attempt < 5; attempt += 1) {
@@ -764,7 +923,7 @@ bookingSchema.pre("save", async function (next) {
     }
   }
   // Extremely unlikely fallback — collisions in 5 attempts at this entropy
-  this.bookingNumber = `${generateBookingNumber()}${Math.random().toString(36).slice(2, 5).toUpperCase()}`;
+  this.bookingNumber = `${generateBookingNumber()}${randomAlphaNum(3)}`;
   next();
 });
 

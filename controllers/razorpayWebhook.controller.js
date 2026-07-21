@@ -88,7 +88,12 @@ async function handlePaymentCaptured(payment) {
 
   const booking = await Booking.findOne({ "payment.razorpay_order_id": orderId });
   if (!booking) {
-    logger.error("[rzp-webhook] payment.captured for unknown order", { orderId, paymentId: payment.id });
+    // Not a booking payment — it may be an on-site estimate payment, which
+    // rides the same Razorpay account but settles into estimatePayment.
+    const estimateHandled = await handleEstimatePaymentCaptured(payment);
+    if (!estimateHandled) {
+      logger.error("[rzp-webhook] payment.captured for unknown order", { orderId, paymentId: payment.id });
+    }
     return;
   }
 
@@ -124,6 +129,29 @@ async function handlePaymentCaptured(payment) {
       razorpay_payment_id: payment.id,
       razorpay_order_id: orderId,
     });
+
+    // Booking was cancelled between our status read above and the finalize
+    // write (user cancel / expiry cron) — same "dead booking, money captured"
+    // situation as the early check, so flag it for refund the same way.
+    if (outcome === "not_payable") {
+      await Booking.updateOne(
+        { _id: booking._id, "payment.status": { $ne: "PAID" }, refundStatus: { $in: ["NONE", null] } },
+        {
+          $set: {
+            "payment.razorpay_payment_id": payment.id,
+            refundStatus: "PENDING",
+            refundAmount: Number(payment.amount || 0) / 100, // paise → INR
+          },
+        }
+      );
+      logger.error("[rzp-webhook] Captured payment lost the finalize race to a cancel — flagged for refund", {
+        bookingId: booking._id.toString(),
+        orderId,
+        paymentId: payment.id,
+      });
+      return;
+    }
+
     logger.info("[rzp-webhook] payment.captured finalized", {
       bookingId: booking._id.toString(),
       outcome,
@@ -137,6 +165,44 @@ async function handlePaymentCaptured(payment) {
 }
 
 /**
+ * payment.captured for an on-site estimate order — mark the booking's
+ * estimatePayment PAID (idempotent) and tell the on-site partner. Returns true
+ * when the order id matched an estimate payment.
+ */
+async function handleEstimatePaymentCaptured(payment) {
+  const orderId = payment.order_id;
+  const booking = await Booking.findOne({ "estimatePayment.razorpay_order_id": orderId })
+    .select("_id partner estimatePayment")
+    .lean();
+  if (!booking) return false;
+
+  const updated = await Booking.findOneAndUpdate(
+    { _id: booking._id, "estimatePayment.status": { $ne: "PAID" } },
+    {
+      $set: {
+        "estimatePayment.status": "PAID",
+        "estimatePayment.razorpay_payment_id": payment.id,
+        "estimatePayment.paidAt": new Date(),
+      },
+    },
+    { new: true }
+  );
+
+  if (updated && global.io && updated.partner) {
+    global.io.to(`partner_${updated.partner}`).emit("estimate_paid", {
+      bookingId: updated._id.toString(),
+    });
+  }
+
+  logger.info("[rzp-webhook] estimate payment.captured recorded", {
+    bookingId: booking._id.toString(),
+    orderId,
+    alreadyPaid: !updated,
+  });
+  return true;
+}
+
+/**
  * payment.failed — mark the booking's payment FAILED if it is still pending.
  * Never touches an already-PAID booking.
  */
@@ -147,6 +213,11 @@ async function handlePaymentFailed(payment) {
   await Booking.updateOne(
     { "payment.razorpay_order_id": orderId, "payment.status": "PENDING" },
     { $set: { "payment.status": "FAILED" } }
+  );
+  // Estimate orders live in estimatePayment — same never-touch-PAID rule.
+  await Booking.updateOne(
+    { "estimatePayment.razorpay_order_id": orderId, "estimatePayment.status": "PENDING" },
+    { $set: { "estimatePayment.status": "FAILED" } }
   );
   logger.info("[rzp-webhook] payment.failed recorded", { orderId, paymentId: payment.id });
 }

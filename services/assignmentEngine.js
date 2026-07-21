@@ -1,13 +1,15 @@
 const Booking = require("../models/Booking");
 const User = require("../models/User");
 const Partner = require("../models/Partner");
-const AdminSetting = require("../admin/models/AdminSetting");
 const {
   findEligiblePartnersForBooking,
   syncPartnerOperationalState,
   buildDateTime,
-  AC_CATEGORY_SLUGS,
-  AC_MAX_CAPACITY_MINUTES,
+  verifyCakeCapAfterClaim,
+  isACCategory,
+  computeTeamPackForBooking,
+  planTeamAssignment,
+  partnerFitsBin,
 } = require("./scheduling_service");
 const {
   resolveZoneForPincode,
@@ -19,20 +21,10 @@ const {
 const { escalateUnassignedBooking } = require("./escalation.service");
 const { sendJobAssignedPush } = require("./pushNotification.service");
 const { getH3CellsForStage } = require("../utils/h3");
-
-// Cached AdminSetting flag — refreshed every 60 s to avoid a DB hit per booking.
-let _useH3Cache = { value: false, expiresAt: 0 };
-
-async function getUseH3Flag() {
-  if (Date.now() < _useH3Cache.expiresAt) return _useH3Cache.value;
-  try {
-    const setting = await AdminSetting.findOne().select("useH3Zones").lean();
-    _useH3Cache = { value: Boolean(setting?.useH3Zones), expiresAt: Date.now() + 60_000 };
-  } catch {
-    _useH3Cache.expiresAt = Date.now() + 10_000; // retry sooner on error
-  }
-  return _useH3Cache.value;
-}
+// Shared cached AdminSetting.useH3Zones flag. Re-exported below because
+// several modules (booking/partner controllers, zone routes, slotCapacity)
+// historically import it from this engine.
+const { getUseH3Flag } = require("./useH3Flag.service");
 
 /*
 =====================================================
@@ -130,125 +122,52 @@ async function getPincodesForStage(booking) {
 DETECT AC BOOKING
 AC bookings use different bin capacity and skill
 weighting than general / mehendi bookings.
+
+Scans the top-level serviceCategory AND every cart line's category/name —
+matching createBooking and buildRequestContext. Previously only
+serviceCategory was checked, so a cart whose top-level category wasn't "ac"
+but contained AC services got mehendi bin-packing (420-min bins, wrong
+buffer) in computeRequiredPartners.
 =====================================================
 */
 function isACBooking(booking) {
-  const cat = String(booking.serviceCategory || "").toLowerCase();
-  return AC_CATEGORY_SLUGS.some((slug) => cat.includes(slug));
+  if (isACCategory(booking?.serviceCategory || "")) return true;
+  return (Array.isArray(booking?.services) ? booking.services : []).some(
+    (s) => isACCategory(s?.category || "") || isACCategory(s?.name || "")
+  );
 }
 
 /*
 =====================================================
-COMPUTE REQUIRED PARTNERS (TASK BIN PACKING)
-Handles both Mehendi multi-artist logic and AC
-multi-unit technician logic through a unified FFD
-(First-Fit Decreasing) packer.
+COMPUTE REQUIRED PARTNERS (TEAM PACK)
+Delegates to the shared packer in scheduling_service —
+one packing model drives team sizing, payout split,
+slot feasibility and the booking's elapsed duration.
+The pack caps each partner's share at the visit
+window (240 min), splits bridal work across the two
+parallel artists, discounts 2nd+ AC units of the same
+line, and tags each bin with its skill requirements
+(technician tier / bridal capability).
+Returns { requiredCount, bins, dedicatedMinutes,
+taskBins, makespanMinutes }.
 =====================================================
 */
 async function computeRequiredPartners(booking) {
-  // ── Shared constants ──────────────────────────────────────────────
-  const MEHENDI_MAX_CAPACITY = 420; // 7 h per guest mehendi artist
-  const MAX_CAPACITY = isACBooking(booking)
-    ? AC_MAX_CAPACITY_MINUTES        // 360 min for AC (equipment overhead)
-    : MEHENDI_MAX_CAPACITY;
+  return computeTeamPackForBooking(booking);
+}
 
-  let dedicatedPartners = 0;        // bridal artists (mehendi) / lead tech (AC multi-unit)
-  const dedicatedMinutes = [];
-  const handTasks = [];
-  const addonFeetTasks = [];
-  const independentTasks = [];
-
-  if (!Array.isArray(booking.services) || !booking.services.length) {
-    return { requiredCount: 1, dedicatedMinutes: [], taskBins: [0] };
-  }
-
-  const Service = require("../models/service.model");
-  const serviceIds = booking.services.map((s) => s.serviceId).filter(Boolean);
-  const servicesData = await Service.find({ _id: { $in: serviceIds } }).lean();
-  const serviceMap = new Map(servicesData.map((s) => [String(s._id), s]));
-
-  // ── AC multi-unit packing ─────────────────────────────────────────
-  if (isACBooking(booking)) {
-    booking.services.forEach((s) => {
-      const quantity = Math.max(Number(s.quantity || 1), 1);
-      const serviceRef = serviceMap.get(String(s.serviceId));
-      const duration = serviceRef ? Number(serviceRef.duration || 90) : 90;
-
-      // Each AC unit is an independent task block (one tech per unit baseline)
-      for (let i = 0; i < quantity; i++) {
-        handTasks.push(duration);
-      }
-    });
-  } else {
-    // ── Mehendi multi-artist packing ──────────────────────────────────
-    const ADDON_FEET_NAMES = ["basic feet", "feet", "ankle", "above ankle"];
-    const INDEPENDENT_FEET_NAMES = ["mid leg", "below knee", "mehendi for guests"];
-
-    booking.services.forEach((s) => {
-      const cat = String(s.category || "").toLowerCase();
-      const name = String(s.name || "").toLowerCase();
-      const isMehendi = cat.includes("mehendi") || name.includes("mehendi");
-      if (!isMehendi) return;
-
-      const quantity = Math.max(Number(s.quantity || 1), 1);
-      const serviceRef = serviceMap.get(String(s.serviceId));
-      const duration = serviceRef ? Number(serviceRef.duration || 60) : 60;
-
-      if (name.includes("bridal mehendi")) {
-        // Phase 1: Dedicated bridal allocation — 1 bride = 2 dedicated artists
-        dedicatedPartners += quantity * 2;
-        for (let i = 0; i < quantity * 2; i++) {
-          dedicatedMinutes.push(duration);
-        }
-      } else {
-        for (let i = 0; i < quantity; i++) {
-          if (ADDON_FEET_NAMES.some((addon) => name === addon)) {
-            addonFeetTasks.push(duration);
-          } else if (INDEPENDENT_FEET_NAMES.some((indep) => name === indep)) {
-            independentTasks.push(duration);
-          } else {
-            handTasks.push(duration);
-          }
-        }
-      }
-    });
-  }
-
-  // Phase 2: Task block construction (pair hand + feet for mehendi)
-  handTasks.sort((a, b) => b - a);
-  addonFeetTasks.sort((a, b) => b - a);
-
-  const taskBlocks = [];
-  for (const feetDuration of addonFeetTasks) {
-    if (handTasks.length > 0) {
-      taskBlocks.push(handTasks.shift() + feetDuration);
-    } else {
-      taskBlocks.push(feetDuration);
-    }
-  }
-  taskBlocks.push(...handTasks, ...independentTasks);
-
-  // Phase 3 & 4: First-Fit Decreasing bin packing
-  taskBlocks.sort((a, b) => b - a);
-  const taskBins = [];
-
-  for (const task of taskBlocks) {
-    let placed = false;
-    for (let i = 0; i < taskBins.length; i++) {
-      if (taskBins[i] + task <= MAX_CAPACITY) {
-        taskBins[i] += task;
-        placed = true;
-        break;
-      }
-    }
-    if (!placed) taskBins.push(task);
-  }
-
-  // Phase 5: Total required
-  const guestPartners = taskBins.length;
-  const requiredCount = Math.max(dedicatedPartners + guestPartners, 1);
-
-  return { requiredCount, dedicatedMinutes, taskBins };
+// Human-readable bin summary for assignment audit notes.
+function describeTeamPack(teamPack) {
+  const bins = Array.isArray(teamPack?.bins) ? teamPack.bins : [];
+  if (!bins.length) return "1 partner, whole job";
+  const bridal = bins.filter((b) => b.kind === "BRIDAL").length;
+  const tier2 = bins.filter((b) => (b.tier || 1) >= 2).length;
+  const rest = bins.length - bridal - tier2;
+  const parts = [];
+  if (bridal) parts.push(`${bridal} bridal`);
+  if (tier2) parts.push(`${tier2} technician-tier`);
+  if (rest > 0) parts.push(`${rest} general`);
+  return parts.join(", ");
 }
 
 /*
@@ -317,18 +236,29 @@ async function assignBooking(bookingId, opts = {}) {
 
     // Don't assign a booking whose service window has already passed.
     // A booking more than 60 minutes in the past is unserviceable — escalate immediately.
+    // GUARDED on ASSIGNING_LOCK: a full-doc save here could overwrite a
+    // concurrent user/admin cancel (refund issued, then status flipped back).
     if (minutesToService < -60) {
-      booking.status = "NO_PARTNER_AVAILABLE";
-      booking.assignmentAudit.push({
-        stage: booking.assignmentStage || 1,
-        event: "NO_PARTNER_AVAILABLE",
-        searchedPincodes: [],
-        notes: `Service window already passed (${Math.round(-minutesToService)} min ago) — cannot assign`,
-        candidates: [],
-      });
-      await booking.save();
-      await releaseSlotCapacityForUnassignable(booking._id, "no_partner_window_passed");
-      await escalateUnassignedBooking(booking._id);
+      const expired = await Booking.findOneAndUpdate(
+        { _id: booking._id, status: "ASSIGNING_LOCK" },
+        {
+          $set: { status: "NO_PARTNER_AVAILABLE" },
+          $push: {
+            assignmentAudit: {
+              stage: booking.assignmentStage || 1,
+              event: "NO_PARTNER_AVAILABLE",
+              searchedPincodes: [],
+              notes: `Service window already passed (${Math.round(-minutesToService)} min ago) — cannot assign`,
+              candidates: [],
+            },
+          },
+        },
+        { new: true }
+      );
+      if (expired) {
+        await releaseSlotCapacityForUnassignable(booking._id, "no_partner_window_passed");
+        await escalateUnassignedBooking(booking._id);
+      }
       return null;
     }
 
@@ -467,17 +397,22 @@ async function assignBooking(bookingId, opts = {}) {
         continue;
       }
 
-      // Compute how many partners this booking actually needs
-      const { requiredCount, dedicatedMinutes, taskBins } =
-        await computeRequiredPartners(booking);
+      // Compute the team pack: how many partners, each partner's share (bin)
+      // and its skill requirements (technician tier / bridal capability).
+      const teamPack = await computeRequiredPartners(booking);
+      const { requiredCount } = teamPack;
 
-      // Not enough eligible partners available for this stage — try the next wider zone.
-      if (rankedPartners.length < requiredCount) {
+      // Match ranked partners to bins. Null = the pool can't fill every ROLE
+      // (not just the headcount) — e.g. three guest artists but no
+      // bridal-capable one, or cleanings covered but no technician for the
+      // gas-refill bin. Try the next wider zone.
+      const stagePlan = planTeamAssignment(rankedPartners, teamPack);
+      if (!stagePlan) {
         booking.assignmentAudit.push({
           stage,
           event: "INSUFFICIENT_PARTNERS",
           searchedPincodes: pincodesToSearch,
-          notes: `Need ${requiredCount} partner(s), only ${rankedPartners.length} eligible in stage ${stage}`,
+          notes: `Need ${requiredCount} partner(s) [${describeTeamPack(teamPack)}], pool of ${rankedPartners.length} cannot fill every role in stage ${stage}`,
           candidates: rankedPartners.slice(0, 5).map((e) => ({ partnerId: e.partner._id, score: e.score })),
         });
         await booking.save();
@@ -486,46 +421,57 @@ async function assignBooking(bookingId, opts = {}) {
       }
 
       // ── ATOMIC PARTNER CLAIM ──────────────────────────────────────────
-      // Walk the ranked candidates and atomically claim each partner for this
-      // exact slot via a guarded $push. MongoDB serialises writes to a single
-      // document, so when two bookings race for the same partner (e.g. a
-      // "tatkal" rush on one slot) only the first claim's guard passes — the
-      // second sees the slot already present, returns null, and that booking
-      // moves on to the next candidate. This is what prevents one partner being
-      // handed two overlapping jobs; the per-booking ASSIGNING_LOCK cannot,
-      // because it locks the booking, not the partner.
+      // Fill the plan slot by slot (most restrictive bins first), atomically
+      // claiming each partner for this exact slot via a guarded $push.
+      // MongoDB serialises writes to a single document, so when two bookings
+      // race for the same partner (e.g. a "tatkal" rush on one slot) only the
+      // first claim's guard passes — the second sees the slot already present,
+      // returns null, and that bin falls through to the next CAPABLE candidate.
+      // This is what prevents one partner being handed two overlapping jobs;
+      // the per-booking ASSIGNING_LOCK cannot, because it locks the booking,
+      // not the partner.
       const claimDate = booking.scheduledDate;
       const claimTime = booking.scheduledTime;
-      const selectedPartners = [];
+      const selectedTeam = []; // { partner, bin } in slot order (lead first)
       const claimedIds = new Set();
+      const failedClaimIds = new Set();
 
-      for (const entry of rankedPartners) {
-        if (selectedPartners.length >= requiredCount) break;
-        const candidateId = entry.partner._id;
-        if (claimedIds.has(String(candidateId))) continue;
+      for (const { bin } of stagePlan) {
+        let claimedForBin = null;
+        for (const entry of rankedPartners) {
+          const candidateId = String(entry.partner._id);
+          if (claimedIds.has(candidateId) || failedClaimIds.has(candidateId)) continue;
+          if (!partnerFitsBin(entry, bin)) continue;
 
-        const claimed = await Partner.findOneAndUpdate(
-          {
-            _id: candidateId,
-            busySlots: {
-              $not: { $elemMatch: { date: claimDate, time: claimTime } },
+          const claimed = await Partner.findOneAndUpdate(
+            {
+              _id: entry.partner._id,
+              busySlots: {
+                $not: { $elemMatch: { date: claimDate, time: claimTime } },
+              },
             },
-          },
-          { $push: { busySlots: { date: claimDate, time: claimTime } } },
-          { new: true }
-        );
+            { $push: { busySlots: { date: claimDate, time: claimTime } } },
+            { new: true }
+          );
 
-        if (claimed) {
-          selectedPartners.push(claimed);
-          claimedIds.add(String(candidateId));
+          if (claimed) {
+            claimedForBin = claimed;
+            claimedIds.add(candidateId);
+            break;
+          }
+          failedClaimIds.add(candidateId);
         }
+        if (!claimedForBin) break;
+        selectedTeam.push({ partner: claimedForBin, bin });
       }
 
-      // Couldn't lock enough distinct partners — parallel assignments won the
-      // race for the rest. Release whatever we did grab (sync rebuilds busySlots
-      // from committed bookings, dropping our uncommitted claim) and widen to the
-      // next stage. A half-staffed team is worse than retrying.
-      if (selectedPartners.length < requiredCount) {
+      const selectedPartners = selectedTeam.map((t) => t.partner);
+
+      // Couldn't lock a capable partner for every bin — parallel assignments
+      // won the race for the rest. Release whatever we did grab (sync rebuilds
+      // busySlots from committed bookings, dropping our uncommitted claim) and
+      // widen to the next stage. A half-staffed team is worse than retrying.
+      if (selectedTeam.length < stagePlan.length) {
         for (const claimedPartner of selectedPartners) {
           await syncPartnerOperationalState(claimedPartner._id);
         }
@@ -533,7 +479,7 @@ async function assignBooking(bookingId, opts = {}) {
           stage,
           event: "CLAIM_CONTENTION",
           searchedPincodes: pincodesToSearch,
-          notes: `Claimed ${selectedPartners.length}/${requiredCount} partner(s) before parallel assignments took the rest — retrying wider`,
+          notes: `Claimed ${selectedTeam.length}/${stagePlan.length} role slot(s) before parallel assignments took the rest — retrying wider`,
           candidates: rankedPartners
             .slice(0, 5)
             .map((e) => ({ partnerId: e.partner._id, score: e.score })),
@@ -541,6 +487,37 @@ async function assignBooking(bookingId, opts = {}) {
         await booking.save();
         // A lost claim race is not deterministic — the same pool is worth
         // retrying at the next stage even if it reaches no new hubs.
+        prevStageFailedDeterministically = false;
+        continue;
+      }
+
+      // ── Cake daily-cap re-verification ─────────────────────────────────
+      // The cap filter inside findEligiblePartnersForBooking ran BEFORE
+      // scoring/team sizing, so two concurrent cake bookings for the same
+      // baker on the same day (different time slots — which the busySlots
+      // claim guard does not serialize) can both have passed it. Now that our
+      // claim is placed, recount: any claimed baker who is meanwhile at the
+      // cap gets released, and we retry as claim contention.
+      const overCapPartnerIds = await verifyCakeCapAfterClaim(
+        booking,
+        selectedPartners.map((p) => p._id)
+      );
+      if (overCapPartnerIds.length) {
+        for (const claimedPartner of selectedPartners) {
+          await syncPartnerOperationalState(claimedPartner._id);
+        }
+        booking.assignmentAudit.push({
+          stage,
+          event: "CLAIM_CONTENTION",
+          searchedPincodes: pincodesToSearch,
+          notes: `Cake daily cap reached for partner(s) ${overCapPartnerIds.join(", ")} between eligibility check and claim — released claims, retrying`,
+          candidates: rankedPartners
+            .slice(0, 5)
+            .map((e) => ({ partnerId: e.partner._id, score: e.score })),
+        });
+        await booking.save();
+        // Same-pool retry is worth it: the next attempt re-runs eligibility,
+        // which now sees the winner's booking and drops the full baker.
         prevStageFailedDeterministically = false;
         continue;
       }
@@ -554,30 +531,30 @@ async function assignBooking(bookingId, opts = {}) {
         .slice(0, 3)
         .map((e) => e.partner._id);
 
-      // Build proportional workload + payout mapping.
+      // Build proportional workload + payout mapping from each partner's OWN
+      // bin (not an index-matched sorted list — the plan already pairs every
+      // partner with the exact share they'll work).
       // The last partner absorbs the rounding remainder so the ratios sum to
       // exactly 1.0 — otherwise toFixed(4) leaves a few paise unallocated and
       // the customer's totalAmount never fully matches sum(partner earnings).
-      const allWorkloads = [...dedicatedMinutes, ...taskBins].sort(
-        (a, b) => b - a
-      );
-      const totalWorkloadMinutes = allWorkloads.reduce((a, b) => a + b, 0) || 1;
+      const totalWorkloadMinutes =
+        selectedTeam.reduce((sum, t) => sum + (t.bin.minutes || 0), 0) || 1;
 
       let assignedRatioSum = 0;
-      const teamAllocations = selectedPartners.map((p, index) => {
-        const isLast = index === selectedPartners.length - 1;
+      const teamAllocations = selectedTeam.map((t, index) => {
+        const isLast = index === selectedTeam.length - 1;
         let payoutRatio;
         if (isLast) {
           payoutRatio = Number(Math.max(1 - assignedRatioSum, 0).toFixed(4));
         } else {
           payoutRatio = Number(
-            ((allWorkloads[index] || 0) / totalWorkloadMinutes).toFixed(4)
+            ((t.bin.minutes || 0) / totalWorkloadMinutes).toFixed(4)
           );
           assignedRatioSum = Number((assignedRatioSum + payoutRatio).toFixed(4));
         }
         return {
-          partnerId: p._id,
-          assignedMinutes: allWorkloads[index] || 0,
+          partnerId: t.partner._id,
+          assignedMinutes: t.bin.minutes || 0,
           payoutRatio,
           isPrimary: index === 0,
         };
@@ -586,48 +563,82 @@ async function assignBooking(bookingId, opts = {}) {
       const autoAccepted = Boolean(primaryPartner.autoAccept);
       const finalStatus = autoAccepted ? "CONFIRMED" : "ASSIGNED";
 
-      booking.partner = primaryPartner._id;
-      booking.teamAllocations = teamAllocations;
-      booking.additionalPartners = additionalPartners.map((p) => p._id);
-      booking.standbyPartners = standbyCandidates;
+      // GUARDED ATOMIC ASSIGNMENT: only commit the partner + status while the
+      // booking is still ASSIGNING_LOCK. The previous full-document save could
+      // overwrite a concurrent cancel (user cancel / admin force-cancel) that
+      // landed during the search — the customer got a refund AND a partner was
+      // dispatched. If the guard fails, release the claimed partners and stop.
+      //
+      // assignedAt anchors the advance-ACK deadline (see ackTimeout.service) —
+      // set on every (re)assignment so each newly attached partner gets a fresh
+      // window. ackReceivedAt is stamped for auto-accepted bookings (no manual
+      // ACK needed) and explicitly RESET for manual-accept ones so a previous
+      // partner's acknowledgement can never satisfy the new partner's ACK gate.
+      //
+      // autoRefundIfUnassigned: a partner is now attached, so the partner-cancel
+      // auto-refund window is closed. Clear the flag (set by cancelBooking on a
+      // partner cancel) — otherwise it stays sticky across this partner's
+      // tenure, and a much-later re-search exhaustion would wrongly auto-cancel
+      // + refund a booking we did manage to staff. If THIS partner later
+      // cancels, cancelBooking re-arms it.
+      const assignedBooking = await Booking.findOneAndUpdate(
+        { _id: booking._id, status: "ASSIGNING_LOCK" },
+        {
+          $set: {
+            partner: primaryPartner._id,
+            teamAllocations,
+            additionalPartners: additionalPartners.map((p) => p._id),
+            standbyPartners: standbyCandidates,
+            status: finalStatus,
+            assignedAt: new Date(),
+            autoRefundIfUnassigned: false,
+            ackReceivedAt: autoAccepted ? new Date() : null,
+          },
+          $push: {
+            assignmentAudit: {
+              stage,
+              event: autoAccepted ? "CONFIRMED_AUTO" : "SOFT_ASSIGNED",
+              searchedPincodes: pincodesToSearch,
+              selectedPartnerId: primaryPartner._id,
+              notes: `[${acBooking ? "AC" : "BEAUTY"}] Selected top-ranked partner${
+                autoAccepted ? " with auto-accept enabled" : ""
+              } — ${requiredCount} partner(s) required`,
+              candidates: rankedPartners.slice(0, 10).map((entry) => ({
+                partnerId: entry.partner._id,
+                score: Number(entry.score || 0),
+                skillMatchLevel: Number(entry.skillMatchLevel || 0),
+                distanceMeters: Number.isFinite(entry.distanceMeters)
+                  ? Math.round(entry.distanceMeters)
+                  : null,
+                activeJobs: Number(entry.activeJobs || 0),
+                rating: Number(entry.partner?.rating ?? 0),
+                // Full per-component breakdown so the weight-shadow report can
+                // recompute rankings under any weighting without re-querying.
+                fairnessScore: Number(entry.fairnessScore || 0),
+                earningsScore: Number(entry.earningsScore || 0),
+                distanceScore: Number(entry.distanceScore || 0),
+                skillScore: Number(entry.skillScore || 0),
+                reliabilityScore: Number(entry.reliabilityScore || 0),
+                autoAccept: Boolean(entry.partner?.autoAccept),
+              })),
+            },
+          },
+        },
+        { new: true }
+      );
 
-      booking.status = finalStatus;
-      // Anchor for the advance-ACK deadline (see ackTimeout.service). Set on
-      // every (re)assignment so each newly attached partner gets a fresh window.
-      booking.assignedAt = new Date();
-      // A partner is now attached, so the partner-cancel auto-refund window is closed.
-      // Clear the flag (set by cancelBooking on a partner cancel) — otherwise it stays
-      // sticky across this partner's tenure, and a much-later re-search exhaustion would
-      // wrongly auto-cancel + refund a booking we did manage to staff. If THIS partner
-      // later cancels, cancelBooking re-arms it.
-      booking.autoRefundIfUnassigned = false;
-      // Auto-accepted bookings don't need a manual ACK from the partner.
-      // Mark ackReceivedAt now so the ACK timeout handler skips reassignment.
-      if (autoAccepted) {
-        booking.ackReceivedAt = new Date();
+      if (!assignedBooking) {
+        // Booking moved on (cancelled/rescheduled) while we were claiming
+        // partners — release the claims and do NOT hand out the job. Sync
+        // rebuilds busySlots from committed bookings, dropping our claim.
+        for (const claimedPartner of selectedPartners) {
+          await syncPartnerOperationalState(claimedPartner._id);
+        }
+        console.warn(
+          `[assignment] Booking ${booking._id} changed state during assignment — claims released, no partner dispatched`
+        );
+        return null;
       }
-      booking.assignmentAudit.push({
-        stage,
-        event: autoAccepted ? "CONFIRMED_AUTO" : "SOFT_ASSIGNED",
-        searchedPincodes: pincodesToSearch,
-        selectedPartnerId: primaryPartner._id,
-        notes: `[${acBooking ? "AC" : "BEAUTY"}] Selected top-ranked partner${
-          autoAccepted ? " with auto-accept enabled" : ""
-        } — ${requiredCount} partner(s) required`,
-        candidates: rankedPartners.slice(0, 10).map((entry) => ({
-          partnerId: entry.partner._id,
-          score: Number(entry.score || 0),
-          skillMatchLevel: Number(entry.skillMatchLevel || 0),
-          distanceMeters: Number.isFinite(entry.distanceMeters)
-            ? Math.round(entry.distanceMeters)
-            : null,
-          activeJobs: Number(entry.activeJobs || 0),
-          fairnessScore: Number(entry.fairnessScore || 0),
-          earningsScore: Number(entry.earningsScore || 0),
-          autoAccept: Boolean(entry.partner?.autoAccept),
-        })),
-      });
-      await booking.save();
 
       // Schedule ACK timeout only for manual-accept bookings (ASSIGNED).
       // Auto-accepted bookings (CONFIRMED) already have ackReceivedAt set above —
@@ -662,10 +673,19 @@ async function assignBooking(bookingId, opts = {}) {
       // bookings so the live counts are exact. A targeted $set (not a full-doc
       // save) avoids clobbering any concurrent update to the partner.
       for (const teamPartner of selectedPartners) {
-        await Partner.updateOne(
-          { _id: teamPartner._id },
-          { $set: { lastAssignedAt: new Date() } }
-        );
+        const update = { $set: { lastAssignedAt: new Date() } };
+        // Reliability acceptance tracking (primary partner only — the one gated
+        // on ACK and the one reassignment revolves around). Every soft-assign
+        // is an offer (assignedCount); an auto-accept partner accepts it here
+        // and now, so bump acceptedCount too. Manual-accept partners get their
+        // acceptedCount in acceptJobCore instead — guarded there against
+        // double-counting, so the two paths never both fire for one offer.
+        if (teamPartner._id.toString() === primaryPartner._id.toString()) {
+          update.$inc = autoAccepted
+            ? { assignedCount: 1, acceptedCount: 1 }
+            : { assignedCount: 1 };
+        }
+        await Partner.updateOne({ _id: teamPartner._id }, update);
         await syncPartnerOperationalState(teamPartner._id);
       }
 
@@ -765,17 +785,27 @@ async function assignBooking(bookingId, opts = {}) {
       return primaryPartner;
     }
 
-    // All 3 stages exhausted — queue for retry if caller requested, else escalate
+    // All 3 stages exhausted — queue for retry if caller requested, else escalate.
+    // Both writes are GUARDED on ASSIGNING_LOCK so a concurrent cancel can't be
+    // overwritten by a stale full-document save (same race as the assign write).
     if (opts.queueOnFailure) {
-      booking.status = "QUEUED";
-      booking.assignmentAudit.push({
-        stage: booking.assignmentStage || 3,
-        event: "QUEUED",
-        searchedPincodes: [],
-        notes: "No partner available at booking time — queued for cron retry",
-        candidates: [],
-      });
-      await booking.save();
+      const queued = await Booking.findOneAndUpdate(
+        { _id: booking._id, status: "ASSIGNING_LOCK" },
+        {
+          $set: { status: "QUEUED" },
+          $push: {
+            assignmentAudit: {
+              stage: booking.assignmentStage || 3,
+              event: "QUEUED",
+              searchedPincodes: [],
+              notes: "No partner available at booking time — queued for cron retry",
+              candidates: [],
+            },
+          },
+        },
+        { new: true }
+      );
+      if (!queued) return null; // booking moved on concurrently — leave it alone
 
       if (global.io) {
         global.io.to(`user_${booking.user}`).emit("booking_update", {
@@ -787,15 +817,23 @@ async function assignBooking(bookingId, opts = {}) {
       return null;
     }
 
-    booking.status = "NO_PARTNER_AVAILABLE";
-    booking.assignmentAudit.push({
-      stage: booking.assignmentStage || 3,
-      event: "NO_PARTNER_AVAILABLE",
-      searchedPincodes: [],
-      notes: "Exhausted all assignment stages without a valid partner",
-      candidates: [],
-    });
-    await booking.save();
+    const unassignable = await Booking.findOneAndUpdate(
+      { _id: booking._id, status: "ASSIGNING_LOCK" },
+      {
+        $set: { status: "NO_PARTNER_AVAILABLE" },
+        $push: {
+          assignmentAudit: {
+            stage: booking.assignmentStage || 3,
+            event: "NO_PARTNER_AVAILABLE",
+            searchedPincodes: [],
+            notes: "Exhausted all assignment stages without a valid partner",
+            candidates: [],
+          },
+        },
+      },
+      { new: true }
+    );
+    if (!unassignable) return null; // booking moved on concurrently — leave it alone
 
     // Release the reserved SlotCapacity units AND bust the slot cache — a
     // booking we can't staff must not keep blocking the window for other
@@ -927,27 +965,21 @@ async function reassignBooking(bookingId, partnerId, options = {}) {
       // already counted this strike themselves. Without the skip flag, an HTTP
       // partner-cancel would increment weeklyCancelCount twice (once in the
       // controller, once here) and auto-suspend after 3 real strikes.
+      //
+      // recordPartnerStrike is the shared atomic implementation (same as the
+      // HTTP cancel path): it applies the rolling-7-day weekly reset before
+      // adding the strike — the old read-modify-write here never reset, so a
+      // stale months-old count plus one ACK timeout could wrongly suspend a
+      // partner — and it can't clobber a concurrent strike's counters.
       if (!skipPartnerPenalty) {
-        const Partner = require("../models/Partner");
-        const rejectingPartner = await Partner.findById(partnerId);
-        if (rejectingPartner) {
+        try {
+          const { recordPartnerStrike } = require("./partnerLifecycle.service");
           // Post-CONFIRMED cancel is penalised double — customer trust impact is higher
-          const penalty = booking.status === "CONFIRMED" ? 2 : 1;
-          rejectingPartner.weeklyCancelCount =
-            (rejectingPartner.weeklyCancelCount || 0) + penalty;
-
-          // Hard suspension: ≥ 5 cancellations in the rolling week
-          if (rejectingPartner.weeklyCancelCount >= 5) {
-            rejectingPartner.isAvailable = false;
-            rejectingPartner.isBlocked = true;
-            rejectingPartner.suspendedUntil = new Date(
-              Date.now() + 7 * 24 * 60 * 60 * 1000
-            );
-            console.warn(
-              `Partner ${partnerId} auto-suspended for 7 days (weeklyCancelCount = ${rejectingPartner.weeklyCancelCount})`
-            );
-          }
-          await rejectingPartner.save();
+          await recordPartnerStrike(partnerId, {
+            strikes: booking.status === "CONFIRMED" ? 2 : 1,
+          });
+        } catch (strikeErr) {
+          console.error(`[reassign] Strike recording failed for partner ${partnerId}: ${strikeErr.message}`);
         }
       }
     }

@@ -185,7 +185,16 @@ app.get("/health", async (_req, res) => {
 ====================== */
 
 mongoose
-  .connect(process.env.MONGO_URI)
+  .connect(process.env.MONGO_URI, {
+    // Fail a request fast when the DB is unreachable instead of hanging on the
+    // 30s default — a slow/blipping Mongo would otherwise pile up requests on
+    // the single event loop and cascade into apparent full-app slowness.
+    serverSelectionTimeoutMS: Number(process.env.MONGO_SERVER_SELECTION_TIMEOUT_MS || 5000),
+    socketTimeoutMS: Number(process.env.MONGO_SOCKET_TIMEOUT_MS || 45000),
+    // Explicit pool bound (Mongoose default is 100). Tunable per deployment.
+    maxPoolSize: Number(process.env.MONGO_MAX_POOL_SIZE || 50),
+    minPoolSize: Number(process.env.MONGO_MIN_POOL_SIZE || 5),
+  })
   .then(async () => {
     logger.info("MongoDB connected");
     try {
@@ -252,9 +261,10 @@ setSocketIO(io);
 const { handshakeAuth } = require("./socket/handshakeAuth");
 io.use(handshakeAuth);
 
-// Short-lived dedup set: prevents double-fire of acceptJob on flaky networks.
-// Key = `${partnerId}:${bookingId}`, cleared after 5 s.
+// Short-lived dedup sets: prevent double-fire of acceptJob / rejectJob on flaky
+// networks. Key = `${partnerId}:${bookingId}`, cleared after 5 s.
 const acceptJobDedup = new Set();
+const rejectJobDedup = new Set();
 
 io.on("connection", (socket) => {
 
@@ -280,6 +290,16 @@ io.on("connection", (socket) => {
 
   /* ======================
      PARTNER ACKNOWLEDGE JOB
+     Additional team members may also send this (previously only the primary
+     partner was accepted — a helper/team member's ack got a hard "Not
+     assigned" error even though they legitimately hold the job). But only the
+     PRIMARY's ack is allowed to flip the shared ackReceivedAt / cancel the ACK
+     timer: scheduleAckTimeout is anchored to the primary partner alone
+     (assignBooking calls scheduleAckTimeout(booking._id, primaryPartner._id)),
+     so letting a team member's ack satisfy that shared field would silently
+     suppress the reassignment-on-timeout check for a primary who never
+     actually acknowledged. A team member's ack is acknowledged as a courtesy
+     no-op instead, mirroring acceptJobCore's non-primary branch.
   ====================== */
   socket.on("acknowledgeJob", async ({ bookingId }) => {
     try {
@@ -288,13 +308,23 @@ io.on("connection", (socket) => {
         return;
       }
 
-      const booking = await Booking.findById(bookingId).select("partner status user");
+      const booking = await Booking.findById(bookingId).select(
+        "partner additionalPartners status user"
+      );
       if (!booking) return;
 
       const pid = String(socket.partnerId);
-      const isAssigned = booking.partner?.toString() === pid;
-      if (!isAssigned) {
+      const isPrimary = booking.partner?.toString() === pid;
+      const isAdditional = (booking.additionalPartners || []).some(
+        (p) => p.toString() === pid
+      );
+      if (!isPrimary && !isAdditional) {
         socket.emit("error", { event: "acknowledgeJob", message: "Not assigned to this booking" });
+        return;
+      }
+
+      if (!isPrimary) {
+        socket.emit("ack_confirmed", { bookingId: String(bookingId) });
         return;
       }
 
@@ -318,6 +348,11 @@ io.on("connection", (socket) => {
   /* ======================
      PARTNER ACCEPT JOB
      ASSIGNED or CONFIRMED → PARTNER_ACCEPTED
+     Delegates to acceptJobCore — the exact function the HTTP accept endpoint
+     uses — so the two paths can never diverge (they used to: HTTP → CONFIRMED
+     with no ack/timer/push, socket → PARTNER_ACCEPTED with all of them).
+     Only the PRIMARY partner's accept flips the booking; a team member's
+     accept is acknowledged without changing global state.
   ====================== */
   socket.on("acceptJob", async ({ bookingId }) => {
     try {
@@ -332,60 +367,25 @@ io.on("connection", (socket) => {
       acceptJobDedup.add(dedupKey);
       setTimeout(() => acceptJobDedup.delete(dedupKey), 5000);
 
-      const booking = await Booking.findById(bookingId);
-      if (!booking) return;
+      const { acceptJobCore } = require("./services/partnerLifecycle.service");
+      const result = await acceptJobCore(bookingId, socket.partnerId);
 
-      if (!["ASSIGNED", "CONFIRMED"].includes(booking.status)) return;
-
-      const pid = String(socket.partnerId);
-      const isAssigned =
-        booking.partner?.toString() === pid ||
-        (booking.additionalPartners || []).some((p) => p.toString() === pid);
-      if (!isAssigned) {
+      if (!result.ok && result.code === "NOT_ASSIGNED") {
         socket.emit("error", { event: "acceptJob", message: "Not assigned to this booking" });
         return;
       }
+      if (!result.ok) return; // not found / already moved on / race lost — no-op
 
-      // ATOMIC: flip the status here, not on the in-memory `booking` doc.
-      // Two acceptJob events on different sockets (same partner, reconnect, two
-      // devices) used to both pass the status check and both increment
-      // activeJobs. The findOneAndUpdate makes exactly one of them win.
-      const accepted = await Booking.findOneAndUpdate(
-        { _id: bookingId, status: { $in: ["ASSIGNED", "CONFIRMED"] } },
-        {
-          $set: {
-            status: "PARTNER_ACCEPTED",
-            ackReceivedAt: booking.ackReceivedAt ?? new Date(),
-          },
-        },
-        { new: true }
-      );
-
-      if (!accepted) {
-        // Another socket won the race — nothing else to do.
+      if (!result.statusChanged) {
+        // Additional team member — confirm receipt without flipping the booking.
+        socket.emit("job_accepted_confirmation", { bookingId: String(bookingId) });
         return;
       }
 
-      const { cancelAckTimeout } = require("./services/ackTimeout.service");
-      await cancelAckTimeout(bookingId);
-
-      await Partner.findByIdAndUpdate(socket.partnerId, {
-        $inc: { activeJobs: 1 },
+      logger.info("[socket] Booking accepted by partner", {
+        bookingId,
+        partnerId: String(socket.partnerId),
       });
-
-      io.to(`user_${accepted.user}`).emit("booking_update", {
-        bookingId: accepted._id.toString(),
-        status: "PARTNER_ACCEPTED",
-      });
-
-      // Push the customer too — reaches them with the app closed.
-      notifyCustomerOfBookingStatus(accepted.user, "PARTNER_ACCEPTED", accepted._id);
-
-      io.to(`partner_${socket.partnerId}`).emit("job_accepted_confirmation", {
-        bookingId: accepted._id.toString(),
-      });
-
-      logger.info("[socket] Booking accepted by partner", { bookingId, partnerId: pid });
     } catch (err) {
       logger.error("acceptJob error", { error: err.message, stack: err.stack });
     }
@@ -404,17 +404,50 @@ io.on("connection", (socket) => {
         return;
       }
 
+      // Dedup rapid duplicate fires (same as acceptJob): without it, two
+      // rejectJob events racing before the status flips to SEARCHING could both
+      // pass the ASSIGNED/CONFIRMED guard below and record two strikes / run two
+      // reassignments for one rejection.
+      const dedupKey = `${socket.partnerId}:${bookingId}`;
+      if (rejectJobDedup.has(dedupKey)) return;
+      rejectJobDedup.add(dedupKey);
+      setTimeout(() => rejectJobDedup.delete(dedupKey), 5000);
+
       const booking = await Booking.findById(bookingId).select("status partner additionalPartners user");
       if (!booking) return;
 
       if (!["ASSIGNED", "CONFIRMED"].includes(booking.status)) return;
 
       const pid = String(socket.partnerId);
-      const isAssigned =
-        booking.partner?.toString() === pid ||
-        (booking.additionalPartners || []).some((p) => p.toString() === pid);
-      if (!isAssigned) {
+      const isPrimary = booking.partner?.toString() === pid;
+      const isAdditional = (booking.additionalPartners || []).some((p) => p.toString() === pid);
+      if (!isPrimary && !isAdditional) {
         socket.emit("error", { event: "rejectJob", message: "Not assigned to this booking" });
+        return;
+      }
+
+      // ADDITIONAL team member rejecting: remove only them — the primary and
+      // the rest of the team keep the job. Previously one member's reject
+      // released the whole booking (primary included) back to SEARCHING.
+      if (!isPrimary) {
+        const {
+          removeTeamMemberFromBooking,
+          recordPartnerStrike,
+        } = require("./services/partnerLifecycle.service");
+        const removal = await removeTeamMemberFromBooking(
+          bookingId,
+          socket.partnerId,
+          "Rejected team assignment"
+        );
+        if (removal.removed) {
+          await recordPartnerStrike(socket.partnerId, {
+            strikes: booking.status === "CONFIRMED" ? 2 : 1,
+          });
+        }
+        logger.info("[socket] Team member rejected assignment — removed from team", {
+          bookingId,
+          partnerId: pid,
+        });
         return;
       }
 

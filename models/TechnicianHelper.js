@@ -23,7 +23,9 @@ const technicianHelperSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: "Partner",
       required: true,
-      index: true,
+      // No field-level index here: the partial-unique index on { helper: 1 }
+      // (status: ACTIVE) defined below already covers helper lookups. Declaring
+      // both produced a duplicate-{helper:1}-index warning at boot.
     },
 
     // Phone number the technician typed when inviting (audit trail).

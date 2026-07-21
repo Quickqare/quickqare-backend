@@ -15,12 +15,14 @@ function handshakeAuth(socket, next) {
     readCookie(socket.handshake.headers?.cookie, USER_TOKEN_COOKIE);
   if (!token) return next();
   try {
-    const partnerSecret = process.env.PARTNER_JWT_SECRET || process.env.JWT_SECRET;
-    const userSecret = process.env.JWT_SECRET;
+    // Partner and user tokens are BOTH signed with JWT_SECRET (see partnerAuth /
+    // userAuth and their controllers). No separate PARTNER_JWT_SECRET is used
+    // anywhere on the HTTP side; an earlier fallback to one here implied a
+    // secret separation that never existed, so it's removed to avoid the false
+    // impression that setting PARTNER_JWT_SECRET changes anything. Role dispatch
+    // below distinguishes partner vs user tokens.
     let payload;
-    try { payload = jwt.verify(token, partnerSecret); } catch (_) {
-      try { payload = jwt.verify(token, userSecret); } catch (__) { return next(); }
-    }
+    try { payload = jwt.verify(token, process.env.JWT_SECRET); } catch (_) { return next(); }
     // Partner tokens are signed { id, role: "partner" } — check role+id first,
     // then fall back to a legacy partnerId field if ever used.
     // User tokens are signed { id, role: "user" } (userOtp.controller) — the

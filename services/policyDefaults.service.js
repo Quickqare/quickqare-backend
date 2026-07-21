@@ -68,16 +68,22 @@ If you have a privacy concern, contact support through the app or admin panel.`,
    - 1 to 4 hours before service: smaller partial refund may apply.
    - Less than 1 hour before service or after partner arrival: refund may be limited or not available depending on service progress.
 
-3. Service already started:
+3. Cake and celebration orders (baked to order):
+   - More than 48 hours before delivery: full refund.
+   - 24 to 48 hours before delivery: 50% refund.
+   - Less than 24 hours before delivery: no refund (baking has begun or the baker's slot cannot be refilled).
+   - Grace period: if the order was placed less than 16 hours before delivery, it can be cancelled within 2 hours of booking for a full refund.
+
+4. Service already started:
    - Once the partner has started work, refunds are generally not allowed unless support approves an exception.
 
-4. No-show or incorrect address:
+5. No-show or incorrect address:
    - If the customer is unavailable or the address is incorrect, refund eligibility may be reduced.
 
-5. Failed service or complaint:
+6. Failed service or complaint:
    - If the service was not delivered properly, QuickQare support may offer a refund, re-service, or another resolution.
 
-6. Refund timing:
+7. Refund timing:
    - Approved refunds may take 5 to 7 business days to reflect in the original payment method.
 
 All refunds are reviewed based on booking status, service progress, and support validation.`,

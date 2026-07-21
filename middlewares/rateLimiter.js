@@ -1,4 +1,5 @@
 const rateLimit = require("express-rate-limit");
+const { ipKeyGenerator } = require("express-rate-limit");
 
 /* =====================================================
    GLOBAL FLOOR LIMITER
@@ -107,13 +108,62 @@ exports.phoneOtpLimiter = rateLimit({
     // Normalise: strip spaces, leading +, ensure string so
     // an empty/missing phone falls back to IP (authLimiter catches it anyway).
     const phone = String(req.body?.phone || "").replace(/\s+/g, "").replace(/^\+/, "");
-    return phone || req.ip;
+    return phone || ipKeyGenerator(req);
   },
 
   handler: (req, res) => {
     res.status(429).json({
       success: false,
       message: "Please wait 60 seconds before requesting another OTP.",
+    });
+  },
+});
+
+/* =====================================================
+   BOOKING CREATE LIMITER (PER USER)
+   POST /api/booking/create reserves real slot capacity for ~10 min per
+   PENDING_PAYMENT booking. Keyed on the authenticated user (must be mounted
+   AFTER userAuth) so a single account can't script a flood of unpaid bookings
+   that lock out slot inventory for everyone else. Falls back to IP if req.user
+   is somehow absent. Pairs with the per-user concurrent-unpaid cap enforced in
+   the createBooking controller.
+===================================================== */
+exports.bookingCreateLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: Number(process.env.BOOKING_CREATE_RATE_LIMIT_MAX || 10),
+
+  standardHeaders: true,
+  legacyHeaders: false,
+
+  keyGenerator: (req) =>
+    req.user?._id ? `booking-create:${req.user._id}` : ipKeyGenerator(req),
+
+  handler: (req, res) => {
+    res.status(429).json({
+      success: false,
+      message: "Too many booking attempts. Please slow down.",
+    });
+  },
+});
+
+/* =====================================================
+   AVAILABLE-SLOTS LIMITER (PER IP)
+   GET/POST /api/booking/available-slots is UNAUTHENTICATED and runs a
+   per-slot-window partner-eligibility query — the most expensive anonymous
+   endpoint in the API. The global floor is too loose to protect it; cap it
+   per IP. 60/min comfortably covers a real customer scrubbing through dates.
+===================================================== */
+exports.slotsLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: Number(process.env.SLOTS_RATE_LIMIT_MAX || 60),
+
+  standardHeaders: true,
+  legacyHeaders: false,
+
+  handler: (req, res) => {
+    res.status(429).json({
+      success: false,
+      message: "Too many slot lookups. Please slow down.",
     });
   },
 });
@@ -162,13 +212,48 @@ exports.phoneLoginLimiter = rateLimit({
 
   keyGenerator: (req) => {
     const phone = String(req.body?.phone || "").replace(/\s+/g, "").replace(/^\+/, "");
-    return `login:${phone || req.ip}`;
+    return `login:${phone || ipKeyGenerator(req)}`;
   },
 
   handler: (req, res) => {
     res.status(429).json({
       success: false,
       message: "Too many failed login attempts for this account. Try again in 15 minutes.",
+    });
+  },
+});
+
+/* =====================================================
+   PER-PHONE OTP VERIFY LIMITER
+   authLimiter on /verify-otp is IP-keyed, so an attacker
+   rotating IPs could grind a 4-digit OTP (10,000 possible
+   codes) for one phone number indefinitely within its
+   validity window. This limiter keys on the target phone
+   instead, same pattern as phoneLoginLimiter.
+   5 attempts caps a brute-force at 5/10,000 (0.05%) odds
+   per active OTP while still covering a couple of genuine
+   typos. Successful verifications don't count, so a legit
+   partner who fumbles once or twice then gets it right is
+   never locked out.
+===================================================== */
+exports.phoneOtpVerifyLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5,                   // max 5 failed OTP verify attempts per phone
+
+  standardHeaders: true,
+  legacyHeaders: false,
+
+  skipSuccessfulRequests: true,
+
+  keyGenerator: (req) => {
+    const phone = String(req.body?.phone || "").replace(/\s+/g, "").replace(/^\+/, "");
+    return `otp-verify:${phone || ipKeyGenerator(req)}`;
+  },
+
+  handler: (req, res) => {
+    res.status(429).json({
+      success: false,
+      message: "Too many failed OTP attempts for this number. Try again in 15 minutes.",
     });
   },
 });
@@ -183,7 +268,7 @@ exports.phoneOtpHourlyLimiter = rateLimit({
 
   keyGenerator: (req) => {
     const phone = String(req.body?.phone || "").replace(/\s+/g, "").replace(/^\+/, "");
-    return `hourly:${phone || req.ip}`;
+    return `hourly:${phone || ipKeyGenerator(req)}`;
   },
 
   handler: (req, res) => {

@@ -221,7 +221,13 @@ async function getEligibleUnitsForWindow(booking, slotStart, slotEnd, scope, ses
   return candidates.length;
 }
 
-async function getSlotAvailabilitySnapshot(booking, slotStart, slotEnd, session) {
+async function getSlotAvailabilitySnapshot(
+  booking,
+  slotStart,
+  slotEnd,
+  session,
+  { readOnly = false } = {}
+) {
   const requiredCount = Math.max(Number((await computeRequiredPartners(booking))?.requiredCount) || 1, 1);
   // Hub path is active only when the flag is on AND this booking has a derived
   // h3Cell — mirrors the assignment engine. Bookings without a cell (legacy,
@@ -250,23 +256,30 @@ async function getSlotAvailabilitySnapshot(booking, slotStart, slotEnd, session)
   const categoryKey = await resolveCategoryKeyForBooking(booking);
   const slotKey = buildSlotKey(scopeKey, dateKey, time, categoryKey);
 
-  const capacity = await SlotCapacity.findOneAndUpdate(
-    { slotKey },
-    {
-      $setOnInsert: {
-        slotKey,
-        reservedUnits: 0,
-      },
-      $set: {
-        pincode: String(booking.pincode || "").trim(),
-        dateKey,
-        time,
-        totalUnits: eligibleUnits,
-        updatedAt: new Date(),
-      },
-    },
-    { new: true, upsert: true, session }
-  );
+  // readOnly: the slot-LISTING path (which includes the unauthenticated
+  // available-slots endpoint) must not write — the old unconditional upsert let
+  // anonymous requests mint a SlotCapacity row per slot-window per category,
+  // an unbounded collection-growth vector. A missing row simply means nothing
+  // is reserved yet. The reservation path keeps the upsert.
+  const capacity = readOnly
+    ? await SlotCapacity.findOne({ slotKey }).lean()
+    : await SlotCapacity.findOneAndUpdate(
+        { slotKey },
+        {
+          $setOnInsert: {
+            slotKey,
+            reservedUnits: 0,
+          },
+          $set: {
+            pincode: String(booking.pincode || "").trim(),
+            dateKey,
+            time,
+            totalUnits: eligibleUnits,
+            updatedAt: new Date(),
+          },
+        },
+        { new: true, upsert: true, session }
+      );
 
   const availableUnits = Math.max(Number(capacity?.totalUnits || eligibleUnits) - Number(capacity?.reservedUnits || 0), 0);
 
@@ -281,7 +294,28 @@ async function getSlotAvailabilitySnapshot(booking, slotStart, slotEnd, session)
   };
 }
 
-async function reserveSlotCapacityForBooking(booking, { session } = {}) {
+/*
+=====================================================
+RESERVATION — PREPARE / COMMIT SPLIT
+
+prepareSlotReservation runs every EXPENSIVE read (per-window partner
+eligibility, zone/hub resolution, category resolution, SlotCapacity row
+upsert) with NO transaction session. commitSlotReservation then performs only
+the tiny atomic writes (guarded $inc per window + SlotLock insert + Booking
+update) — the part that belongs inside createBooking's transaction.
+
+Why: with the old single function, N simultaneous requests for the same slot
+each held the transaction open across the whole eligibility stack, so every
+transaction fought over the same SlotCapacity document for its entire
+lifetime → WriteConflict retry storms. Keeping the transaction to a few
+milliseconds shrinks the conflict window to almost nothing.
+
+Oversell safety is unchanged: the guarded conditional $inc in commit re-checks
+reservedUnits atomically at write time, so a stale prepare can only produce a
+clean 409 — never an overbooked slot.
+=====================================================
+*/
+async function prepareSlotReservation(booking) {
   const { startAt, endAt } = buildBookingWindow(booking);
   const requiredCount = Math.max(Number((await computeRequiredPartners(booking))?.requiredCount) || 1, 1);
   const slotWindows = buildSlotWindows(startAt, endAt);
@@ -292,41 +326,73 @@ async function reserveSlotCapacityForBooking(booking, { session } = {}) {
     throw error;
   }
 
+  const snapshots = [];
+  for (const window of slotWindows) {
+    // No session: the upsert + eligibility count commit immediately. This also
+    // fast-fails a full slot with a 409 BEFORE the caller opens a transaction
+    // or inserts a Booking row.
+    const snapshot = await getSlotAvailabilitySnapshot(booking, window.slotStart, window.slotEnd, null);
+    // Not enough eligible partners, OR the window's units are already reserved
+    // by other bookings. The availableUnits check is advisory (commit's guarded
+    // $inc is the real gate) but it turns the common contention case — many
+    // customers racing one slot — into a cheap pre-transaction 409.
+    if (snapshot.eligibleUnits < requiredCount || snapshot.availableUnits < requiredCount) {
+      const error = new Error("Selected slot is no longer available");
+      error.statusCode = 409;
+      throw error;
+    }
+    snapshots.push(snapshot);
+  }
+
+  return { startAt, requiredCount, snapshots };
+}
+
+async function commitSlotReservation(booking, prepared, { session } = {}) {
+  const { startAt, requiredCount, snapshots } = prepared;
   const reservedSlotKeys = [];
 
-  for (const window of slotWindows) {
-    const snapshot = await getSlotAvailabilitySnapshot(booking, window.slotStart, window.slotEnd, session);
-    if (snapshot.eligibleUnits < requiredCount) {
-      const error = new Error("Selected slot is no longer available");
-      error.statusCode = 409;
-      throw error;
-    }
-
-    const updated = await SlotCapacity.findOneAndUpdate(
-      {
-        slotKey: snapshot.slotKey,
-        reservedUnits: { $lte: Math.max(Number(snapshot.capacity?.totalUnits || snapshot.eligibleUnits) - requiredCount, 0) },
-      },
-      {
-        $inc: { reservedUnits: requiredCount },
-        $set: {
-          pincode: String(booking.pincode || "").trim(),
-          dateKey: snapshot.dateKey,
-          time: snapshot.time,
-          totalUnits: snapshot.eligibleUnits,
-          updatedAt: new Date(),
+  try {
+    for (const snapshot of snapshots) {
+      const updated = await SlotCapacity.findOneAndUpdate(
+        {
+          slotKey: snapshot.slotKey,
+          reservedUnits: { $lte: Math.max(Number(snapshot.capacity?.totalUnits || snapshot.eligibleUnits) - requiredCount, 0) },
         },
-      },
-      { new: true, session }
-    );
+        {
+          $inc: { reservedUnits: requiredCount },
+          $set: {
+            pincode: String(booking.pincode || "").trim(),
+            dateKey: snapshot.dateKey,
+            time: snapshot.time,
+            totalUnits: snapshot.eligibleUnits,
+            updatedAt: new Date(),
+          },
+        },
+        { new: true, session }
+      );
 
-    if (!updated) {
-      const error = new Error("Selected slot is no longer available");
-      error.statusCode = 409;
-      throw error;
+      if (!updated) {
+        const error = new Error("Selected slot is no longer available");
+        error.statusCode = 409;
+        throw error;
+      }
+
+      reservedSlotKeys.push(snapshot.slotKey);
     }
-
-    reservedSlotKeys.push(snapshot.slotKey);
+  } catch (err) {
+    // Sessionless callers (reschedule) have no transaction to roll back a
+    // partial multi-window reservation — undo any windows already incremented
+    // so a mid-loop 409 can't permanently leak reserved units. Transactional
+    // callers skip this: the aborting transaction reverts everything itself.
+    if (!session && reservedSlotKeys.length) {
+      for (const slotKey of reservedSlotKeys) {
+        await SlotCapacity.updateOne(
+          { slotKey, reservedUnits: { $gte: requiredCount } },
+          { $inc: { reservedUnits: -requiredCount }, $set: { updatedAt: new Date() } }
+        ).catch(() => {});
+      }
+    }
+    throw err;
   }
 
   const expiresAt = new Date(Date.now() + SLOT_LOCK_MINUTES * 60 * 1000);
@@ -368,6 +434,14 @@ async function reserveSlotCapacityForBooking(booking, { session } = {}) {
   };
 }
 
+// Single-call convenience for paths without a surrounding transaction
+// (rescheduleBooking). createBooking calls prepare/commit separately so the
+// expensive prepare stays outside its transaction.
+async function reserveSlotCapacityForBooking(booking, { session } = {}) {
+  const prepared = await prepareSlotReservation(booking);
+  return commitSlotReservation(booking, prepared, { session });
+}
+
 async function markSlotLockPaid(bookingId, { session } = {}) {
   return SlotLock.findOneAndUpdate(
     { bookingId, status: "PENDING_PAYMENT" },
@@ -381,19 +455,41 @@ async function markSlotLockPaid(bookingId, { session } = {}) {
   );
 }
 
-async function releaseSlotCapacityByBookingId(bookingId, { session, releaseReason = "" } = {}) {
+async function releaseSlotCapacityByBookingId(
+  bookingId,
+  { session, releaseReason = "", onlyIfPendingPayment = false } = {}
+) {
   const bookingMeta = await Booking.findById(bookingId)
     .select("pincode scheduledDate")
     .lean();
 
-  // Exclude RELEASED locks in the query itself: a rescheduled booking can have
-  // an old RELEASED lock plus a live one, and findOne with no filter could
-  // grab the released row and wrongly no-op, stranding the live reservation.
-  let lockQuery = SlotLock.findOne({ bookingId, status: { $ne: "RELEASED" } });
+  // CLAIM FIRST: atomically flip the lock to RELEASED before touching counters.
+  // Two concurrent releases for the same booking could both pass a read-then-
+  // write check and double-decrement reservedUnits; only one can win this claim.
+  // Excluding RELEASED locks in the claim also keeps the reschedule case safe (a
+  // rescheduled booking can have an old RELEASED lock plus a live one).
+  //
+  // onlyIfPendingPayment restricts the claim to a still-unpaid lock. The expiry
+  // cron uses it so it can never release a reservation the payment path has just
+  // converted to a permanent (PAID) hold — the claim simply no-ops instead.
+  let claimQuery = SlotLock.findOneAndUpdate(
+    {
+      bookingId,
+      status: onlyIfPendingPayment ? "PENDING_PAYMENT" : { $ne: "RELEASED" },
+    },
+    {
+      $set: {
+        status: "RELEASED",
+        releasedAt: new Date(),
+        releaseReason: String(releaseReason || "").trim().slice(0, 200),
+      },
+    }
+  );
   if (session) {
-    lockQuery = lockQuery.session(session);
+    claimQuery = claimQuery.session(session);
   }
-  const lock = await lockQuery;
+  // Pre-image: units/slotKeys as they were reserved.
+  const lock = await claimQuery;
   if (!lock) {
     return { released: false, lock: null };
   }
@@ -409,18 +505,6 @@ async function releaseSlotCapacityByBookingId(bookingId, { session, releaseReaso
       { session }
     );
   }
-
-  await SlotLock.updateOne(
-    { _id: lock._id, status: { $ne: "RELEASED" } },
-    {
-      $set: {
-        status: "RELEASED",
-        releasedAt: new Date(),
-        releaseReason: String(releaseReason || "").trim().slice(0, 200),
-      },
-    },
-    { session }
-  );
 
   await Booking.updateOne(
     { _id: bookingId },
@@ -464,16 +548,32 @@ async function cleanupExpiredSlotLocks({ limit = 100 } = {}) {
 
   let released = 0;
   for (const lock of expiredLocks) {
-    const booking = await Booking.findById(lock.bookingId).select("status payment");
-    if (booking && booking.status === "PENDING_PAYMENT") {
-      booking.status = "CANCELLED";
-      booking.cancelledBy = "system";
-      booking.cancelReason = "Payment lock expired";
-      await booking.save();
-    }
+    // GUARDED cancel: only a booking still awaiting an unpaid checkout may be
+    // expired. The old findById + save raced finalizePaidBooking — a payment
+    // landing between the read and the save was overwritten with CANCELLED.
+    // The payment guard makes the paid booking win unconditionally.
+    await Booking.updateOne(
+      {
+        _id: lock.bookingId,
+        status: "PENDING_PAYMENT",
+        "payment.status": { $ne: "PAID" },
+      },
+      {
+        $set: {
+          status: "CANCELLED",
+          cancelledBy: "system",
+          cancelledAt: now,
+          cancelReason: "Payment lock expired",
+        },
+      }
+    );
 
+    // onlyIfPendingPayment: if the payment finalizer marked this lock PAID while
+    // we were scanning, the release no-ops and the paid booking keeps its
+    // reservation instead of having its capacity handed back to the pool.
     const result = await releaseSlotCapacityByBookingId(lock.bookingId, {
       releaseReason: "payment_lock_expired",
+      onlyIfPendingPayment: true,
     });
     if (result.released) released += 1;
   }
@@ -486,7 +586,9 @@ module.exports = {
   buildSlotKey,
   buildSlotWindows,
   cleanupExpiredSlotLocks,
+  commitSlotReservation,
   getSlotAvailabilitySnapshot,
+  prepareSlotReservation,
   releaseSlotCapacityByBookingId,
   reserveSlotCapacityForBooking,
   resolveCapacityScope,

@@ -90,37 +90,12 @@ exports.verifyRazorpayPayment = async (req, res) => {
     }
 
     /* =====================
-       ONLY PENDING BOOKINGS
-    ===================== */
-    if (booking.status !== "PENDING_PAYMENT") {
-      return res.status(400).json({
-        success: false,
-        message: "Booking is not awaiting payment",
-      });
-    }
-
-    if (!booking.lockedUntil || new Date(booking.lockedUntil).getTime() <= Date.now()) {
-      await releaseSlotCapacityByBookingId(booking._id, {
-        releaseReason: "payment_order_expired",
-      });
-      booking.status = "CANCELLED";
-      booking.payment.status = "FAILED";
-      booking.cancelledBy = "system";
-      booking.cancelReason = "Payment lock expired before verification";
-      booking.lockedUntil = null;
-      booking.slotReservationExpiresAt = null;
-      booking.slotLockId = null;
-      booking.slotReservationUnits = 0;
-      await booking.save();
-
-      return res.status(409).json({
-        success: false,
-        message: "Selected slot is no longer available",
-      });
-    }
-
-    /* =====================
-       VERIFY SIGNATURE
+       VERIFY SIGNATURE FIRST
+       The signature proves Razorpay captured this payment against our stored
+       order. It must be checked BEFORE any state-mutating branch below: the
+       expired-lock and cancelled-booking branches behave completely differently
+       depending on whether real money was captured, and the old order (cancel
+       first, verify later) left a charged customer with no refund flag.
     ===================== */
     if (!process.env.RAZORPAY_KEY_SECRET) {
       console.error("[payment] RAZORPAY_KEY_SECRET is not configured");
@@ -145,19 +120,97 @@ exports.verifyRazorpayPayment = async (req, res) => {
       crypto.timingSafeEqual(expectedBuf, providedBuf);
 
     if (!signatureValid) {
-      booking.payment.status = "FAILED";
-      await releaseSlotCapacityByBookingId(booking._id, {
-        releaseReason: "payment_signature_failed",
-      });
-      booking.lockedUntil = null;
-      booking.slotReservationExpiresAt = null;
-      booking.slotLockId = null;
-      booking.slotReservationUnits = 0;
-      await booking.save();
+      // Only tear down a booking that is still awaiting payment — never mutate
+      // a booking that has moved on. Release clears the slot fields itself; the
+      // guarded update can't overwrite a concurrent PAID finalize.
+      if (booking.status === "PENDING_PAYMENT") {
+        await releaseSlotCapacityByBookingId(booking._id, {
+          releaseReason: "payment_signature_failed",
+        });
+        await Booking.updateOne(
+          { _id: booking._id, "payment.status": { $ne: "PAID" } },
+          { $set: { "payment.status": "FAILED" } }
+        );
+      }
 
       return res.status(400).json({
         success: false,
         message: "Invalid payment signature",
+      });
+    }
+
+    /* =====================
+       SIGNATURE VALID = MONEY CAPTURED
+       From here on, every non-success path must leave the captured money
+       flagged for refund — silently dropping it strands the customer's payment.
+    ===================== */
+
+    // Booking no longer payable (cancelled by the user or the expiry cron while
+    // the checkout was open) → queue a full refund, never resurrect it.
+    if (booking.status !== "PENDING_PAYMENT") {
+      await Booking.updateOne(
+        { _id: booking._id, "payment.status": { $ne: "PAID" }, refundStatus: { $in: ["NONE", null] } },
+        {
+          $set: {
+            "payment.razorpay_payment_id": razorpay_payment_id,
+            refundStatus: "PENDING",
+            refundAmount: Number(booking.totalAmount || 0),
+          },
+        }
+      );
+      return res.status(409).json({
+        success: false,
+        message: "This booking is no longer active. Your payment will be refunded in full.",
+      });
+    }
+
+    // Slot hold lapsed before the payment landed. The reservation may already be
+    // released, so the booking can't proceed — cancel it (guarded so a concurrent
+    // webhook finalize wins) and queue a full refund of the captured amount.
+    // Guest add-ons never hold a slot lock, so they skip this check entirely.
+    if (
+      booking.origin !== "partner_onspot" &&
+      (!booking.lockedUntil || new Date(booking.lockedUntil).getTime() <= Date.now())
+    ) {
+      const cancelled = await Booking.findOneAndUpdate(
+        { _id: booking._id, status: "PENDING_PAYMENT", "payment.status": { $ne: "PAID" } },
+        {
+          $set: {
+            status: "CANCELLED",
+            cancelledBy: "system",
+            cancelledAt: new Date(),
+            cancelReason: "Payment received after slot lock expired",
+            "payment.razorpay_payment_id": razorpay_payment_id,
+            refundStatus: "PENDING",
+            refundAmount: Number(booking.totalAmount || 0),
+          },
+        },
+        { new: true }
+      );
+
+      if (!cancelled) {
+        // The webhook finalized this payment concurrently — the booking is live.
+        const fresh = await Booking.findById(booking._id).select("payment.status").lean();
+        if (fresh?.payment?.status === "PAID") {
+          return res.json({
+            success: true,
+            message: "Payment already verified",
+            bookingId: booking._id,
+          });
+        }
+        return res.status(409).json({
+          success: false,
+          message: "This booking is no longer active. Your payment will be refunded in full.",
+        });
+      }
+
+      await releaseSlotCapacityByBookingId(booking._id, {
+        releaseReason: "payment_after_lock_expiry",
+      });
+
+      return res.status(409).json({
+        success: false,
+        message: "Selected slot is no longer available. Your payment will be refunded in full.",
       });
     }
 
@@ -174,6 +227,24 @@ exports.verifyRazorpayPayment = async (req, res) => {
         success: true,
         message: "Payment already verified",
         bookingId: booking._id,
+      });
+    }
+
+    // Cancelled between our read and the finalize write — flag the refund.
+    if (outcome === "not_payable") {
+      await Booking.updateOne(
+        { _id: booking._id, "payment.status": { $ne: "PAID" }, refundStatus: { $in: ["NONE", null] } },
+        {
+          $set: {
+            "payment.razorpay_payment_id": razorpay_payment_id,
+            refundStatus: "PENDING",
+            refundAmount: Number(booking.totalAmount || 0),
+          },
+        }
+      );
+      return res.status(409).json({
+        success: false,
+        message: "This booking is no longer active. Your payment will be refunded in full.",
       });
     }
 

@@ -12,6 +12,9 @@ module.exports = {
       env: {
         NODE_ENV: "production",
         PORT: 4000,
+        // Calendar-day logic (cake lead times, baker daily caps) assumes IST;
+        // bare VMs often run UTC.
+        TZ: "Asia/Kolkata",
       },
     },
   ],

@@ -1,4 +1,5 @@
 const router = require("express").Router();
+const userAuth = require("../middlewares/userAuth");
 const {
   listApplicableCoupons,
   validateCouponForAmount,
@@ -41,11 +42,15 @@ router.get("/available", async (req, res) => {
    APPLY COUPON
    POST /api/coupons/apply
 ===================================================== */
-router.post("/apply", async (req, res) => {
+router.post("/apply", userAuth, async (req, res) => {
   try {
     const code = String(req.body.code || "").trim();
     const amount = Number(req.body.amount || 0);
-    const customerId = req.body.customerId || null;
+    // customerId is taken from the authenticated session, NOT the request body.
+    // Trusting a body-supplied customerId let a caller probe/spoof another
+    // customer's per-customer redemption eligibility. Authoritative redemption
+    // still happens at booking-create; this endpoint is now bound to the caller.
+    const customerId = req.user?._id || null;
     const serviceIds = Array.isArray(req.body.serviceIds) ? req.body.serviceIds : [];
 
     const result = await validateCouponForAmount({ code, amount, customerId, serviceIds });

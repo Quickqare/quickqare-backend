@@ -6,8 +6,11 @@ const CatalogItem = require("../models/CatalogItem");
 const SubCategory = require("../models/SubCategory");
 const { reverseGeocode } = require("../services/geocode.service");
 const { syncPartnerOperationalState } = require("../services/scheduling_service");
-const { emitBookingUpdate } = require("../socket/emitters");
-const { completeBooking } = require("./booking.controller");
+const {
+  completeBooking,
+  startService,
+  markOnTheWay: bookingMarkOnTheWay,
+} = require("./booking.controller");
 const { deriveH3Cell } = require("../utils/h3");
 const { fileToPublicUrl } = require("../utils/fileUrl");
 const { getSensitiveFileUrl } = require("../utils/sensitiveFileUrl");
@@ -121,7 +124,13 @@ function toPartnerJobPayload(booking, partnerId, { isPartnerCancelled = false } 
 /**
  * =====================================================
  * PARTNER ACCEPT BOOKING
- * ASSIGNED → CONFIRMED
+ * ASSIGNED / CONFIRMED → PARTNER_ACCEPTED
+ *
+ * Delegates to acceptJobCore — the same function the socket acceptJob handler
+ * uses — so the two paths can never diverge again. (They used to: this HTTP
+ * endpoint flipped to CONFIRMED without setting ackReceivedAt, cancelling the
+ * ACK timer, counting the active job, or pushing the customer, while the
+ * socket path did all four and landed on PARTNER_ACCEPTED.)
  * =====================================================
  */
 exports.acceptBooking = async (req, res) => {
@@ -136,41 +145,44 @@ exports.acceptBooking = async (req, res) => {
       });
     }
 
-    let booking = await Booking.findOneAndUpdate(
-      {
-        _id: bookingId,
-        $or: [{ partner: partnerId }, { additionalPartners: partnerId }],
-        status: "ASSIGNED",
-      },
-      {
-        status: "CONFIRMED",
-      },
-      { new: true }
-    )
-      .populate("services.serviceId") // NEW (multi-service)
-      .populate("primaryService"); // NEW
+    const { acceptJobCore } = require("../services/partnerLifecycle.service");
+    const result = await acceptJobCore(bookingId, partnerId);
 
+    if (!result.ok && result.code === "NOT_FOUND") {
+      return res.status(404).json({ success: false, message: "Booking not found" });
+    }
+    if (!result.ok && result.code === "NOT_ASSIGNED") {
+      return res.status(403).json({ success: false, message: "Not assigned to this booking" });
+    }
+
+    // Load the payload the partner app expects. toPartnerJobPayload, never the
+    // raw document: the raw booking carries serviceStartCode (the customer's
+    // in-app start code) and payment internals, which must never reach a
+    // partner-facing response.
+    const booking = await Booking.findById(bookingId)
+      .populate("services.serviceId")
+      .populate("primaryService");
     if (!booking) {
-      booking = await Booking.findOne({
-        _id: bookingId,
-        $or: [{ partner: partnerId }, { additionalPartners: partnerId }],
-        status: { $ne: "ASSIGNED" }
-      }).populate("services.serviceId").populate("primaryService");
-      if (booking) {
-        return res.json({ success: true, message: "Booking state already updated", booking });
-      }
-      return res.status(409).json({
-        success: false,
-        message: "Booking not available",
+      return res.status(404).json({ success: false, message: "Booking not found" });
+    }
+
+    // NOT_ACCEPTABLE / RACE_LOST: the booking already moved past the accept
+    // gate (accepted on another device, started, …) — idempotent success so a
+    // flaky-network retry doesn't error out in the partner's face.
+    if (!result.ok) {
+      return res.json({
+        success: true,
+        message: "Booking state already updated",
+        booking: toPartnerJobPayload(booking, partnerId),
       });
     }
 
-    emitBookingUpdate(booking);
-
     return res.json({
       success: true,
-      message: "Booking accepted",
-      booking,
+      message: result.statusChanged
+        ? "Booking accepted"
+        : "Noted — the job is confirmed once your team lead accepts.",
+      booking: toPartnerJobPayload(booking, partnerId),
     });
   } catch (err) {
     console.error("Accept booking error:", err);
@@ -188,53 +200,18 @@ exports.acceptBooking = async (req, res) => {
  * =====================================================
  */
 exports.markOnTheWay = async (req, res) => {
-  try {
-    const partnerId = req.partner._id;
-    const { bookingId } = req.body;
-
-    let booking = await Booking.findOneAndUpdate(
-      {
-        _id: bookingId,
-        $or: [{ partner: partnerId }, { additionalPartners: partnerId }],
-        status: { $in: ["ASSIGNED", "CONFIRMED", "PARTNER_ACCEPTED"] },
-      },
-      {
-        status: "ON_THE_WAY",
-        onTheWayAt: new Date(),
-      },
-      { new: true }
-    )
-      .populate("services.serviceId")
-      .populate("primaryService");
-
-    if (!booking) {
-      booking = await Booking.findOne({
-        _id: bookingId,
-        $or: [{ partner: partnerId }, { additionalPartners: partnerId }]
-      }).populate("services.serviceId").populate("primaryService");
-      if (booking && ["ON_THE_WAY", "IN_PROGRESS", "COMPLETED"].includes(booking.status)) {
-        return res.json({ success: true, message: "Already updated", booking });
-      }
-      return res.status(409).json({
-        success: false,
-        message: "Booking not available",
-      });
-    }
-
-    emitBookingUpdate(booking);
-
-    return res.json({
-      success: true,
-      message: "Partner is on the way",
-      booking,
-    });
-  } catch (err) {
-    console.error("ON_THE_WAY error:", err);
-    return res.status(500).json({
-      success: false,
-      message: "Server error",
-    });
+  // Delegate to booking.controller.markOnTheWay (same pattern as markInProgress
+  // → startService and markCompleted → completeBooking) so the two on-the-way
+  // paths can't diverge. The inline version here never computed the customer
+  // ETA nor emitted it — bookings started via this route silently left the
+  // customer with no "arriving in N min" update. The shared handler does both,
+  // keeps the same PARTNER_ACCEPTED/CONFIRMED guard, and authorizes the primary
+  // partner or a team member. It reads the id from req.params, so map the
+  // legacy body field across.
+  if (req.body?.bookingId && !req.params.bookingId) {
+    req.params.bookingId = req.body.bookingId;
   }
+  return bookingMarkOnTheWay(req, res);
 };
 
 /**
@@ -244,53 +221,15 @@ exports.markOnTheWay = async (req, res) => {
  * =====================================================
  */
 exports.markInProgress = async (req, res) => {
-  try {
-    const partnerId = req.partner._id;
-    const { bookingId } = req.body;
-
-    let booking = await Booking.findOneAndUpdate(
-      {
-        _id: bookingId,
-        $or: [{ partner: partnerId }, { additionalPartners: partnerId }],
-        status: "ON_THE_WAY",
-      },
-      {
-        status: "IN_PROGRESS",
-        inProgressAt: new Date(),
-      },
-      { new: true }
-    )
-      .populate("services.serviceId")
-      .populate("primaryService");
-
-    if (!booking) {
-      booking = await Booking.findOne({
-        _id: bookingId,
-        $or: [{ partner: partnerId }, { additionalPartners: partnerId }]
-      }).populate("services.serviceId").populate("primaryService");
-      if (booking && ["IN_PROGRESS", "COMPLETED"].includes(booking.status)) {
-        return res.json({ success: true, message: "Already updated", booking });
-      }
-      return res.status(409).json({
-        success: false,
-        message: "Booking not available",
-      });
-    }
-
-    emitBookingUpdate(booking);
-
-    return res.json({
-      success: true,
-      message: "Job started",
-      booking,
-    });
-  } catch (err) {
-    console.error("IN_PROGRESS error:", err);
-    return res.status(500).json({
-      success: false,
-      message: "Server error",
-    });
+  // Delegate to booking.controller.startService (same pattern as markCompleted →
+  // completeBooking). The old inline implementation flipped ON_THE_WAY →
+  // IN_PROGRESS with NO service-start-code check and NO job-spot-selfie gate,
+  // so this legacy route was a full bypass of both protections. startService
+  // enforces them and also accepts the ARRIVED state.
+  if (req.body.bookingId && !req.params.bookingId) {
+    req.params.bookingId = req.body.bookingId;
   }
+  return startService(req, res);
 };
 
 /**

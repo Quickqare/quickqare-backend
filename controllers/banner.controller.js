@@ -18,11 +18,18 @@ const isVisibleNow = (banner, now = new Date()) => {
   return true;
 };
 
+// Empty is fine (no service target); anything else must be a Service _id.
+const isValidServiceId = (value) => {
+  const v = asString(value);
+  return v === "" || mongoose.Types.ObjectId.isValid(v);
+};
+
 const buildPatch = (body = {}) => {
   const patch = {};
   if (body.title !== undefined) patch.title = asString(body.title);
   if (body.imageUrl !== undefined) patch.imageUrl = asString(body.imageUrl);
   if (body.linkUrl !== undefined) patch.linkUrl = asString(body.linkUrl);
+  if (body.serviceId !== undefined) patch.serviceId = asString(body.serviceId);
   if (body.placement !== undefined) patch.placement = normalizePlacement(body.placement);
   if (body.platform !== undefined) patch.platform = normalizePlatform(body.platform);
   if (body.sortOrder !== undefined) patch.sortOrder = Number(body.sortOrder) || 0;
@@ -114,10 +121,20 @@ exports.createBanner = async (req, res) => {
       });
     }
 
+    if (!isValidServiceId(req.body.serviceId)) {
+      return res.status(400).json({
+        success: false,
+        data: null,
+        error: { code: "VALIDATION_ERROR", message: "serviceId must be a valid service id", details: null },
+        meta: { requestId: req.requestId },
+      });
+    }
+
     const row = await Banner.create({
       title: asString(req.body.title),
       imageUrl,
       linkUrl: asString(req.body.linkUrl),
+      serviceId: asString(req.body.serviceId),
       placement: normalizePlacement(req.body.placement || "home"),
       platform: normalizePlatform(req.body.platform || "all"),
       sortOrder: Number(req.body.sortOrder) || 0,
@@ -161,6 +178,15 @@ exports.updateBanner = async (req, res) => {
           message: "linkUrl must be an absolute http:// or https:// URL",
           details: null,
         },
+        meta: { requestId: req.requestId },
+      });
+    }
+
+    if (!isValidServiceId(req.body.serviceId)) {
+      return res.status(400).json({
+        success: false,
+        data: null,
+        error: { code: "VALIDATION_ERROR", message: "serviceId must be a valid service id", details: null },
         meta: { requestId: req.requestId },
       });
     }

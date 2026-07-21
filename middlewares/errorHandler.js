@@ -1,11 +1,27 @@
 /* =====================================================
    GLOBAL ERROR HANDLER (PRODUCTION SAFE)
 ===================================================== */
-module.exports = (err, req, res, next) => {
-  console.error("🔥 Error:", err);
+const logger = require("../utils/logger");
 
+module.exports = (err, req, res, next) => {
+  logger.error("Request error", {
+    method: req.method,
+    path: req.originalUrl,
+    status: err.statusCode || 500,
+    error: err.message,
+    stack: err.stack,
+  });
+
+  // Whether this error carries a message we deliberately expose to clients.
+  // Errors we explicitly throw set statusCode; the typed-mapping branches below
+  // set their own safe message. An UNMAPPED 500 (a bug/DB failure) must NOT echo
+  // err.message back — that can leak internal detail (queries, paths, stack
+  // fragments). Those fall back to a generic string.
+  const isClientSafe = Boolean(err.statusCode);
   let statusCode = err.statusCode || 500;
-  let message = err.message || "Internal Server Error";
+  let message = isClientSafe
+    ? err.message || "Internal Server Error"
+    : "Internal Server Error";
 
   /* =====================
      MONGOOSE CAST ERROR

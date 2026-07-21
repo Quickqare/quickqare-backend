@@ -52,7 +52,10 @@ exports.sendOtp = async (req, res) => {
   try {
     const { phone } = req.body;
 
-    if (!phone) {
+    // Require a plain string. A non-string (e.g. an object/array that slipped
+    // past sanitizeMongo as {}) is a malformed client request — reject it here
+    // with a clean 400 rather than letting it surface as a downstream 500.
+    if (!phone || typeof phone !== "string") {
       return res.status(400).json({ message: "Phone number is required" });
     }
 
@@ -73,7 +76,7 @@ exports.verifyOtp = async (req, res) => {
   try {
     const { phone, otp, name, gender, referralCode } = req.body;
 
-    if (!phone || !otp) {
+    if (!phone || typeof phone !== "string" || !otp || typeof otp !== "string") {
       return res.status(400).json({ message: "Phone and OTP are required" });
     }
 

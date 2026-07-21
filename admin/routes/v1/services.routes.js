@@ -9,7 +9,12 @@ const audit = require("../../middleware/audit");
 const { PERMISSIONS } = require("../../constants/permissions");
 const { asSingleString } = require("../../utils/common");
 const { success, fail } = require("../../utils/response");
+const { MEHENDI_PRICING_RULE_KEYS } = require("../../../utils/pricing");
 const defaultServices = require("../../data/defaultServices");
+
+const CATEGORY_TYPES = ["GENERAL", "AC", "MEHENDI", "CELEBRATION"];
+// Must stay in sync with the Service schema's packingRole enum.
+const SERVICE_PACKING_ROLES = ["BRIDAL", "HAND", "FEET_ADDON", "INDEPENDENT"];
 
 const router = express.Router();
 
@@ -93,6 +98,12 @@ router.post("/categories", audit("admin.services.category.create"), async (req, 
     }
     const imageUrl = String(req.body.imageUrl || "").trim();
     const webImageUrl = String(req.body.webImageUrl || "").trim();
+    const categoryType = String(req.body.categoryType || "").trim().toUpperCase();
+    if (categoryType && !CATEGORY_TYPES.includes(categoryType)) {
+      return fail(res, 400, "VALIDATION_ERROR", `Unknown categoryType: ${categoryType}`, null, {
+        requestId: req.requestId,
+      });
+    }
 
     const slug = name.toLowerCase().replace(/\s+/g, "-");
     const existing = await Category.findOne({ $or: [{ name }, { slug }] }).lean();
@@ -106,6 +117,7 @@ router.post("/categories", audit("admin.services.category.create"), async (req, 
       isActive: true,
       ...(imageUrl ? { imageUrl } : {}),
       ...(webImageUrl ? { webImageUrl } : {}),
+      ...(categoryType ? { categoryType } : {}),
     });
     return success(res, row, { requestId: req.requestId });
   } catch (error) {
@@ -130,6 +142,17 @@ router.patch("/categories/:id", audit("admin.services.category.update"), async (
     if (typeof req.body.imageUrl === "string") patch.imageUrl = req.body.imageUrl.trim();
     if (typeof req.body.webImageUrl === "string") patch.webImageUrl = req.body.webImageUrl.trim();
     if (req.body.isActive !== undefined) patch.isActive = Boolean(req.body.isActive);
+    // Behaviour class (AC / MEHENDI / CELEBRATION) — makes renames safe by
+    // giving detection an explicit signal instead of name matching.
+    if (req.body.categoryType !== undefined) {
+      const categoryType = String(req.body.categoryType || "").trim().toUpperCase();
+      if (!CATEGORY_TYPES.includes(categoryType)) {
+        return fail(res, 400, "VALIDATION_ERROR", `Unknown categoryType: ${categoryType}`, null, {
+          requestId: req.requestId,
+        });
+      }
+      patch.categoryType = categoryType;
+    }
 
     const row = await Category.findByIdAndUpdate(categoryId, { $set: patch }, { new: true }).lean();
     if (!row) {
@@ -332,6 +355,8 @@ router.post("/", audit("admin.services.create"), async (req, res) => {
       price,
       commissionPercent,
       ...(Number.isFinite(duration) && duration > 0 ? { duration } : {}),
+      ...([1, 2].includes(Number(req.body.skillTier)) ? { skillTier: Number(req.body.skillTier) } : {}),
+      ...(SERVICE_PACKING_ROLES.includes(req.body.packingRole) ? { packingRole: req.body.packingRole } : {}),
       isActive: true,
     });
 
@@ -400,9 +425,13 @@ router.post("/seed-defaults", audit("admin.services.seed"), async (req, res) => 
         price,
         commissionPercent: Number.isFinite(commissionPercent) ? commissionPercent : 20,
         ...(Number.isFinite(duration) && duration > 0 ? { duration } : {}),
+        ...([1, 2].includes(Number(service.skillTier)) ? { skillTier: Number(service.skillTier) } : {}),
+        ...(SERVICE_PACKING_ROLES.includes(service.packingRole) ? { packingRole: service.packingRole } : {}),
         ...(Number(service.minLeadDays) > 0 ? { minLeadDays: Number(service.minLeadDays) } : {}),
         ...(service.cancellationPolicyType ? { cancellationPolicyType: service.cancellationPolicyType } : {}),
+        ...(Array.isArray(service.cancellationTiers) ? { cancellationTiers: service.cancellationTiers } : {}),
         ...(Array.isArray(service.sinceBookingTiers) ? { sinceBookingTiers: service.sinceBookingTiers } : {}),
+        ...(service.cancellationGrace ? { cancellationGrace: service.cancellationGrace } : {}),
         ...(Array.isArray(service.ingredients) ? { ingredients: service.ingredients } : {}),
         ...(service.customization ? { customization: service.customization } : {}),
         isActive: true,
@@ -437,6 +466,39 @@ router.patch("/:id", audit("admin.services.update"), async (req, res) => {
     if (req.body.highlightOrder !== undefined) patch.highlightOrder = Number(req.body.highlightOrder) || 0;
     if (req.body.duration !== undefined && Number(req.body.duration) > 0) patch.duration = Number(req.body.duration);
     if (req.body.minLeadDays !== undefined) patch.minLeadDays = Math.max(0, Number(req.body.minLeadDays) || 0);
+    // Skill tier (AC): 1 = serviceman, 2 = technician. Drives the assignment
+    // engine's skill gate — only accept the two known tiers.
+    if (req.body.skillTier !== undefined) {
+      const tier = Number(req.body.skillTier);
+      if (![1, 2].includes(tier)) {
+        return fail(res, 400, "VALIDATION_ERROR", "skillTier must be 1 (serviceman) or 2 (technician)", null, {
+          requestId: req.requestId,
+        });
+      }
+      patch.skillTier = tier;
+    }
+    // Packing role (mehendi team sizing). Empty string clears it back to
+    // name-based fallback detection.
+    if (req.body.packingRole !== undefined) {
+      const role = String(req.body.packingRole || "").trim();
+      if (role && !SERVICE_PACKING_ROLES.includes(role)) {
+        return fail(res, 400, "VALIDATION_ERROR", `Unknown packingRole: ${role}`, null, {
+          requestId: req.requestId,
+        });
+      }
+      patch.packingRole = role || null;
+    }
+    // Explicit pricing rule (mehendi hand packages). Empty string clears it
+    // back to name-based fallback matching; anything else must be a known key.
+    if (req.body.pricingRuleKey !== undefined) {
+      const key = String(req.body.pricingRuleKey || "").trim();
+      if (key && !MEHENDI_PRICING_RULE_KEYS.includes(key)) {
+        return fail(res, 400, "VALIDATION_ERROR", `Unknown pricingRuleKey: ${key}`, null, {
+          requestId: req.requestId,
+        });
+      }
+      patch.pricingRuleKey = key || null;
+    }
     if (req.body.isEggless !== undefined) patch.isEggless = Boolean(req.body.isEggless);
     if (req.body.autoSlideEnabled !== undefined) patch.autoSlideEnabled = Boolean(req.body.autoSlideEnabled);
     if (req.body.autoSlideSeconds !== undefined) {
@@ -504,7 +566,10 @@ router.patch("/:id/status", audit("admin.services.status"), async (req, res) => 
 // Optional: policyType ("BEFORE_SERVICE" | "SINCE_BOOKING") and
 // sinceBookingTiers: [{ maxHoursAfterBooking, refundPercent }, ...] for
 // advance-order categories (cakes).
-// Send tiers: [] to reset service to global defaults.
+// Optional: grace: { windowMinutes, appliesBelowLeadHours } — free-cancel
+// window for orders placed with under appliesBelowLeadHours of notice
+// (windowMinutes 0 disables; appliesBelowLeadHours 0 = applies to all).
+// Send grace: null to disable. Send tiers: [] to reset to global defaults.
 router.patch("/:id/cancellation-policy", audit("admin.services.cancellation"), async (req, res) => {
   try {
     const serviceId = asSingleString(req.params.id);
@@ -560,6 +625,25 @@ router.patch("/:id/cancellation-policy", audit("admin.services.cancellation"), a
       set.sinceBookingTiers = [...sinceTiers].sort((a, b) => a.maxHoursAfterBooking - b.maxHoursAfterBooking);
     }
 
+    if (req.body.grace !== undefined) {
+      const grace = req.body.grace;
+      if (grace === null) {
+        set.cancellationGrace = { windowMinutes: 0, appliesBelowLeadHours: 0 };
+      } else if (grace && typeof grace === "object") {
+        const windowMinutes = Number(grace.windowMinutes);
+        const appliesBelowLeadHours = Number(grace.appliesBelowLeadHours);
+        if (
+          !Number.isFinite(windowMinutes) || windowMinutes < 0 ||
+          !Number.isFinite(appliesBelowLeadHours) || appliesBelowLeadHours < 0
+        ) {
+          return fail(res, 400, "INVALID_GRACE", "grace.windowMinutes and grace.appliesBelowLeadHours must be numbers >= 0", null, { requestId: req.requestId });
+        }
+        set.cancellationGrace = { windowMinutes, appliesBelowLeadHours };
+      } else {
+        return fail(res, 400, "INVALID_GRACE", "grace must be an object or null", null, { requestId: req.requestId });
+      }
+    }
+
     const row = await Service.findByIdAndUpdate(serviceId, { $set: set }, { new: true }).lean();
 
     if (!row) {
@@ -572,6 +656,7 @@ router.patch("/:id/cancellation-policy", audit("admin.services.cancellation"), a
         cancellationTiers: row.cancellationTiers,
         cancellationPolicyType: row.cancellationPolicyType,
         sinceBookingTiers: row.sinceBookingTiers,
+        cancellationGrace: row.cancellationGrace,
       },
       { requestId: req.requestId }
     );
@@ -584,7 +669,8 @@ router.patch("/:id/cancellation-policy", audit("admin.services.cancellation"), a
 
 // PATCH /:id/customization — set per-order customization options (cakes)
 // Body: { weights, flavours: [{name, priceDelta}], twoTierPriceDelta, addons: [{name, price}], nameOnCakeEnabled,
-//         flavoursEnabled, weightsEnabled, tiersEnabled, addonsEnabled, referencePhotoEnabled }
+//         egglessPriceDelta, flavoursEnabled, weightsEnabled, tiersEnabled, addonsEnabled, referencePhotoEnabled,
+//         egglessOptionEnabled }
 router.patch("/:id/customization", audit("admin.services.customization"), async (req, res) => {
   try {
     const serviceId = asSingleString(req.params.id);
@@ -646,6 +732,7 @@ router.patch("/:id/customization", audit("admin.services.customization"), async 
     }
 
     const twoTierPriceDelta = Math.max(0, Number(body.twoTierPriceDelta) || 0);
+    const egglessPriceDelta = Math.max(0, Number(body.egglessPriceDelta) || 0);
     const nameOnCakeEnabled = body.nameOnCakeEnabled !== false;
 
     // Per-section customer-facing toggles (default enabled).
@@ -654,6 +741,7 @@ router.patch("/:id/customization", audit("admin.services.customization"), async 
     const tiersEnabled = body.tiersEnabled !== false;
     const addonsEnabled = body.addonsEnabled !== false;
     const referencePhotoEnabled = body.referencePhotoEnabled !== false;
+    const egglessOptionEnabled = body.egglessOptionEnabled !== false;
 
     const row = await Service.findByIdAndUpdate(
       serviceId,
@@ -663,6 +751,7 @@ router.patch("/:id/customization", audit("admin.services.customization"), async 
             weights,
             flavours,
             twoTierPriceDelta,
+            egglessPriceDelta,
             addons,
             nameOnCakeEnabled,
             flavoursEnabled,
@@ -670,6 +759,7 @@ router.patch("/:id/customization", audit("admin.services.customization"), async 
             tiersEnabled,
             addonsEnabled,
             referencePhotoEnabled,
+            egglessOptionEnabled,
           },
         },
       },

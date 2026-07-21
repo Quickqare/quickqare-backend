@@ -16,6 +16,19 @@ const mapsCache = new Map();
 const REVGEO_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours — reverse geocode should stay fresh
 const SEARCH_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days — search results rarely change
 
+// Hard ceiling on cached entries so a flood of distinct queries (even within
+// the per-IP rate limit, over the 30-day TTL) can't grow the Map unbounded and
+// push the process toward the 500MB restart. Map preserves insertion order, so
+// evicting the first key drops the oldest entry (approx-LRU without a new dep).
+const MAPS_CACHE_MAX_ENTRIES = Number(process.env.MAPS_CACHE_MAX_ENTRIES || 5000);
+function cacheSet(key, value) {
+  if (mapsCache.size >= MAPS_CACHE_MAX_ENTRIES) {
+    const oldest = mapsCache.keys().next().value;
+    if (oldest !== undefined) mapsCache.delete(oldest);
+  }
+  mapsCache.set(key, value);
+}
+
 setInterval(() => {
   const now = Date.now();
   for (const [key, value] of mapsCache.entries()) {
@@ -79,7 +92,7 @@ exports.reverseGeocode = async (req, res) => {
       google: resolved.google || null,
     };
 
-    mapsCache.set(cacheKey, {
+    cacheSet(cacheKey, {
       timestamp: Date.now(),
       ttl: REVGEO_CACHE_TTL_MS,
       data: responsePayload,
@@ -205,7 +218,7 @@ exports.searchAddress = async (req, res) => {
       },
     };
 
-    mapsCache.set(cacheKey, {
+    cacheSet(cacheKey, {
       timestamp: Date.now(),
       data: responsePayload,
     });

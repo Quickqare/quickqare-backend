@@ -238,6 +238,14 @@ exports.loginPartner = async (req, res) => {
       return res.status(400).json({ message: "Invalid credentials" });
     }
 
+    // Reject a blocked partner at login itself (defense in depth). The
+    // partnerAuth middleware already blocks every authenticated request from a
+    // blocked partner, but issuing a token here at all is misleading and lets a
+    // blocked account hold a valid session. Mirrors the check in sendPartnerOtp.
+    if (partner.isBlocked) {
+      return res.status(403).json({ message: "Your account has been blocked" });
+    }
+
     const settings = await AdminSetting.findOne();
     if (settings?.partnerSubscriptionRequired && !partner.subscriptionActive) {
       return res.status(403).json({
@@ -276,7 +284,7 @@ exports.sendPartnerOtp = async (req, res) => {
   try {
     const { phone } = req.body;
 
-    if (!phone) {
+    if (!phone || typeof phone !== "string") {
       return res.status(400).json({ success: false, message: "Phone number is required" });
     }
 
@@ -310,7 +318,7 @@ exports.verifyPartnerOtp = async (req, res) => {
   try {
     const { phone, otp } = req.body;
 
-    if (!phone || !otp) {
+    if (!phone || typeof phone !== "string" || !otp || typeof otp !== "string") {
       return res.status(400).json({ success: false, message: "Phone and OTP are required" });
     }
 

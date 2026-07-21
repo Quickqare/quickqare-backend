@@ -90,6 +90,46 @@ router.patch("/settings", audit("admin.settings.update"), async (req, res) => {
       }
     }
 
+    // Assignment business knobs. Invalid values are ignored (not clamped to
+    // a surprise) — the current setting stays in force.
+    if (req.body.assignment !== undefined && typeof req.body.assignment === "object") {
+      const a = req.body.assignment;
+      if (a.cakeMaxOrdersPerPartnerPerDay !== undefined) {
+        const v = Math.floor(Number(a.cakeMaxOrdersPerPartnerPerDay));
+        if (Number.isFinite(v) && v >= 1 && v <= 20) {
+          settings.assignment = settings.assignment || {};
+          settings.assignment.cakeMaxOrdersPerPartnerPerDay = v;
+        }
+      }
+    }
+
+    // Mehendi hand-package pricing. Per rule: tierPrices replaces the whole
+    // array (₹, positive integers, max 10 tiers); overflowPerHand ≥ 0. Rules
+    // absent from the payload are left untouched.
+    if (req.body.mehendiHandsPricing !== undefined && typeof req.body.mehendiHandsPricing === "object") {
+      const { MEHENDI_PRICING_RULE_KEYS } = require("../../../utils/pricing");
+      const incoming = req.body.mehendiHandsPricing;
+      if (!settings.mehendiHandsPricing) settings.mehendiHandsPricing = {};
+      for (const key of MEHENDI_PRICING_RULE_KEYS) {
+        const rule = incoming[key];
+        if (!rule || typeof rule !== "object") continue;
+        if (!settings.mehendiHandsPricing[key]) settings.mehendiHandsPricing[key] = {};
+        if (Array.isArray(rule.tierPrices)) {
+          settings.mehendiHandsPricing[key].tierPrices = rule.tierPrices
+            .map((p) => Math.round(Number(p) || 0))
+            .filter((p) => p > 0)
+            .slice(0, 10);
+        }
+        if (rule.overflowPerHand !== undefined) {
+          const v = Number(rule.overflowPerHand);
+          if (Number.isFinite(v) && v >= 0) {
+            settings.mehendiHandsPricing[key].overflowPerHand = v;
+          }
+        }
+      }
+      settings.markModified("mehendiHandsPricing");
+    }
+
     // Home theme (festival / campaign UI)
     if (req.body.homeTheme !== undefined && typeof req.body.homeTheme === "object") {
       const t = req.body.homeTheme;

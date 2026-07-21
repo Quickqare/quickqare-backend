@@ -271,13 +271,50 @@ const partnerSchema = new mongoose.Schema(
     },
 
     // Quality counters — increment on no-show / late-accept events.
-    // Used by ops dashboard for proactive partner review.
+    // Used by ops dashboard for proactive partner review AND by the
+    // reliability component of the assignment score (scoreReliability).
     noShowCount: {
       type: Number,
       default: 0,
     },
 
     lateAcceptanceCount: {
+      type: Number,
+      default: 0,
+    },
+
+    /* =====================
+       BEHAVIOURAL STATS (LEARNED RELIABILITY)
+       Drive the acceptance-rate half of scoreReliability so the engine
+       stops offering jobs to partners who habitually ignore them, and
+       stops burning the 5-attempt reassignment budget on them.
+
+       Tracked for the PRIMARY partner only (the one gated on ACK and the
+       one reassignment revolves around). assignedCount advances on every
+       soft-assignment; acceptedCount advances on accept (auto-accept
+       counts as an immediate accept at assignment time). The gap between
+       them — rejects and ACK timeouts — is exactly the unreliability we
+       want to price in, so no separate reject counter is needed.
+    ===================== */
+    assignedCount: {
+      type: Number,
+      default: 0,
+    },
+
+    acceptedCount: {
+      type: Number,
+      default: 0,
+    },
+
+    // Average ACK response time = ackTotalSeconds / ackSampleCount.
+    // Informational for now (surfaced to ops / the weight-shadow report);
+    // not yet a live scoring input.
+    ackTotalSeconds: {
+      type: Number,
+      default: 0,
+    },
+
+    ackSampleCount: {
       type: Number,
       default: 0,
     },

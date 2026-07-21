@@ -18,7 +18,7 @@ const validate = require("../middlewares/validate");
 const {
   registerPartnerValidator,
 } = require("../middlewares/validators");
-const { authLimiter, phoneOtpLimiter, phoneOtpHourlyLimiter, phoneLoginLimiter } = require("../middlewares/rateLimiter");
+const { authLimiter, phoneOtpLimiter, phoneOtpHourlyLimiter, phoneLoginLimiter, phoneOtpVerifyLimiter } = require("../middlewares/rateLimiter");
 
 /* =====================================================
    PARTNER AUTH ROUTES (PRODUCTION READY)
@@ -47,7 +47,7 @@ router.post(
  */
 router.post("/login", authLimiter, phoneLoginLimiter, loginPartner);
 router.post("/send-otp", authLimiter, phoneOtpLimiter, phoneOtpHourlyLimiter, sendPartnerOtp);
-router.post("/verify-otp", authLimiter, verifyPartnerOtp);
+router.post("/verify-otp", authLimiter, phoneOtpVerifyLimiter, verifyPartnerOtp);
 router.post("/msg91/exchange", authLimiter, exchangePartnerMsg91AccessToken);
 router.post("/reset-password-msg91", authLimiter, resetPartnerPasswordWithMsg91);
 router.post("/reset-password", authLimiter, partnerAuth, resetPartnerPassword);

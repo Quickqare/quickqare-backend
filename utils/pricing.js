@@ -37,65 +37,64 @@ function normalizeText(value = "") {
   return String(value).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 }
 
-function getMinimalMehendiHandsPrice(hands = 1) {
-  const quantity = Math.max(Number(hands) || 1, 1);
+/*
+=====================================================
+MEHENDI HAND-PACKAGE PRICING
+Tiered price by number of hands (index = hands - 1);
+beyond the last tier the total falls back to
+round(hands × overflowPerHand) — the per-hand bulk
+rate. The tables below are the CODE DEFAULTS; admin
+can override any of them via
+AdminSetting.mehendiHandsPricing without a deploy
+(see getMehendiHandsPriceWithSettings).
+=====================================================
+*/
+const DEFAULT_MEHENDI_HANDS_PRICING = {
+  mehendi_minimal_hands: {
+    tierPrices: [399, 699, 999, 1199],
+    overflowPerHand: 299,
+  },
+  mehendi_palm_length_hands: {
+    tierPrices: [499, 798, 1149, 1499],
+    overflowPerHand: 399,
+  },
+  mehendi_bangle_length_hands: {
+    tierPrices: [799, 1199, 1699, 2199],
+    overflowPerHand: 569.05, // 599 × 0.95 bulk rate
+  },
+  mehendi_mid_length_hands: {
+    tierPrices: [999, 1499, 2099, 2599],
+    overflowPerHand: 629,
+  },
+  mehendi_elbow_bridal_hands: {
+    tierPrices: [1799, 3000],
+    overflowPerHand: 1349.25, // 1799 × 0.75 bulk rate
+  },
+  mehendi_above_elbow_bridal_hands: {
+    tierPrices: [2000, 3500],
+    // 25% bulk discount on the per-hand rate, mirroring the elbow-length
+    // curve. Previously returned null → callers hit `price <= 0` and the
+    // booking was rejected with no useful explanation.
+    overflowPerHand: 1500, // 2000 × 0.75 bulk rate
+  },
+};
 
-  if (quantity === 1) return 399;
-  if (quantity === 2) return 699;
-  if (quantity === 3) return 999;
-  if (quantity === 4) return 1199;
-  return quantity * 299;
+const MEHENDI_PRICING_RULE_KEYS = Object.keys(DEFAULT_MEHENDI_HANDS_PRICING);
+
+function resolveMehendiHandsPriceFromTable(table, hands = 1) {
+  const quantity = Math.max(Number(hands) || 1, 1);
+  const tierPrice = Array.isArray(table?.tierPrices)
+    ? Number(table.tierPrices[quantity - 1])
+    : NaN;
+  if (Number.isFinite(tierPrice) && tierPrice > 0) return tierPrice;
+  const overflowPerHand = Number(table?.overflowPerHand);
+  if (!Number.isFinite(overflowPerHand) || overflowPerHand <= 0) return null;
+  return Math.round(quantity * overflowPerHand);
 }
 
-function getPalmLengthMehendiHandsPrice(hands = 1) {
-  const quantity = Math.max(Number(hands) || 1, 1);
-
-  if (quantity === 1) return 499;
-  if (quantity === 2) return 798;
-  if (quantity === 3) return 1149;
-  if (quantity === 4) return 1499;
-  return quantity * 399;
-}
-
-function getBangleLengthMehendiHandsPrice(hands = 1) {
-  const quantity = Math.max(Number(hands) || 1, 1);
-
-  if (quantity === 1) return 799;
-  if (quantity === 2) return 1199;
-  if (quantity === 3) return 1699;
-  if (quantity === 4) return 2199;
-  return Math.round(quantity * 599 * 0.95);
-}
-
-function getMidLengthMehendiHandsPrice(hands = 1) {
-  const quantity = Math.max(Number(hands) || 1, 1);
-
-  if (quantity === 1) return 999;
-  if (quantity === 2) return 1499;
-  if (quantity === 3) return 2099;
-  if (quantity === 4) return 2599;
-  return quantity * 629;
-}
-
-function getElbowLengthBridalMehendiHandsPrice(hands = 1) {
-  const quantity = Math.max(Number(hands) || 1, 1);
-
-  if (quantity === 1) return 1799;
-  if (quantity === 2) return 3000;
-  return round(quantity * 1799 * 0.75);
-}
-
-function getAboveElbowBridalMehendiHandsPrice(hands = 1) {
-  const quantity = Math.max(Number(hands) || 1, 1);
-
-  if (quantity === 1) return 2000;
-  if (quantity === 2) return 3500;
-  // 3+ hands: fall back to a 25% bulk discount on the per-hand rate, mirroring
-  // the elbow-length curve. Previously returned null → callers hit
-  // `price <= 0` and the booking was rejected with no useful explanation.
-  return Math.round(quantity * 2000 * 0.75);
-}
-
+// Name-based fallback detection. Only used when the Service record has no
+// explicit pricingRuleKey (legacy rows) — an admin rename would silently
+// break this matching, which is exactly why pricingRuleKey exists.
 function getMehendiPricingRuleKey(serviceName = "") {
   const normalized = normalizeText(serviceName);
 
@@ -126,32 +125,45 @@ function getMehendiPricingRuleKey(serviceName = "") {
   return null;
 }
 
+// Sync variant — code defaults only. Kept for tests/back-compat; booking
+// pricing should use getMehendiHandsPriceWithSettings so admin overrides apply.
 function getMehendiHandsPrice(pricingRuleKey, hands = 1) {
-  if (pricingRuleKey === "mehendi_minimal_hands") {
-    return getMinimalMehendiHandsPrice(hands);
+  const table = DEFAULT_MEHENDI_HANDS_PRICING[pricingRuleKey];
+  if (!table) return null;
+  return resolveMehendiHandsPriceFromTable(table, hands);
+}
+
+// Admin-overridable variant. Reads AdminSetting.mehendiHandsPricing with a
+// 60s cache (same pattern as the useH3Zones flag); any rule whose override
+// has no positive tier prices falls back to the code defaults, so a blank or
+// half-filled admin form can never zero out live pricing.
+let _mehendiPricingCache = { value: null, expiresAt: 0 };
+async function getMehendiHandsPriceWithSettings(pricingRuleKey, hands = 1) {
+  if (!DEFAULT_MEHENDI_HANDS_PRICING[pricingRuleKey]) return null;
+
+  if (Date.now() >= _mehendiPricingCache.expiresAt) {
+    try {
+      const AdminSetting = require("../admin/models/AdminSetting");
+      const settings = await AdminSetting.findOne()
+        .select("mehendiHandsPricing")
+        .lean();
+      _mehendiPricingCache = {
+        value: settings?.mehendiHandsPricing || null,
+        expiresAt: Date.now() + 60_000,
+      };
+    } catch {
+      _mehendiPricingCache.expiresAt = Date.now() + 10_000;
+    }
   }
 
-  if (pricingRuleKey === "mehendi_palm_length_hands") {
-    return getPalmLengthMehendiHandsPrice(hands);
-  }
-
-  if (pricingRuleKey === "mehendi_bangle_length_hands") {
-    return getBangleLengthMehendiHandsPrice(hands);
-  }
-
-  if (pricingRuleKey === "mehendi_mid_length_hands") {
-    return getMidLengthMehendiHandsPrice(hands);
-  }
-
-  if (pricingRuleKey === "mehendi_elbow_bridal_hands") {
-    return getElbowLengthBridalMehendiHandsPrice(hands);
-  }
-
-  if (pricingRuleKey === "mehendi_above_elbow_bridal_hands") {
-    return getAboveElbowBridalMehendiHandsPrice(hands);
-  }
-
-  return null;
+  const override = _mehendiPricingCache.value?.[pricingRuleKey];
+  const hasUsableOverride =
+    Array.isArray(override?.tierPrices) &&
+    override.tierPrices.some((p) => Number(p) > 0);
+  const table = hasUsableOverride
+    ? override
+    : DEFAULT_MEHENDI_HANDS_PRICING[pricingRuleKey];
+  return resolveMehendiHandsPriceFromTable(table, hands);
 }
 
 /*
@@ -225,6 +237,11 @@ function validateCakeOptions(service, rawOptions = {}) {
     return { ok: false, message: "Two-tier is not available for this service" };
   }
 
+  const eggless = Boolean(rawOptions.eggless);
+  if (eggless && config.egglessOptionEnabled === false) {
+    return { ok: false, message: "Eggless option is not available for this service" };
+  }
+
   const addonNames = Array.isArray(rawOptions.addons) ? rawOptions.addons : [];
   if (addonNames.length > 0 && config.addonsEnabled === false) {
     return { ok: false, message: "Add-ons are not available for this service" };
@@ -264,6 +281,7 @@ function validateCakeOptions(service, rawOptions = {}) {
       flavour: flavour.name,
       ...(weight ? { weight } : {}),
       tiers,
+      eggless,
       addons,
       nameOnCake,
       ...(referencePhotoUrl ? { referencePhotoUrl } : {}),
@@ -293,12 +311,16 @@ function computeCakeLineTotal(service, options, quantity = 1) {
     Number(options.tiers) === 2 && config.tiersEnabled !== false
       ? Number(config.twoTierPriceDelta) || 0
       : 0;
+  const egglessDelta =
+    options.eggless && config.egglessOptionEnabled !== false
+      ? Number(config.egglessPriceDelta) || 0
+      : 0;
   const addonsTotal = (options.addons || []).reduce(
     (total, addon) => total + (Number(addon.price) || 0),
     0
   );
 
-  const unitPrice = (Number(service.price) || 0) + flavourDelta + weightDelta + tierDelta + addonsTotal;
+  const unitPrice = (Number(service.price) || 0) + flavourDelta + weightDelta + tierDelta + egglessDelta + addonsTotal;
   return { unitPrice: round(unitPrice), lineTotal: round(unitPrice * qty) };
 }
 
@@ -431,16 +453,11 @@ exports.calculatePricing = ({
   };
 };
 
-exports.getMinimalMehendiHandsPrice = getMinimalMehendiHandsPrice;
-exports.getPalmLengthMehendiHandsPrice = getPalmLengthMehendiHandsPrice;
-exports.getBangleLengthMehendiHandsPrice = getBangleLengthMehendiHandsPrice;
-exports.getMidLengthMehendiHandsPrice = getMidLengthMehendiHandsPrice;
-exports.getElbowLengthBridalMehendiHandsPrice =
-  getElbowLengthBridalMehendiHandsPrice;
-exports.getAboveElbowBridalMehendiHandsPrice =
-  getAboveElbowBridalMehendiHandsPrice;
+exports.DEFAULT_MEHENDI_HANDS_PRICING = DEFAULT_MEHENDI_HANDS_PRICING;
+exports.MEHENDI_PRICING_RULE_KEYS = MEHENDI_PRICING_RULE_KEYS;
 exports.getMehendiPricingRuleKey = getMehendiPricingRuleKey;
 exports.getMehendiHandsPrice = getMehendiHandsPrice;
+exports.getMehendiHandsPriceWithSettings = getMehendiHandsPriceWithSettings;
 exports.validateCakeOptions = validateCakeOptions;
 exports.computeCakeLineTotal = computeCakeLineTotal;
 exports.hasCustomization = hasCustomization;

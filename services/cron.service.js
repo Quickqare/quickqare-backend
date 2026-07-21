@@ -11,6 +11,23 @@ const PARTNER_HISTORY_DAYS = 60;
 const HISTORY_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // once per day
 const CHECK_INTERVAL_MS = 30 * 60 * 1000; // every 30 minutes
 
+// ── Learning loop (the "small brain") ──────────────────────────────────────
+// Nightly jobs that turn recorded outcomes into learned parameters the same
+// synchronous assignment engine already consumes. All strictly bounded and
+// clamped — never non-deterministic, never in the assignment hot path.
+const LEARNING_INTERVAL_MS = 24 * 60 * 60 * 1000; // durations + travel, once per day
+const LEARNING_LOOKBACK_DAYS = 30; // completed-booking window the learners aggregate over
+const LEARNED_DURATION_MIN_BATCH = 5; // need this many clean samples before writing a service
+const LEARNED_TRAVEL_MIN_BATCH = 10; // need this many samples before writing a category
+const LEARNED_EWMA_ALPHA = 0.3; // weight of the new batch vs the prior learned value
+const SHADOW_INTERVAL_MS = 24 * 60 * 60 * 1000; // weight-shadow report, once per day
+const SHADOW_LOOKBACK_DAYS = 7;
+const SHADOW_MAX_BOOKINGS = 5000; // hard cap on bookings scanned per shadow run
+// Candidate weighting the shadow report tests against the live one: shift 0.10
+// from idle onto reliability. Applied to whichever live set (AC/general) the
+// booking used, so the sum stays 1.0.
+const SHADOW_RELIABILITY_SHIFT = 0.1;
+
 // No-show thresholds: how many hours past scheduled time before we flag a booking
 const NO_SHOW_ACCEPTED_HOURS  = 2; // PARTNER_ACCEPTED but didn't show up
 const NO_SHOW_ON_THE_WAY_HOURS = 3; // ON_THE_WAY but never arrived
@@ -25,6 +42,11 @@ const RESCHEDULE_REASON = {
 const PAYOUT_RETRY_INTERVAL_MS = 10 * 60 * 1000; // every 10 minutes
 // Only retry payouts that have been pending for at least this long (process crash window)
 const PAYOUT_RETRY_AFTER_MS = 5 * 60 * 1000; // 5 minutes
+// A transient error (network blip, brief DB hiccup) must not permanently
+// strand a partner's earnings: retry up to this many times before marking the
+// payout "failed" for manual admin intervention. creditWallet is idempotent,
+// so re-running a partially-credited booking is safe.
+const PAYOUT_MAX_RETRIES = 5;
 const SLOT_LOCK_CHECK_INTERVAL_MS = 5 * 60 * 1000; // every 5 minutes
 
 // QUEUED bookings are dispatched when they are this many hours before service.
@@ -177,7 +199,12 @@ async function dispatchQueuedBookings() {
       const start = b.scheduledStartAt
         ? new Date(b.scheduledStartAt)
         : buildDateTime(b.scheduledDate, b.scheduledTime);
-      if (!(start > now)) return false;
+      // Past-start QUEUED bookings are dispatched too — assignBooking either
+      // still staffs them (within its 60-min grace) or escalates + releases
+      // capacity immediately. Filtering them out stranded a PAID booking in
+      // QUEUED for 48h until the stale cron cancelled it, with no timely
+      // customer notification or refund.
+      if (start <= now) return true;
       // Customized (cake) orders never wait for the T-3h window — the baker
       // needs the full lead time to bake. Normally they're assigned at payment
       // (paymentFinalize skips QUEUED for them), so any QUEUED one here is a
@@ -577,7 +604,7 @@ async function retryPendingPayouts() {
       payoutStatus: "pending",
       completedAt: { $lt: cutoff },
     })
-      .select("_id partner additionalPartners partnerSettlement user")
+      .select("_id partner additionalPartners partnerSettlement user payoutRetryCount")
       .lean();
 
     if (!orphaned.length) return;
@@ -631,8 +658,32 @@ async function retryPendingPayouts() {
 
         console.log(`[cron] Payout retry succeeded for booking ${booking._id}`);
       } catch (err) {
-        console.error(`[cron] Payout retry failed for booking ${booking._id}:`, err.message);
-        await Booking.findByIdAndUpdate(booking._id, { $set: { payoutStatus: "failed" } });
+        const attempts = Number(booking.payoutRetryCount || 0) + 1;
+        console.error(
+          `[cron] Payout retry ${attempts}/${PAYOUT_MAX_RETRIES} failed for booking ${booking._id}:`,
+          err.message
+        );
+
+        if (attempts >= PAYOUT_MAX_RETRIES) {
+          // Exhausted — needs a human. Alert ops so it doesn't rot silently.
+          await Booking.findByIdAndUpdate(booking._id, {
+            $set: { payoutStatus: "failed", payoutRetryCount: attempts },
+          });
+          if (global.io) {
+            global.io.to("admin_ops").emit("payout_failed", {
+              bookingId: String(booking._id),
+              partnerId: booking.partner ? String(booking.partner) : null,
+              attempts,
+              error: err.message,
+              timestamp: new Date().toISOString(),
+            });
+          }
+        } else {
+          // Transient failure — stay "pending" so the next cron pass retries.
+          await Booking.findByIdAndUpdate(booking._id, {
+            $set: { payoutRetryCount: attempts },
+          });
+        }
       }
     }
   } catch (err) {
@@ -703,16 +754,23 @@ async function detectNoShowPartners() {
         );
         if (!updated) continue; // race condition — already handled
 
-        // Partner cancellation strike
+        // Partner no-show strike — shared atomic implementation (weekly reset
+        // + auto-suspension), same as the cancel/reject paths. The old
+        // read-modify-write here never reset the weekly counter.
         if (booking.partner) {
-          const partner = await Partner.findById(booking.partner);
-          if (partner) {
-            partner.weeklyCancelCount = (partner.weeklyCancelCount || 0) + 1;
-            if (partner.weeklyCancelCount >= 5) {
-              partner.isBlocked = true;
-              console.warn(`[no-show] Auto-suspended partner ${partner._id} after no-show strike`);
-            }
-            await partner.save();
+          try {
+            const { recordPartnerStrike } = require("./partnerLifecycle.service");
+            await recordPartnerStrike(booking.partner);
+            // Lifetime no-show counter — feeds the reliability score's no-show
+            // penalty (was a dead schema field until now). Kept out of
+            // recordPartnerStrike because that path also handles plain
+            // cancels/rejects, which are not no-shows.
+            await Partner.updateOne(
+              { _id: booking.partner },
+              { $inc: { noShowCount: 1 } }
+            );
+          } catch (strikeErr) {
+            console.error(`[no-show] Strike recording failed for partner ${booking.partner}: ${strikeErr.message}`);
           }
         }
 
@@ -739,14 +797,22 @@ async function detectNoShowPartners() {
 /*
 =====================================================
 PURGE OLD PARTNER JOB HISTORY
-Removes partner references from bookings older than
-60 days that have no open/in-review dispute.
-This prevents partners from ever seeing those jobs
-again (the query filter is the first gate; this
-scrub is the permanent one).
+Removes partner references from TERMINAL bookings (COMPLETED / CANCELLED)
+older than 60 days that have no open/in-review dispute. This prevents
+partners from ever seeing those jobs again (the query filter is the first
+gate; this scrub is the permanent one).
+
+The status filter matters: createdAt alone can't tell a delivered job from
+one still in flight. A cake pre-order can be booked (createdAt) months before
+its scheduled delivery date, and a NEEDS_RESCHEDULING/ASSIGNED booking can sit
+for a while mid-dispute-free lifecycle — purging the partner reference off
+either of those strands an active job with no assigned partner. Only a
+booking that has actually finished (or been cancelled) is safe to scrub.
 Runs once daily.
 =====================================================
 */
+const PARTNER_HISTORY_PURGEABLE_STATUSES = ["COMPLETED", "CANCELLED"];
+
 async function purgeOldPartnerJobHistory() {
   try {
     const Booking = require("../models/Booking");
@@ -762,6 +828,7 @@ async function purgeOldPartnerJobHistory() {
     const result = await Booking.updateMany(
       {
         createdAt: { $lt: cutoff },
+        status: { $in: PARTNER_HISTORY_PURGEABLE_STATUSES },
         _id: { $nin: disputedIds },
         $or: [
           { partner: { $ne: null } },
@@ -784,34 +851,370 @@ async function purgeOldPartnerJobHistory() {
   }
 }
 
+// Mean after dropping the top/bottom 10% — kills single-outlier skew (one job
+// where the partner forgot to tap "arrived" for two hours) without needing a
+// full median. Returns null for an empty set.
+function trimmedMean(values) {
+  const arr = values.filter(Number.isFinite).sort((a, b) => a - b);
+  if (!arr.length) return null;
+  const cut = Math.floor(arr.length * 0.1);
+  const kept = arr.length > 2 * cut + 1 ? arr.slice(cut, arr.length - cut) : arr;
+  return kept.reduce((s, v) => s + v, 0) / kept.length;
+}
+
+// EWMA blend of a fresh batch mean into the prior learned value.
+function ewmaBlend(prior, batch) {
+  if (!Number.isFinite(prior) || prior <= 0) return batch;
+  return LEARNED_EWMA_ALPHA * batch + (1 - LEARNED_EWMA_ALPHA) * prior;
+}
+
+/*
+=====================================================
+LEARN SERVICE DURATIONS  (fix 3)
+Turns real on-site time (inProgressAt -> completedAt) of COMPLETED,
+single-line, single-unit bookings into Service.learnedDurationMinutes via
+EWMA, clamped to +/-40% of the admin-entered duration. Only single-line
+single-unit jobs are used so the whole elapsed time maps cleanly to one
+service (team/multi-cart jobs would mis-attribute). The reader
+(serviceDurationMinutes) ignores the learned value until >= 5 samples, so a
+thin batch can't take over. Runs once per day.
+=====================================================
+*/
+async function learnServiceDurations() {
+  try {
+    const Booking = require("../models/Booking");
+    const Service = require("../models/service.model");
+    const {
+      LEARNED_DURATION_MIN_FACTOR,
+      LEARNED_DURATION_MAX_FACTOR,
+    } = require("./scheduling_service");
+    const cutoff = new Date(Date.now() - LEARNING_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
+
+    // Collect actual minutes per serviceId from clean single-unit jobs.
+    const bookings = await Booking.find({
+      status: "COMPLETED",
+      inProgressAt: { $ne: null },
+      completedAt: { $ne: null, $gte: cutoff },
+      services: { $size: 1 },
+    })
+      .select("services inProgressAt completedAt")
+      .lean();
+
+    const samplesByService = new Map(); // serviceIdString -> number[]
+    for (const b of bookings) {
+      const line = b.services?.[0];
+      const serviceId = line?.serviceId;
+      if (!serviceId) continue;
+      const qty = Number(line?.quantity || 1);
+      if (qty > 1) continue; // single unit only
+      const mins = (new Date(b.completedAt) - new Date(b.inProgressAt)) / 60000;
+      if (!(mins >= 5 && mins <= 600)) continue; // drop garbage timestamps
+      const key = String(serviceId);
+      if (!samplesByService.has(key)) samplesByService.set(key, []);
+      samplesByService.get(key).push(mins);
+    }
+
+    let updated = 0;
+    for (const [serviceId, samples] of samplesByService) {
+      if (samples.length < LEARNED_DURATION_MIN_BATCH) continue;
+      const service = await Service.findById(serviceId).select(
+        "duration learnedDurationMinutes"
+      );
+      if (!service) continue;
+      const catalog = Math.max(Number(service.duration) || 60, 1);
+      const batchMean = trimmedMean(samples);
+      if (!Number.isFinite(batchMean)) continue;
+      const blended = ewmaBlend(Number(service.learnedDurationMinutes), batchMean);
+      const clamped = Math.round(
+        Math.min(
+          Math.max(blended, catalog * LEARNED_DURATION_MIN_FACTOR),
+          catalog * LEARNED_DURATION_MAX_FACTOR
+        )
+      );
+      await Service.updateOne(
+        { _id: serviceId },
+        { $set: { learnedDurationMinutes: clamped, learnedDurationSamples: samples.length } }
+      );
+      updated += 1;
+    }
+
+    if (updated > 0) {
+      console.log(`[learn] Service durations updated for ${updated} service(s) from ${bookings.length} completed jobs`);
+    }
+  } catch (err) {
+    console.error("[cron] learnServiceDurations error:", err.message);
+  }
+}
+
+/*
+=====================================================
+LEARN TRAVEL TIMES  (fix 4)
+Turns real transit time (onTheWayAt -> arrivedAt) of COMPLETED bookings into
+a learned flat travel buffer per category (general vs AC), stored in
+LearnedStat "travelBuffer" via EWMA and clamped to the category band. This is
+what the scheduler actually uses as the flat door-to-door buffer, so wrong
+buffers (too fat -> false "slot full"; too thin -> back-to-back lateness) get
+corrected toward reality. No per-km math: bookings don't snapshot the
+partner's start point, so we learn the observed transit TIME directly, which
+is exactly what the flat buffer represents. Runs once per day.
+=====================================================
+*/
+async function learnTravelTimes() {
+  try {
+    const Booking = require("../models/Booking");
+    const LearnedStat = require("../models/LearnedStat");
+    const { isACBooking } = require("./assignmentEngine");
+    const {
+      TRAVEL_BUFFER_GENERAL_MIN,
+      TRAVEL_BUFFER_GENERAL_MAX,
+      TRAVEL_BUFFER_AC_MIN,
+      TRAVEL_BUFFER_AC_MAX,
+    } = require("./scheduling_service");
+    const cutoff = new Date(Date.now() - LEARNING_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
+
+    const bookings = await Booking.find({
+      status: "COMPLETED",
+      onTheWayAt: { $ne: null },
+      arrivedAt: { $ne: null },
+      completedAt: { $gte: cutoff },
+    })
+      .select("serviceCategory services onTheWayAt arrivedAt")
+      .lean();
+
+    const buckets = { general: [], ac: [] };
+    for (const b of bookings) {
+      const mins = (new Date(b.arrivedAt) - new Date(b.onTheWayAt)) / 60000;
+      if (!(mins >= 1 && mins <= 180)) continue; // drop garbage / same-timestamp
+      (isACBooking(b) ? buckets.ac : buckets.general).push(mins);
+    }
+
+    const prior = await LearnedStat.findOne({ key: "travelBuffer" }).lean();
+    const data = { ...(prior?.data || {}) };
+    const sampleCounts = { ...(prior?.data?.samples || {}) };
+    let changed = false;
+
+    for (const [cat, band] of [
+      ["general", [TRAVEL_BUFFER_GENERAL_MIN, TRAVEL_BUFFER_GENERAL_MAX]],
+      ["ac", [TRAVEL_BUFFER_AC_MIN, TRAVEL_BUFFER_AC_MAX]],
+    ]) {
+      const samples = buckets[cat];
+      if (samples.length < LEARNED_TRAVEL_MIN_BATCH) continue;
+      const batchMean = trimmedMean(samples);
+      if (!Number.isFinite(batchMean)) continue;
+      const blended = ewmaBlend(Number(data[cat]), batchMean);
+      data[cat] = Math.round(Math.min(Math.max(blended, band[0]), band[1]));
+      sampleCounts[cat] = samples.length;
+      changed = true;
+    }
+
+    if (changed) {
+      data.samples = sampleCounts;
+      const totalSamples = (sampleCounts.general || 0) + (sampleCounts.ac || 0);
+      await LearnedStat.updateOne(
+        { key: "travelBuffer" },
+        { $set: { data, samples: totalSamples } },
+        { upsert: true }
+      );
+      console.log(
+        `[learn] Travel buffers updated: general=${data.general ?? "—"}m ac=${data.ac ?? "—"}m ` +
+          `(samples g=${sampleCounts.general || 0} ac=${sampleCounts.ac || 0})`
+      );
+    }
+  } catch (err) {
+    console.error("[cron] learnTravelTimes error:", err.message);
+  }
+}
+
+/*
+=====================================================
+SCORE-WEIGHT SHADOW REPORT  (fix 5)
+LOG-ONLY. Never changes a live decision. Replays the exact stored candidate
+breakdowns from recent assignments under the live weights AND a candidate
+weighting (0.10 shifted from idle onto reliability), and reports how often the
+top pick would have differed — with special attention to assignments that
+later went bad (reassigned or needed rescheduling). This is the same
+"shadow beside the live path" pattern already used for the H3 hub lookup:
+observe safely for a few weeks before anyone decides to move a weight.
+Runs once per day; the latest snapshot is also stored for the admin panel.
+=====================================================
+*/
+function _shadowScore(candidate, weights) {
+  return (
+    (Number(candidate.fairnessScore) || 0) * weights.idle +
+    (Number(candidate.earningsScore) || 0) * weights.earnings +
+    (Number(candidate.distanceScore) || 0) * weights.distance +
+    (Number(candidate.skillScore) || 0) * weights.skill +
+    (Number(candidate.reliabilityScore) || 0) * weights.reliability
+  );
+}
+
+function _shadowTopPick(candidates, weights) {
+  let best = null;
+  let bestScore = -Infinity;
+  for (const c of candidates) {
+    const s = _shadowScore(c, weights);
+    if (s > bestScore) {
+      bestScore = s;
+      best = c;
+    }
+  }
+  return best;
+}
+
+async function runScoreWeightShadow() {
+  try {
+    const Booking = require("../models/Booking");
+    const LearnedStat = require("../models/LearnedStat");
+    const { isACBooking } = require("./assignmentEngine");
+    const { AC_SCORE_WEIGHTS, GENERAL_SCORE_WEIGHTS } = require("./scheduling_service");
+    const cutoff = new Date(Date.now() - SHADOW_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
+
+    const candidateWeights = (base) => ({
+      idle: base.idle - SHADOW_RELIABILITY_SHIFT,
+      earnings: base.earnings,
+      distance: base.distance,
+      skill: base.skill,
+      reliability: base.reliability + SHADOW_RELIABILITY_SHIFT,
+    });
+
+    const bookings = await Booking.find({
+      updatedAt: { $gte: cutoff },
+      "assignmentAudit.event": { $in: ["SOFT_ASSIGNED", "CONFIRMED_AUTO"] },
+    })
+      .select("status assignmentAudit serviceCategory services")
+      .limit(SHADOW_MAX_BOOKINGS)
+      .lean();
+
+    let analyzed = 0;
+    let pickChanged = 0;
+    let badOutcome = 0;
+    let pickChangedOnBad = 0;
+    let reliabilityGainSum = 0; // avg reliabilityScore lift of the candidate pick over the live pick
+
+    for (const b of bookings) {
+      const audit = Array.isArray(b.assignmentAudit) ? b.assignmentAudit : [];
+      const assignEntry = [...audit]
+        .reverse()
+        .find((e) => e.event === "SOFT_ASSIGNED" || e.event === "CONFIRMED_AUTO");
+      const cands = assignEntry?.candidates || [];
+      if (cands.length < 2) continue;
+      // Skip pre-deploy audits that lack the full component breakdown.
+      const hasComponents = cands.every(
+        (c) => Number.isFinite(c.reliabilityScore) && Number.isFinite(c.skillScore)
+      );
+      if (!hasComponents) continue;
+
+      const base = isACBooking(b) ? AC_SCORE_WEIGHTS : GENERAL_SCORE_WEIGHTS;
+      const cand = candidateWeights(base);
+      const livePick = _shadowTopPick(cands, base);
+      const candPick = _shadowTopPick(cands, cand);
+      if (!livePick || !candPick) continue;
+
+      analyzed += 1;
+      const changed = String(livePick.partnerId) !== String(candPick.partnerId);
+      if (changed) {
+        pickChanged += 1;
+        reliabilityGainSum +=
+          (Number(candPick.reliabilityScore) || 0) - (Number(livePick.reliabilityScore) || 0);
+      }
+
+      const reassignCount = audit.filter((e) => e.event === "REASSIGN_REQUESTED").length;
+      const bad =
+        reassignCount > 0 ||
+        ["NEEDS_RESCHEDULING", "NO_PARTNER_AVAILABLE"].includes(b.status);
+      if (bad) {
+        badOutcome += 1;
+        if (changed) pickChangedOnBad += 1;
+      }
+    }
+
+    const pct = (n, d) => (d > 0 ? Math.round((n / d) * 1000) / 10 : 0);
+    const snapshot = {
+      analyzed,
+      pickChanged,
+      pickChangedPct: pct(pickChanged, analyzed),
+      badOutcome,
+      pickChangedOnBad,
+      pickChangedOnBadPct: pct(pickChangedOnBad, badOutcome),
+      avgReliabilityGainOnChange:
+        pickChanged > 0 ? Math.round((reliabilityGainSum / pickChanged) * 10) / 10 : 0,
+      lookbackDays: SHADOW_LOOKBACK_DAYS,
+      reliabilityShift: SHADOW_RELIABILITY_SHIFT,
+      generatedAt: new Date().toISOString(),
+    };
+
+    if (analyzed > 0) {
+      console.log(
+        `[shadow] Score-weight report: analyzed=${analyzed} pickChanged=${pickChanged} (${snapshot.pickChangedPct}%) ` +
+          `badOutcome=${badOutcome} pickChangedOnBad=${pickChangedOnBad} (${snapshot.pickChangedOnBadPct}%) ` +
+          `avgReliabilityGainOnChange=${snapshot.avgReliabilityGainOnChange}`
+      );
+    }
+
+    await LearnedStat.updateOne(
+      { key: "scoreWeightShadow" },
+      { $set: { data: snapshot, samples: analyzed } },
+      { upsert: true }
+    );
+  } catch (err) {
+    console.error("[cron] runScoreWeightShadow error:", err.message);
+  }
+}
+
 /*
 =====================================================
 INIT — called once after MongoDB connects
 =====================================================
 */
-function initCronJobs() {
-  // Run once on startup to catch stale bookings from before last restart
-  cancelStaleBookings();
-  dispatchQueuedBookings();
-  cleanupExpiredSlotLocks();
-  sendJobReminders();
-  sendCakeOrderReminders();
-  enforceAdvanceAckDeadlines();
-  sendHelperInviteReminders();
-  retryPendingPayouts();
-  detectNoShowPartners();
-  purgeOldPartnerJobHistory();
+// Wrap a job so a slow run can never overlap its own next tick. Under load a
+// long purge/dispatch could otherwise still be running when setInterval fires
+// again, doubling DB work on the single process. The in-flight flag makes the
+// second fire a no-op until the first finishes.
+function withOverlapGuard(name, fn) {
+  let running = false;
+  return async function guarded() {
+    if (running) {
+      if (process.env.NODE_ENV !== "test") {
+        console.warn(`[cron] ${name} still running — skipping this tick`);
+      }
+      return;
+    }
+    running = true;
+    try {
+      await fn();
+    } catch (err) {
+      console.error(`[cron] ${name} error:`, err?.message);
+    } finally {
+      running = false;
+    }
+  };
+}
 
-  setInterval(cancelStaleBookings, CHECK_INTERVAL_MS);
-  setInterval(dispatchQueuedBookings, CHECK_INTERVAL_MS);
-  setInterval(cleanupExpiredSlotLocks, SLOT_LOCK_CHECK_INTERVAL_MS);
-  setInterval(sendJobReminders, REMINDER_INTERVAL_MS);
-  setInterval(sendCakeOrderReminders, CAKE_REMINDER_INTERVAL_MS);
-  setInterval(enforceAdvanceAckDeadlines, REMINDER_INTERVAL_MS);
-  setInterval(sendHelperInviteReminders, REMINDER_INTERVAL_MS);
-  setInterval(retryPendingPayouts, PAYOUT_RETRY_INTERVAL_MS);
-  setInterval(detectNoShowPartners, CHECK_INTERVAL_MS);
-  setInterval(purgeOldPartnerJobHistory, HISTORY_CLEANUP_INTERVAL_MS);
+function initCronJobs() {
+  const jobs = [
+    { name: "cancelStaleBookings", fn: cancelStaleBookings, interval: CHECK_INTERVAL_MS },
+    { name: "dispatchQueuedBookings", fn: dispatchQueuedBookings, interval: CHECK_INTERVAL_MS },
+    { name: "cleanupExpiredSlotLocks", fn: cleanupExpiredSlotLocks, interval: SLOT_LOCK_CHECK_INTERVAL_MS },
+    { name: "sendJobReminders", fn: sendJobReminders, interval: REMINDER_INTERVAL_MS },
+    { name: "sendCakeOrderReminders", fn: sendCakeOrderReminders, interval: CAKE_REMINDER_INTERVAL_MS },
+    { name: "enforceAdvanceAckDeadlines", fn: enforceAdvanceAckDeadlines, interval: REMINDER_INTERVAL_MS },
+    { name: "sendHelperInviteReminders", fn: sendHelperInviteReminders, interval: REMINDER_INTERVAL_MS },
+    { name: "retryPendingPayouts", fn: retryPendingPayouts, interval: PAYOUT_RETRY_INTERVAL_MS },
+    { name: "detectNoShowPartners", fn: detectNoShowPartners, interval: CHECK_INTERVAL_MS },
+    { name: "purgeOldPartnerJobHistory", fn: purgeOldPartnerJobHistory, interval: HISTORY_CLEANUP_INTERVAL_MS },
+    // Learning loop (fixes 3/4/5) — nightly, log-only for the shadow report.
+    { name: "learnServiceDurations", fn: learnServiceDurations, interval: LEARNING_INTERVAL_MS },
+    { name: "learnTravelTimes", fn: learnTravelTimes, interval: LEARNING_INTERVAL_MS },
+    { name: "runScoreWeightShadow", fn: runScoreWeightShadow, interval: SHADOW_INTERVAL_MS },
+  ];
+
+  jobs.forEach((job, i) => {
+    const guarded = withOverlapGuard(job.name, job.fn);
+    // Stagger the initial catch-up runs a few seconds apart so all ten don't
+    // hammer Mongo at once on every process start (thundering herd at boot).
+    setTimeout(guarded, i * 3000);
+    setInterval(guarded, job.interval);
+  });
 
   if (process.env.NODE_ENV !== "test") {
     console.log(
@@ -840,4 +1243,7 @@ module.exports = {
   retryPendingPayouts,
   detectNoShowPartners,
   purgeOldPartnerJobHistory,
+  learnServiceDurations,
+  learnTravelTimes,
+  runScoreWeightShadow,
 };

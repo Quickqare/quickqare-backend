@@ -21,14 +21,14 @@ const {
   buildDateTime,
   clearSlotCache,
   syncPartnerOperationalState,
-  AC_MAX_CAPACITY_MINUTES,
-  AC_CATEGORY_SLUGS,
+  isACCategory,
+  calculateDurationForServices,
 } = require("../services/scheduling_service");
 const {
   calculatePricing,
   getPricingSettings,
   getMehendiPricingRuleKey,
-  getMehendiHandsPrice,
+  getMehendiHandsPriceWithSettings,
   validateCakeOptions,
   computeCakeLineTotal,
   hasCustomization,
@@ -36,7 +36,9 @@ const {
 const { validateCouponForAmount } = require("../services/coupon.service");
 const {
   SLOT_LOCK_MINUTES,
+  commitSlotReservation,
   markSlotLockPaid,
+  prepareSlotReservation,
   releaseSlotCapacityByBookingId,
   reserveSlotCapacityForBooking,
 } = require("../services/slotCapacity.service");
@@ -46,6 +48,21 @@ const {
 } = require("../services/pushNotification.service");
 
 const PAYMENT_LOCK_MINUTES = SLOT_LOCK_MINUTES;
+
+// Max concurrent unpaid (PENDING_PAYMENT, still-locked) bookings a single
+// customer may hold. Guards slot inventory against a script/abuser reserving
+// every window without paying. Tunable via env without a code change.
+const MAX_ACTIVE_UNPAID_BOOKINGS = Math.max(
+  1,
+  Number(process.env.MAX_ACTIVE_UNPAID_BOOKINGS || 3)
+);
+
+// Sanity caps on a single booking's cart. Without them a request could send
+// hundreds of line items or a quantity of 1e9, ballooning the booking document,
+// the settlement math, and slot-capacity computations. Generous enough that no
+// real customer hits them.
+const MAX_CART_ITEMS = Math.max(1, Number(process.env.MAX_CART_ITEMS || 20));
+const MAX_ITEM_QUANTITY = Math.max(1, Number(process.env.MAX_ITEM_QUANTITY || 50));
 
 const AdminSetting = require("../admin/models/AdminSetting");
 
@@ -97,11 +114,54 @@ const clampPercent = (value, fallback = 20) => {
   return Math.min(Math.max(numeric, 0), 100);
 };
 
+/*
+  Approved AND PAID on-site estimate items are part of the partner's delivered
+  work — settle them exactly like booking lines (commission per item's service,
+  falling back to the partner's own rate). Estimates that were approved but
+  never paid contribute nothing: crediting a partner for money the platform
+  never collected would leak funds.
+*/
+const calculateEstimateSettlement = async (booking, partner) => {
+  const paid =
+    booking.estimateStatus === "approved" &&
+    booking.estimatePayment?.status === "PAID" &&
+    Array.isArray(booking.estimateItems) &&
+    booking.estimateItems.length > 0;
+
+  if (!paid) return { grossAmount: 0, commissionAmount: 0 };
+
+  // Estimate line items reference CatalogItem records (see submitEstimate),
+  // which carry no per-item commission — so commission on approved estimate
+  // work is charged at the partner's own rate. A previous version queried the
+  // Service collection with these CatalogItem ids, which never matched and
+  // silently produced this exact fallback for every item; the dead lookup is
+  // removed so the behaviour is explicit (and one DB round-trip is saved).
+  const commissionPercent = clampPercent(partner?.commissionPercent, 20);
+
+  let grossAmount = 0;
+  let commissionAmount = 0;
+  for (const item of booking.estimateItems) {
+    const lineTotal = roundAmount(Number(item.lineTotal || 0));
+    if (lineTotal <= 0) continue;
+    grossAmount = roundAmount(grossAmount + lineTotal);
+    commissionAmount = roundAmount(
+      commissionAmount + roundAmount((lineTotal * commissionPercent) / 100)
+    );
+  }
+
+  return {
+    grossAmount,
+    commissionAmount: Math.min(commissionAmount, grossAmount),
+  };
+};
+
 const calculatePartnerSettlement = async (booking, partner) => {
   const taxableAmount = Math.max(
     roundAmount(Number(booking.baseAmount || 0) - Number(booking.discountAmount || 0)),
     0
   );
+
+  const estimate = await calculateEstimateSettlement(booking, partner);
 
   const bookingLines = Array.isArray(booking.services) ? booking.services : [];
 
@@ -136,9 +196,11 @@ const calculatePartnerSettlement = async (booking, partner) => {
     commissionAmount = Math.min(roundAmount(commissionAmount), taxableAmount);
 
     return {
-      grossAmount: taxableAmount,
-      commissionAmount,
-      partnerEarningAmount: roundAmount(taxableAmount - commissionAmount),
+      grossAmount: roundAmount(taxableAmount + estimate.grossAmount),
+      commissionAmount: roundAmount(commissionAmount + estimate.commissionAmount),
+      partnerEarningAmount: roundAmount(
+        taxableAmount - commissionAmount + estimate.grossAmount - estimate.commissionAmount
+      ),
     };
   }
 
@@ -152,9 +214,11 @@ const calculatePartnerSettlement = async (booking, partner) => {
 
   const commissionAmount = roundAmount((taxableAmount * commissionPercent) / 100);
   return {
-    grossAmount: taxableAmount,
-    commissionAmount,
-    partnerEarningAmount: roundAmount(taxableAmount - commissionAmount),
+    grossAmount: roundAmount(taxableAmount + estimate.grossAmount),
+    commissionAmount: roundAmount(commissionAmount + estimate.commissionAmount),
+    partnerEarningAmount: roundAmount(
+      taxableAmount - commissionAmount + estimate.grossAmount - estimate.commissionAmount
+    ),
   };
 };
 
@@ -171,6 +235,26 @@ exports.createBooking = async (req, res) => {
         message: settings?.emergencyLockdown
           ? "Service temporarily unavailable. Please try again later."
           : "New bookings are temporarily disabled. Please try again later.",
+      });
+    }
+
+    // Cap how many unpaid, slot-holding bookings one account may have open at
+    // once. Each PENDING_PAYMENT booking reserves real SlotCapacity for the
+    // payment-lock window, so without a cap a single user (or a runaway client
+    // retry loop) could reserve every window in a zone and simply never pay,
+    // locking out real customers. Only live-locked, customer-initiated carts
+    // count — expired locks and partner_onspot add-ons are excluded.
+    const activeUnpaidCount = await Booking.countDocuments({
+      user: req.user._id,
+      status: "PENDING_PAYMENT",
+      origin: { $ne: "partner_onspot" },
+      lockedUntil: { $gt: new Date() },
+    });
+    if (activeUnpaidCount >= MAX_ACTIVE_UNPAID_BOOKINGS) {
+      return res.status(429).json({
+        success: false,
+        message:
+          "You have bookings awaiting payment. Please complete or cancel them before creating a new one.",
       });
     }
 
@@ -310,7 +394,6 @@ exports.createBooking = async (req, res) => {
     let baseAmount = 0;
     let finalPrimaryService = primaryService;
     const categorySlugCache = new Map();
-    let totalDurationMinutes = 0;
     const allServiceCancellationTiers = [];
     // Customization-configured (cake) services drive lead-time and the
     // SINCE_BOOKING cancellation policy for the whole booking.
@@ -318,7 +401,27 @@ exports.createBooking = async (req, res) => {
     let hasPlainService = false;
     let maxMinLeadDays = 0;
     let sinceBookingPolicy = null; // { tiers } from the first SINCE_BOOKING service
-    const mehendiRestrictedFeetOnly = new Set(["feet", "basic feet", "ankle", "above ankle"]);
+    // Most lenient grace-period config across booked services (cakes).
+    // graceLeadThresholdHours is Infinity when a service applies its grace to
+    // every order (appliesBelowLeadHours = 0).
+    let graceWindowMinutes = 0;
+    let graceLeadThresholdHours = 0;
+    const collectCancellationGrace = (service) => {
+      const windowMinutes = Number(service?.cancellationGrace?.windowMinutes) || 0;
+      if (windowMinutes <= 0) return;
+      const threshold = Number(service?.cancellationGrace?.appliesBelowLeadHours) || 0;
+      graceWindowMinutes = Math.max(graceWindowMinutes, windowMinutes);
+      graceLeadThresholdHours = Math.max(
+        graceLeadThresholdHours,
+        threshold > 0 ? threshold : Infinity
+      );
+    };
+    // Add-ons that can't be booked on their own — they need a Mehendi hand
+    // design in the same booking. "Mehendi for guests" isn't a feet option but
+    // shares the same restriction (a guest add-on with no main design is not a
+    // real booking). It is still excluded from counting AS a hand design below,
+    // so it can never satisfy its own requirement.
+    const mehendiRestrictedFeetOnly = new Set(["feet", "basic feet", "ankle", "above ankle", "mehendi for guests"]);
     const mehendiAllFeetOptions = new Set([
       "feet",
       "basic feet",
@@ -357,6 +460,14 @@ exports.createBooking = async (req, res) => {
     if (services && services.length > 0) {
       const Service = require("../models/service.model");
 
+      // Cap cart size before any per-item work.
+      if (services.length > MAX_CART_ITEMS) {
+        return res.status(400).json({
+          success: false,
+          message: `A booking can contain at most ${MAX_CART_ITEMS} services.`,
+        });
+      }
+
       for (const item of services) {
         const incomingServiceId = String(item?.serviceId || "");
 
@@ -377,16 +488,12 @@ exports.createBooking = async (req, res) => {
         }
 
         const categorySlug = await resolveServiceCategorySlug(service);
-        const quantity = Math.max(Number(item.quantity || 1), 1);
+        const quantity = Math.min(Math.max(Number(item.quantity || 1), 1), MAX_ITEM_QUANTITY);
         // Pricing is ALWAYS taken from the server-side Service record. The
         // client-supplied price is never trusted — a tampered request could
         // otherwise set an arbitrary amount. A service with no valid configured
         // price is rejected outright rather than falling back to client input.
         const price = Number(service.price || 0);
-        const durationMinutes = Math.max(
-          Number(service.duration || 0) || 0,
-          1
-        );
 
         if (price <= 0) {
           return res.status(400).json({
@@ -429,9 +536,12 @@ exports.createBooking = async (req, res) => {
         // (e.g. 2 hands of Minimal Mehendi = ₹699, not 2 × ₹399 = ₹798). The
         // per-hand base price stays in `price`; only the line total is tiered.
         // Everything else falls back to plain price × quantity.
-        const mehendiPricingRuleKey = getMehendiPricingRuleKey(service.name);
+        // The explicit Service.pricingRuleKey wins; name matching is the
+        // legacy fallback and breaks silently if the service is renamed.
+        const mehendiPricingRuleKey =
+          service.pricingRuleKey || getMehendiPricingRuleKey(service.name);
         const mehendiPackageTotal = mehendiPricingRuleKey
-          ? getMehendiHandsPrice(mehendiPricingRuleKey, quantity)
+          ? await getMehendiHandsPriceWithSettings(mehendiPricingRuleKey, quantity)
           : null;
         const itemTotal = customizedTotals
           ? customizedTotals.lineTotal
@@ -445,7 +555,6 @@ exports.createBooking = async (req, res) => {
           : "";
 
         baseAmount += itemTotal;
-        totalDurationMinutes += durationMinutes * quantity;
 
         bookingServices.push({
           serviceId: service._id,
@@ -462,6 +571,7 @@ exports.createBooking = async (req, res) => {
         if (Array.isArray(service.cancellationTiers) && service.cancellationTiers.length > 0) {
           allServiceCancellationTiers.push(service.cancellationTiers);
         }
+        collectCancellationGrace(service);
       }
 
       // Customized (cake) orders can't be mixed with other services in one
@@ -499,7 +609,7 @@ exports.createBooking = async (req, res) => {
         return res.status(400).json({
           success: false,
           message:
-            "Basic Feet, Ankle, and Above Ankle add-ons require a Mehendi hand design. Mid Leg and Below Knee can be booked separately.",
+            "Guest mehendi, Basic Feet, Ankle, and Above Ankle add-ons require a Mehendi hand design. Mid Leg and Below Knee can be booked separately.",
         });
       }
 
@@ -572,6 +682,22 @@ exports.createBooking = async (req, res) => {
 
       const legacyCategorySlug = await resolveServiceCategorySlug(legacyService);
 
+      // Restricted Mehendi add-ons (guest mehendi, basic feet, ankle, above
+      // ankle) can never be booked on their own — they require a hand design in
+      // the same booking, which the single-service format can't carry. The
+      // multi-service flow rejects this too; this closes the legacy loophole so
+      // the restriction holds no matter which booking format a client uses.
+      if (
+        String(legacyCategorySlug || "").toLowerCase().includes("mehendi") &&
+        mehendiRestrictedFeetOnly.has(normalizeText(legacyService.name))
+      ) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Guest mehendi, Basic Feet, Ankle, and Above Ankle add-ons require a Mehendi hand design and can't be booked on their own.",
+        });
+      }
+
       // Pricing is ALWAYS taken from the server-side Service record — same
       // rule as the multi-service flow. This path previously hardcoded ₹500,
       // which let a replayed legacy-format request book ANY service at a flat
@@ -583,9 +709,6 @@ exports.createBooking = async (req, res) => {
           message: `Invalid price configured for service: ${legacyService._id}`,
         });
       }
-      const legacyDuration =
-        Number(legacyService.duration) > 0 ? Number(legacyService.duration) : 60;
-
       bookingServices.push({
         serviceId: legacyService._id,
         name: legacyService.name,
@@ -602,7 +725,6 @@ exports.createBooking = async (req, res) => {
 
       baseAmount = legacyPrice;
       finalPrimaryService = serviceId;
-      totalDurationMinutes = legacyDuration;
 
       // Same cancellation-tier snapshot rule as the multi-service flow.
       if (
@@ -611,6 +733,7 @@ exports.createBooking = async (req, res) => {
       ) {
         allServiceCancellationTiers.push(legacyService.cancellationTiers);
       }
+      collectCancellationGrace(legacyService);
     }
 
     else {
@@ -694,19 +817,20 @@ exports.createBooking = async (req, res) => {
 
     const scheduledStartAt = buildDateTime(scheduledDate, scheduledTime);
 
-    // Use the AC capacity ceiling for air-conditioning jobs; 240 min for everything else.
-    const allCategories = [
+    // Elapsed duration is team-aware: for AC/mehendi the shared packer's
+    // makespan applies (multiple partners work in parallel, so the visit is
+    // as long as the longest single partner's share, not the sum of all
+    // service durations). Other categories keep the summed duration.
+    // isACCategory is token-aware — the old raw substring match on "ac" also
+    // matched names like "Face pack" ("pack" ⊃ "ac").
+    const isAC = [
       serviceCategory,
       ...bookingServices.map((s) => s.category),
       ...bookingServices.map((s) => s.name),
-    ].map((v) => String(v || "").toLowerCase());
-    const isAC = AC_CATEGORY_SLUGS.some((slug) =>
-      allCategories.some((c) => c.includes(slug))
-    );
-    const maxDurationMinutes = isAC ? AC_MAX_CAPACITY_MINUTES : 240;
-    const estimatedDurationMinutes = Math.min(
-      Math.max(totalDurationMinutes || 60, 1),
-      maxDurationMinutes
+    ].some((v) => isACCategory(String(v || "")));
+    const estimatedDurationMinutes = await calculateDurationForServices(
+      bookingServices,
+      { isAC }
     );
 
     const scheduledEndAt = new Date(
@@ -721,6 +845,19 @@ exports.createBooking = async (req, res) => {
     // Compute cancellation tiers snapshot — most lenient refundPercent at each threshold
     // across all booked services. Falls back to [] (global defaults apply at cancel time).
     const cancellationTiersSnapshot = mergeCancellationTiers(allServiceCancellationTiers);
+
+    // Grace-period free-cancel deadline: an order placed with less notice than
+    // graceLeadThresholdHours starts inside a low/zero refund tier through no
+    // fault of the customer — give them graceWindowMinutes from NOW to cancel
+    // at 100% (checked ahead of the tiers in cancelBookingByUser).
+    let freeCancelUntil = null;
+    if (graceWindowMinutes > 0) {
+      const leadHoursAtBooking =
+        (scheduledStartAt.getTime() - Date.now()) / (1000 * 60 * 60);
+      if (leadHoursAtBooking < graceLeadThresholdHours) {
+        freeCancelUntil = new Date(Date.now() + graceWindowMinutes * 60 * 1000);
+      }
+    }
 
     const bookingPayload = {
       user: req.user._id,
@@ -772,8 +909,34 @@ exports.createBooking = async (req, res) => {
             refundPercent: Number(t.refundPercent),
           }))
         : [],
+      freeCancelUntil,
     };
 
+    // PHASE A — expensive per-window eligibility reads + fast availability
+    // precheck, OUTSIDE the transaction. A full slot 409s here without ever
+    // opening a transaction or inserting a Booking row. The payload has every
+    // field the snapshot path reads, so no created document is needed yet.
+    // Oversell safety does not depend on this precheck — commitSlotReservation
+    // re-checks reservedUnits atomically at write time.
+    let preparedReservation;
+    try {
+      preparedReservation = await prepareSlotReservation(bookingPayload);
+    } catch (prepareError) {
+      const code = prepareError?.statusCode || 500;
+      if (code !== 409) console.error("Booking reservation precheck error:", prepareError);
+      return res.status(code).json({
+        success: false,
+        message:
+          code === 409
+            ? prepareError.message || "Selected slot is no longer available"
+            : prepareError.message || "Booking creation failed",
+      });
+    }
+
+    // PHASE B — transaction holds only fast atomic writes: Booking insert,
+    // guarded $inc per slot window, SlotLock insert, Booking update. Keeping it
+    // this small shrinks the write-conflict window when many customers race
+    // for the same slot.
     const session = await mongoose.startSession();
     let booking = null;
 
@@ -782,7 +945,7 @@ exports.createBooking = async (req, res) => {
         const [createdBooking] = await Booking.create([bookingPayload], { session });
         booking = createdBooking;
 
-        const reservation = await reserveSlotCapacityForBooking(booking, { session });
+        const reservation = await commitSlotReservation(booking, preparedReservation, { session });
         booking.slotLockId = reservation.lock._id;
         booking.slotReservationUnits = reservation.requiredCount;
         booking.slotReservationExpiresAt = reservation.expiresAt;
@@ -932,9 +1095,24 @@ exports.markOnTheWay = async (req, res) => {
       // ETA is best-effort; partner can still proceed without it
     }
 
-    booking.status = "ON_THE_WAY";
-    booking.estimatedArrivalAt = estimatedArrivalAt;
-    await booking.save();
+    // ATOMIC, guarded on the status we validated above — a full-doc save here
+    // could overwrite a concurrent transition (cancel, reassignment) with
+    // stale state. Same pattern as markArrived/startService.
+    const updated = await Booking.findOneAndUpdate(
+      { _id: booking._id, status: { $in: ["PARTNER_ACCEPTED", "CONFIRMED"] } },
+      {
+        $set: {
+          status: "ON_THE_WAY",
+          onTheWayAt: new Date(),
+          estimatedArrivalAt,
+        },
+      },
+      { new: true }
+    );
+
+    if (!updated) {
+      return res.status(409).json({ message: "Booking status changed concurrently — please refresh" });
+    }
 
     // Notify user with ETA only.
     if (global.io) {
@@ -1043,6 +1221,18 @@ const CUSTOMER_FAULT_ISSUE_TYPES = ["CUSTOMER_NOT_AVAILABLE", "CUSTOMER_ASKED_LA
 // verification feature flag.
 const CUSTOMER_PARTNER_FIELDS = "name phone rating selfieUrl selfieVerificationStatus";
 
+// Booking statuses during which a customer may fetch the assigned partner's
+// live GPS. Anything terminal (COMPLETED / CANCELLED) or pre-assignment is
+// excluded so partner location can't be tracked outside an active job.
+const LIVE_LOCATION_TRACKABLE_STATUSES = new Set([
+  "ASSIGNED",
+  "CONFIRMED",
+  "PARTNER_ACCEPTED",
+  "ON_THE_WAY",
+  "ARRIVED",
+  "IN_PROGRESS",
+]);
+
 // Only expose the selfie to the customer once the admin has verified it — they
 // should never match against an unverified/rejected photo. Mutates the lean
 // partner object in place (blanks the URL; keeps the status for the UI badge).
@@ -1059,6 +1249,29 @@ function gateBookingSelfies(booking) {
   if (Array.isArray(booking.additionalPartners)) {
     booking.additionalPartners.forEach(gateSelfieForCustomer);
   }
+  return booking;
+}
+
+// Strip ops/partner-internal fields from a lean booking before it ships in a
+// customer-facing response. Customer read endpoints (getBookingById,
+// getMyBookings) previously returned the raw document, leaking the assignment
+// audit (candidate partner ids/scores/distances), rejected-partner ids, the
+// partner's private on-site notes to ops, and the admin-review job-spot selfie
+// + its GPS. serviceStartCode is deliberately KEPT — the customer reads it to
+// the partner to start the job. Mutates and returns the lean object in place.
+function sanitizeBookingForCustomer(booking) {
+  if (!booking) return booking;
+  delete booking.assignmentAudit;
+  delete booking.rejectedPartners;
+  delete booking.partnerCancellations;
+  delete booking.partnerReports;
+  delete booking.standbyPartners;
+  delete booking.startSelfieUrl;
+  delete booking.startSelfieLocation;
+  delete booking.startSelfieDistanceMeters;
+  delete booking.startSelfieFlagged;
+  if (booking.payment) delete booking.payment.razorpay_signature;
+  if (booking.estimatePayment) delete booking.estimatePayment.razorpay_signature;
   return booking;
 }
 
@@ -1302,6 +1515,7 @@ exports.startService = async (req, res) => {
       {
         $set: {
           status: "IN_PROGRESS",
+          inProgressAt: new Date(),
         }
       },
       { new: true }
@@ -1415,9 +1629,14 @@ exports.completeBooking = async (req, res) => {
         // calls from the same partner therefore can't both pass — only the
         // first flips the element and proceeds. The loser 409s, but the
         // wallet stays correct because the credit above is idempotent.
+        // status: "IN_PROGRESS" is also required so a booking cancelled
+        // concurrently (e.g. an admin force-cancel between our read and here)
+        // can't have an allocation marked COMPLETED under it — the update
+        // no-ops and this call 409s instead.
         const arrayUpdate = await Booking.findOneAndUpdate(
           {
             _id: bookingId,
+            status: "IN_PROGRESS",
             teamAllocations: { $elemMatch: { partnerId, status: { $ne: "COMPLETED" } } },
           },
           { $set: { "teamAllocations.$.status": "COMPLETED", "teamAllocations.$.completedAt": new Date() } },
@@ -1591,11 +1810,20 @@ exports.completeBooking = async (req, res) => {
 /* =======================
    PARTNER CANCELS BOOKING
    (MAX 5 PER ROLLING WEEK + AUTO-SUSPEND AT LIMIT)
-   Special case: cancelling from ARRIVED status closes the booking entirely
-   (no reassignment) and charges a penalty — partner arrived but walked away.
+   Special case: a CUSTOMER-FAULT cancel from ARRIVED status closes the booking
+   entirely (no reassignment, no refund) and charges the partner the arrived
+   penalty. A partner-fault cancel at ARRIVED (vehicle breakdown, health issue…)
+   is a normal voluntary cancel: the booking is released for reassignment so
+   the paying customer isn't stripped of their money for the partner's own
+   emergency.
 ======================= */
-const PARTNER_WEEKLY_CANCEL_LIMIT = 5;
-const PARTNER_DAILY_CANCEL_LIMIT  = 1;
+const {
+  PARTNER_DAILY_CANCEL_LIMIT,
+  PARTNER_WEEKLY_CANCEL_LIMIT,
+  checkStrikeAllowance,
+  recordPartnerStrike,
+  removeTeamMemberFromBooking,
+} = require("../services/partnerLifecycle.service");
 
 const PARTNER_CANCEL_REASONS = [
   "Emergency / personal issue",
@@ -1604,6 +1832,16 @@ const PARTNER_CANCEL_REASONS = [
   "Location too far",
   "Job scope changed",
   "Health issue",
+];
+
+// Signals that the CUSTOMER is why the job can't proceed at the door. Only
+// these unlock the no-refund close path from ARRIVED: the "Customer not
+// reachable" cancel reason, or a previously filed customer-fault on-site
+// report (which is what the report-issue flow tells partners to do first).
+const CUSTOMER_FAULT_CANCEL_REASONS = ["Customer not reachable"];
+const ARRIVED_CUSTOMER_FAULT_REPORTS = [
+  ...CUSTOMER_FAULT_ISSUE_TYPES,
+  "CUSTOMER_NOT_REACHABLE",
 ];
 
 exports.cancelBooking = async (req, res) => {
@@ -1635,120 +1873,99 @@ exports.cancelBooking = async (req, res) => {
     const now = new Date();
 
     /* =====================
-       CANCEL STRIKES & RATE LIMITS — voluntary (non-ARRIVED) cancels only.
-
-       An ARRIVED cancel is a "customer refused / asked later" situation: it is
-       governed by the wallet penalty instead, so it must NOT consume the daily
-       quota, count toward weekly auto-suspension, or block a partner who is
-       stuck at a refusing customer's door (#5 — no double penalty).
-
-       For voluntary cancels we CHECK the limits up front (reject if over) but only
-       COMMIT the strike via commitCancelStrike() after the booking actually
-       transitions, so a lost race (the 409 paths below) never penalises the
-       partner for a cancellation that didn't happen (#4 — no charge on race).
+       ADDITIONAL TEAM MEMBER → REMOVE ONLY THEM
+       One member's exit must not release the whole team: previously this path
+       nulled the PRIMARY partner and reassigned everything, destroying a
+       confirmed team booking over one member's cancellation. The member is
+       removed, struck (voluntary-cancel limits apply), and ops is alerted to
+       arrange a replacement. The primary and the rest of the team keep the job.
     ===================== */
-    const isArrivedCancel = booking.status === "ARRIVED";
-    const todayStr = now.toISOString().slice(0, 10); // YYYY-MM-DD
-
-    // Default no-op (ARRIVED path); redefined below for voluntary cancels.
-    let commitCancelStrike = async () => {};
-
-    if (!isArrivedCancel) {
-      // ----- DAILY CANCEL LIMIT (1 per calendar day) — check only -----
-      const sameDay = partner.lastDailyCancelDate === todayStr;
-      if (sameDay && partner.dailyCancelCount >= PARTNER_DAILY_CANCEL_LIMIT) {
+    if (!isPrimary) {
+      const { dailyExceeded, weeklyExceeded } = checkStrikeAllowance(partner, now);
+      if (dailyExceeded) {
         return res.status(400).json({
           message: `You can only cancel ${PARTNER_DAILY_CANCEL_LIMIT} job per day. Try again tomorrow.`,
         });
       }
-
-      // ----- ROLLING 7-DAY WINDOW (auto-suspension) — check only -----
-      // Use epoch (0) as the safe default so a null lastCancelReset always triggers a reset,
-      // rather than comparing against NaN (which is what `new Date(null)` produces in some runtimes).
-      const lastReset = partner.lastCancelReset ? new Date(partner.lastCancelReset) : new Date(0);
-      const diffDays = (now.getTime() - lastReset.getTime()) / (1000 * 60 * 60 * 24);
-      const willResetWeek = diffDays >= 7;
-      const effectiveWeekly = willResetWeek ? 0 : (partner.weeklyCancelCount || 0);
-
-      if (effectiveWeekly >= PARTNER_WEEKLY_CANCEL_LIMIT) {
+      if (weeklyExceeded) {
         return res.status(400).json({
           message: `Weekly cancel limit reached (${PARTNER_WEEKLY_CANCEL_LIMIT} per week). Account suspended.`,
         });
       }
 
-      // Persist the strike + free load — only invoked after a successful transition.
-      // Uses a single atomic pipeline update (not read-modify-write) so two concurrent
-      // cancels by the same partner can't clobber each other's counter increments and
-      // dodge the daily/weekly limit or the weekly auto-suspension. The day/week reset is
-      // recomputed from the stored fields inside the update so it's race-safe.
-      commitCancelStrike = async () => {
-        const weekMs = 7 * 24 * 60 * 60 * 1000;
-        const weeklyResetCond = {
-          $gte: [
-            { $subtract: [now, { $ifNull: ["$lastCancelReset", new Date(0)] }] },
-            weekMs,
-          ],
-        };
-        const updated = await Partner.findOneAndUpdate(
-          { _id: partner._id },
-          [
-            {
-              $set: {
-                dailyCancelCount: {
-                  $cond: [
-                    { $eq: ["$lastDailyCancelDate", todayStr] },
-                    { $add: [{ $ifNull: ["$dailyCancelCount", 0] }, 1] },
-                    1,
-                  ],
-                },
-                lastDailyCancelDate: todayStr,
-                weeklyCancelCount: {
-                  $add: [
-                    { $cond: [weeklyResetCond, 0, { $ifNull: ["$weeklyCancelCount", 0] }] },
-                    1,
-                  ],
-                },
-                lastCancelReset: {
-                  $cond: [weeklyResetCond, now, { $ifNull: ["$lastCancelReset", now] }],
-                },
-              },
-            },
-            {
-              $set: {
-                isBlocked: {
-                  $cond: [
-                    { $gte: ["$weeklyCancelCount", PARTNER_WEEKLY_CANCEL_LIMIT] },
-                    true,
-                    "$isBlocked",
-                  ],
-                },
-              },
-            },
-          ],
-          { new: true }
-        );
+      const removal = await removeTeamMemberFromBooking(booking._id, partner._id, reason);
+      if (!removal.removed) {
+        return res.status(409).json({
+          success: false,
+          message: "Booking state changed during cancellation — please refresh",
+        });
+      }
 
+      const struck = await recordPartnerStrike(partner._id, { now });
+      return res.json({
+        success: true,
+        message: "You have been removed from this booking. Our team will arrange a replacement if needed.",
+        weeklyCancelCount: struck?.weeklyCancelCount ?? partner.weeklyCancelCount,
+      });
+    }
+
+    /* =====================
+       PRIMARY PARTNER — CLASSIFY THE CANCEL
+
+       Customer-fault at the door (ARRIVED + "Customer not reachable" reason, or
+       a previously filed customer-fault on-site report) closes the booking with
+       no refund and charges the wallet penalty instead of a strike — it must
+       NOT consume the daily quota or weekly suspension counter (no double
+       penalty for a partner stuck at a refusing customer's door).
+
+       Everything else — including partner-fault reasons at ARRIVED — is a
+       voluntary cancel: limits are CHECKED up front (reject if over) but the
+       strike is only COMMITTED via commitCancelStrike() after the booking
+       actually transitions, so a lost race never penalises the partner for a
+       cancellation that didn't happen.
+    ===================== */
+    const hasCustomerFaultReport = (booking.partnerReports || []).some((r) =>
+      ARRIVED_CUSTOMER_FAULT_REPORTS.includes(r.issueType)
+    );
+    const isCustomerFaultArrivedCancel =
+      booking.status === "ARRIVED" &&
+      (CUSTOMER_FAULT_CANCEL_REASONS.includes(reason) || hasCustomerFaultReport);
+
+    // Default no-op (customer-fault ARRIVED path); redefined for voluntary cancels.
+    let commitCancelStrike = async () => {};
+
+    if (!isCustomerFaultArrivedCancel) {
+      const { dailyExceeded, weeklyExceeded } = checkStrikeAllowance(partner, now);
+      if (dailyExceeded) {
+        return res.status(400).json({
+          message: `You can only cancel ${PARTNER_DAILY_CANCEL_LIMIT} job per day. Try again tomorrow.`,
+        });
+      }
+      if (weeklyExceeded) {
+        return res.status(400).json({
+          message: `Weekly cancel limit reached (${PARTNER_WEEKLY_CANCEL_LIMIT} per week). Account suspended.`,
+        });
+      }
+
+      commitCancelStrike = async () => {
+        const updated = await recordPartnerStrike(partner._id, { now });
         if (updated) {
           // Mirror the committed values onto the in-memory doc for the response below.
           partner.weeklyCancelCount = updated.weeklyCancelCount;
           partner.dailyCancelCount = updated.dailyCancelCount;
           partner.isBlocked = updated.isBlocked;
-          if (updated.weeklyCancelCount >= PARTNER_WEEKLY_CANCEL_LIMIT) {
-            console.warn(`[AUTO-SUSPEND] Partner ${partner._id} (${partner.name}) suspended after ${updated.weeklyCancelCount} weekly cancellations`);
-          }
         }
-
         await syncPartnerOperationalState(partner._id);
       };
     }
 
     /* =====================
-       ARRIVED → CANCEL OUTRIGHT + PENALTY
-       Partner arrived but walked away (customer refused or asked later).
-       No reassignment — the customer caused the situation, so the booking
-       is closed. Customer gets 0% refund; partner pays a penalty.
+       ARRIVED + CUSTOMER FAULT → CANCEL OUTRIGHT + PENALTY
+       Partner arrived but the customer refused / wasn't available. No
+       reassignment — the customer caused the situation, so the booking is
+       closed. Customer gets 0% refund; partner pays the arrived penalty.
     ===================== */
-    if (booking.status === "ARRIVED") {
+    if (isCustomerFaultArrivedCancel) {
       const cancelledBooking = await Booking.findOneAndUpdate(
         { _id: booking._id, status: "ARRIVED" },
         {
@@ -1871,11 +2088,16 @@ exports.cancelBooking = async (req, res) => {
     const releasedBooking = await Booking.findOneAndUpdate(
       {
         _id: booking._id,
-        status: { $in: ["ASSIGNED", "CONFIRMED", "PARTNER_ACCEPTED", "ON_THE_WAY"] },
+        // ARRIVED is included: a partner-fault cancel at the door (vehicle
+        // breakdown, health issue…) reassigns instead of closing the booking —
+        // only the customer-fault ARRIVED path above ends it with no refund.
+        status: { $in: ["ASSIGNED", "CONFIRMED", "PARTNER_ACCEPTED", "ON_THE_WAY", "ARRIVED"] },
       },
       {
         // autoRefundIfUnassigned: this is a partner cancellation — if reassignment
         // later exhausts, escalation should auto-cancel + refund (not park it on ops).
+        // additionalPartners/teamAllocations are NOT cleared here: reassignBooking
+        // owns the full team release (it clears and syncs every member).
         $set:  { status: "SEARCHING", partner: null, autoRefundIfUnassigned: true },
         $push: { partnerCancellations: { partner: partner._id, reason, cancelledAt: now } },
       },
@@ -2030,6 +2252,7 @@ exports.cancelBookingByUser = async (req, res) => {
     const hoursToService = (scheduledStart.getTime() - Date.now()) / (1000 * 60 * 60);
 
     let refund = { percent: 100, amount: 0 };
+    let graceApplied = false;
     if (booking.payment?.status === "PAID") {
       if (booking.status === "ARRIVED") {
         // The professional has already reached the customer's location. Cancelling
@@ -2044,6 +2267,17 @@ exports.cancelBookingByUser = async (req, res) => {
         // of rescheduling, they get a FULL refund with no late-cancellation penalty,
         // even though the original slot time has already passed (hoursToService < 0).
         refund = { percent: 100, amount: Number(booking.totalAmount || 0) };
+      } else if (
+        booking.freeCancelUntil &&
+        Date.now() <= new Date(booking.freeCancelUntil).getTime()
+      ) {
+        // Grace-period free cancel: the order was placed with little notice
+        // (freeCancelUntil is only set at creation when the lead time was
+        // under the service's grace threshold) and would otherwise start
+        // inside a low/zero refund tier the moment it was booked. Within the
+        // grace window the customer gets 100% back regardless of tier.
+        refund = { percent: 100, amount: Number(booking.totalAmount || 0) };
+        graceApplied = true;
       } else if (
         booking.cancellationPolicyTypeSnapshot === "SINCE_BOOKING" &&
         Array.isArray(booking.sinceBookingTiersSnapshot) &&
@@ -2091,16 +2325,18 @@ exports.cancelBookingByUser = async (req, res) => {
       });
     }
 
-    // Instant refund for the free-cancel window (cake orders cancelled within
-    // 1h of booking, 100% refund) — the customer shouldn't have to wait for
-    // manual back-office processing when they're getting their money back in
-    // full. Any other tier/percent still goes through the existing manual
-    // PENDING → back-office flow. Falls back to PENDING on any Razorpay error;
-    // the cancellation itself has already succeeded above regardless.
+    // Instant refund for the free-cancel window (cake orders cancelled inside
+    // their SINCE_BOOKING first tier or the grace-period window, 100% refund)
+    // — the customer shouldn't have to wait for manual back-office processing
+    // when they're getting their money back in full. Any other tier/percent
+    // still goes through the existing manual PENDING → back-office flow.
+    // Falls back to PENDING on any Razorpay error; the cancellation itself
+    // has already succeeded above regardless.
     if (
       refund.amount > 0 &&
       refund.percent === 100 &&
-      booking.cancellationPolicyTypeSnapshot === "SINCE_BOOKING" &&
+      (graceApplied ||
+        booking.cancellationPolicyTypeSnapshot === "SINCE_BOOKING") &&
       booking.payment?.razorpay_payment_id &&
       process.env.RAZORPAY_KEY_ID &&
       process.env.RAZORPAY_KEY_SECRET
@@ -2111,12 +2347,23 @@ exports.cancelBookingByUser = async (req, res) => {
           key_id: process.env.RAZORPAY_KEY_ID,
           key_secret: process.env.RAZORPAY_KEY_SECRET,
         });
-        await razorpay.payments.refund(booking.payment.razorpay_payment_id, {
-          amount: Math.round(refund.amount * 100),
-        });
+        const razorpayRefund = await razorpay.payments.refund(
+          booking.payment.razorpay_payment_id,
+          { amount: Math.round(refund.amount * 100) }
+        );
+        // Persist the refund id BEFORE flipping to PROCESSED: if this write
+        // is lost, back office retries a PENDING refund against Razorpay,
+        // which rejects the duplicate — the stored id makes reconciling that
+        // case a dashboard lookup instead of a support ticket.
         await Booking.updateOne(
           { _id: booking._id },
-          { $set: { refundStatus: "PROCESSED", refundProcessedAt: new Date() } }
+          {
+            $set: {
+              refundStatus: "PROCESSED",
+              refundProcessedAt: new Date(),
+              "payment.razorpay_refund_id": razorpayRefund?.id || null,
+            },
+          }
         );
         updatedBooking.refundStatus = "PROCESSED";
       } catch (refundErr) {
@@ -2152,6 +2399,29 @@ exports.cancelBookingByUser = async (req, res) => {
     // open. booking.partner is populated, so its fcmToken is available here.
     if (booking.partner?.fcmToken) {
       sendJobCancelledPush(booking.partner.fcmToken, booking._id.toString());
+    }
+
+    // Notify every ADDITIONAL team member too — previously only the primary
+    // partner was told, so a team-job's helpers/additional artists kept seeing
+    // a job the customer had already cancelled. additionalPartners is a raw
+    // ObjectId array (not populated above), so fcmTokens need a lookup.
+    if (booking.additionalPartners?.length) {
+      if (global.io) {
+        for (const pId of booking.additionalPartners) {
+          global.io.to(`partner_${pId}`).emit("booking_cancelled", {
+            bookingId: booking._id.toString(),
+            cancelledBy: "user",
+          });
+        }
+      }
+      const additionalPartnerDocs = await Partner.find({
+        _id: { $in: booking.additionalPartners },
+      })
+        .select("fcmToken")
+        .lean();
+      for (const p of additionalPartnerDocs) {
+        if (p.fcmToken) sendJobCancelledPush(p.fcmToken, booking._id.toString());
+      }
     }
 
     res.json({
@@ -2191,6 +2461,21 @@ exports.getPartnerLiveLocation = async (req, res) => {
       return res.status(403).json({
         success: false,
         message: "Unauthorized",
+      });
+    }
+
+    // Live location is only meaningful while a partner is actively assigned and
+    // heading to / working the job. Without this gate the partner reference
+    // persists on COMPLETED / CANCELLED bookings, so a past customer could poll
+    // this endpoint forever and keep receiving the partner's real-time GPS —
+    // effectively surveilling a gig worker they once booked. Terminal and
+    // pre-assignment statuses return no coordinates.
+    if (!LIVE_LOCATION_TRACKABLE_STATUSES.has(booking.status)) {
+      return res.json({
+        success: true,
+        hasPartner: false,
+        trackingAvailable: false,
+        message: "Live tracking is not available for this booking",
       });
     }
 
@@ -2248,10 +2533,15 @@ exports.getMyBookings = async (req, res) => {
     // both that row and its later system-cancelled form from My Bookings.
     // Paid bookings always show, including cancelled ones (they carry refund
     // info the customer needs); payment.status never leaves "PAID" once set.
+    // EXCEPTION: partner_onspot guest add-ons must stay visible while unpaid —
+    // they're partner-initiated requests awaiting the customer's approval &
+    // payment (PENDING_APPROVAL, and PENDING_PAYMENT after a dropped checkout
+    // the customer needs to retry). A declined one (CANCELLED, unpaid) is
+    // correctly hidden by the second clause.
     const visibleToCustomer = {
       user: req.user._id,
       $nor: [
-        { status: "PENDING_PAYMENT" },
+        { status: "PENDING_PAYMENT", origin: { $ne: "partner_onspot" } },
         { status: "CANCELLED", "payment.status": { $ne: "PAID" } },
       ],
     };
@@ -2269,6 +2559,7 @@ exports.getMyBookings = async (req, res) => {
     ]);
 
     bookings.forEach(gateBookingSelfies);
+    bookings.forEach(sanitizeBookingForCustomer);
 
     res.json({
       success: true,
@@ -2291,6 +2582,9 @@ exports.getActiveCart = async (req, res) => {
     const activeCart = await Booking.findOne({
       user: req.user._id,
       status: "PENDING_PAYMENT",
+      // Guest add-ons are partner-initiated requests with their own approval
+      // flow — they must not hijack the homescreen cart.
+      origin: { $ne: "partner_onspot" },
     })
       .populate("services.serviceId", "name imageUrl description price duration")
       .select("services baseAmount discountAmount totalAmount status");
@@ -2319,7 +2613,7 @@ exports.getEstimate = async (req, res) => {
     const booking = await Booking.findOne({
       _id: req.params.bookingId,
       user: req.user._id,
-    }).select("estimateItems estimateTotal estimateStatus estimateSubmittedAt");
+    }).select("estimateItems estimateTotal estimateStatus estimateSubmittedAt estimatePayment");
 
     if (!booking) return res.status(404).json({ success: false, message: "Booking not found" });
     if (booking.estimateStatus === "none" || !booking.estimateItems?.length) {
@@ -2342,6 +2636,9 @@ exports.getEstimate = async (req, res) => {
         totalAmount: estimatePricing.totalAmount,
         status: booking.estimateStatus,
         submittedAt: booking.estimateSubmittedAt,
+        // NONE = not yet paid (or pre-feature booking); PENDING/PAID/FAILED
+        // mirror estimatePayment. Clients use this to show the pay button.
+        paymentStatus: booking.estimatePayment?.status || "NONE",
       },
     });
   } catch (err) {
@@ -2371,15 +2668,31 @@ exports.respondToEstimate = async (req, res) => {
       return res.status(409).json({ success: false, message: "Estimate already responded to or not pending" });
     }
 
-    booking.estimateStatus = approved ? "approved" : "rejected";
-    if (approved) booking.estimateApprovedAt = new Date();
-    else booking.estimateRejectedAt = new Date();
-    await booking.save();
+    // Atomic, guarded on estimateStatus: "pending" so two concurrent responses
+    // (or a partner re-submitting the estimate at the same moment) can't
+    // last-write-win over each other — only the first flips it. A targeted
+    // $set also avoids the full-document save clobbering a concurrent partner
+    // lifecycle write on the same in-progress booking.
+    const now = new Date();
+    const updated = await Booking.findOneAndUpdate(
+      { _id: req.params.bookingId, user: req.user._id, estimateStatus: "pending" },
+      {
+        $set: {
+          estimateStatus: approved ? "approved" : "rejected",
+          ...(approved ? { estimateApprovedAt: now } : { estimateRejectedAt: now }),
+        },
+      },
+      { new: true }
+    );
+
+    if (!updated) {
+      return res.status(409).json({ success: false, message: "Estimate already responded to or not pending" });
+    }
 
     // Notify the partner in real time
-    if (global.io && booking.partner) {
-      global.io.to(`partner_${booking.partner}`).emit("estimate_response", {
-        bookingId: booking._id.toString(),
+    if (global.io && updated.partner) {
+      global.io.to(`partner_${updated.partner}`).emit("estimate_response", {
+        bookingId: updated._id.toString(),
         approved,
       });
     }
@@ -2393,6 +2706,195 @@ exports.respondToEstimate = async (req, res) => {
   } catch (err) {
     console.error("respondToEstimate error:", err);
     res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
+/* =====================================================
+   CREATE ESTIMATE PAYMENT ORDER
+   POST /api/booking/:bookingId/estimate/create-order
+   Collects the approved on-site estimate through Razorpay. This closes the
+   gap where an approved estimate was never charged: the partner did the extra
+   work, but no payment was ever collected or settled. A separate Razorpay
+   order from the main booking payment; totals (base + platform fee + GST) are
+   frozen on estimatePayment at order time. Mirrors the guest add-on flow.
+===================================================== */
+exports.createEstimateOrder = async (req, res) => {
+  try {
+    const booking = await Booking.findOne({
+      _id: req.params.bookingId,
+      user: req.user._id,
+    });
+    if (!booking) return res.status(404).json({ success: false, message: "Booking not found" });
+
+    if (booking.estimateStatus !== "approved" || !booking.estimateItems?.length) {
+      return res.status(400).json({
+        success: false,
+        message: "No approved estimate to pay for on this booking",
+      });
+    }
+    if (booking.estimatePayment?.status === "PAID") {
+      return res.status(400).json({ success: false, message: "Estimate already paid" });
+    }
+    // Pay while the technician is still on the job — after completion the
+    // settlement has already been computed, so the estimate can no longer ride it.
+    if (booking.status !== "IN_PROGRESS") {
+      return res.status(400).json({
+        success: false,
+        message: "The estimate can only be paid while the service is in progress",
+      });
+    }
+
+    const settings = await AdminSetting.findOne().lean();
+    if (settings?.emergencyLockdown || settings?.paymentsFreezed) {
+      return res.status(503).json({
+        success: false,
+        message: settings?.emergencyLockdown
+          ? "Service temporarily unavailable. Please try again later."
+          : "Payments are temporarily frozen. Please try again later.",
+      });
+    }
+    if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) {
+      return res.status(500).json({ success: false, message: "Razorpay not configured" });
+    }
+
+    const pricingSettings = await getPricingSettings();
+    const pricing = calculatePricing({
+      baseAmount: booking.estimateTotal,
+      pricing: pricingSettings,
+    });
+    if (!(Number(pricing.totalAmount) > 0)) {
+      return res.status(400).json({ success: false, message: "Estimate amount is not payable" });
+    }
+
+    const Razorpay = require("razorpay");
+    const razorpay = new Razorpay({
+      key_id: process.env.RAZORPAY_KEY_ID,
+      key_secret: process.env.RAZORPAY_KEY_SECRET,
+    });
+    const order = await razorpay.orders.create({
+      amount: Math.round(Number(pricing.totalAmount) * 100),
+      currency: "INR",
+      receipt: `estimate_${booking._id}`,
+    });
+
+    // Targeted update — a full-doc save here could clobber concurrent partner
+    // lifecycle writes on the same in-progress booking.
+    await Booking.updateOne(
+      { _id: booking._id },
+      {
+        $set: {
+          estimatePayment: {
+            razorpay_order_id: order.id,
+            razorpay_payment_id: null,
+            razorpay_signature: null,
+            status: "PENDING",
+            paidAt: null,
+            baseAmount: pricing.baseAmount,
+            platformFeeAmount: pricing.platformFeeAmount,
+            gstAmount: pricing.gstAmount,
+            totalAmount: pricing.totalAmount,
+          },
+        },
+      }
+    );
+
+    return res.json({
+      success: true,
+      order: { ...order, key_id: process.env.RAZORPAY_KEY_ID },
+      estimate: {
+        items: booking.estimateItems,
+        baseAmount: pricing.baseAmount,
+        platformFeeAmount: pricing.platformFeeAmount,
+        gstAmount: pricing.gstAmount,
+        totalAmount: pricing.totalAmount,
+      },
+    });
+  } catch (err) {
+    console.error("createEstimateOrder error:", err);
+    return res.status(500).json({ success: false, message: "Payment order failed" });
+  }
+};
+
+/* =====================================================
+   VERIFY ESTIMATE PAYMENT
+   POST /api/booking/:bookingId/estimate/verify
+   Same signature + order-binding rules as the main verify endpoint; the
+   Razorpay webhook (estimatePayment order lookup) is the server-side backstop
+   if this client call is lost. Idempotent via the PAID guard.
+===================================================== */
+exports.verifyEstimatePayment = async (req, res) => {
+  try {
+    const { razorpay_payment_id, razorpay_order_id, razorpay_signature } = req.body;
+    if (!razorpay_payment_id || !razorpay_order_id || !razorpay_signature) {
+      return res.status(400).json({ success: false, message: "Payment verification data missing" });
+    }
+
+    const booking = await Booking.findOne({
+      _id: req.params.bookingId,
+      user: req.user._id,
+    });
+    if (!booking) return res.status(404).json({ success: false, message: "Booking not found" });
+
+    if (booking.estimatePayment?.status === "PAID") {
+      return res.json({ success: true, message: "Payment already verified", bookingId: booking._id });
+    }
+
+    // Order binding — the submitted order must be the one we created for THIS
+    // booking's estimate, so a valid signature from a cheaper order can't mark
+    // this estimate paid.
+    const expectedOrderId = booking.estimatePayment?.razorpay_order_id;
+    if (!expectedOrderId || String(razorpay_order_id) !== String(expectedOrderId)) {
+      return res.status(400).json({ success: false, message: "Payment does not match this estimate" });
+    }
+
+    if (!process.env.RAZORPAY_KEY_SECRET) {
+      return res.status(500).json({ success: false, message: "Payment gateway not configured" });
+    }
+
+    const crypto = require("crypto");
+    const expectedSignature = crypto
+      .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
+      .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+      .digest("hex");
+    const expectedBuf = Buffer.from(expectedSignature);
+    const providedBuf = Buffer.from(String(razorpay_signature));
+    const signatureValid =
+      expectedBuf.length === providedBuf.length &&
+      crypto.timingSafeEqual(expectedBuf, providedBuf);
+
+    if (!signatureValid) {
+      await Booking.updateOne(
+        { _id: booking._id, "estimatePayment.status": { $ne: "PAID" } },
+        { $set: { "estimatePayment.status": "FAILED" } }
+      );
+      return res.status(400).json({ success: false, message: "Invalid payment signature" });
+    }
+
+    // ATOMIC: only the first caller (client verify OR webhook) flips to PAID.
+    const updated = await Booking.findOneAndUpdate(
+      { _id: booking._id, "estimatePayment.status": { $ne: "PAID" } },
+      {
+        $set: {
+          "estimatePayment.status": "PAID",
+          "estimatePayment.razorpay_payment_id": razorpay_payment_id,
+          "estimatePayment.razorpay_signature": razorpay_signature,
+          "estimatePayment.paidAt": new Date(),
+        },
+      },
+      { new: true }
+    );
+
+    // Tell the on-site partner the extra work is paid for.
+    if (updated && global.io && updated.partner) {
+      global.io.to(`partner_${updated.partner}`).emit("estimate_paid", {
+        bookingId: updated._id.toString(),
+      });
+    }
+
+    return res.json({ success: true, message: "Payment verified", bookingId: booking._id });
+  } catch (err) {
+    console.error("verifyEstimatePayment error:", err);
+    return res.status(500).json({ success: false, message: "Payment verification failed" });
   }
 };
 
@@ -2422,6 +2924,10 @@ exports.getBookingById = async (req, res) => {
         .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0];
       if (latest) booking.partnerReportedIssue = latest.issueType;
     }
+
+    // Strip internal fields AFTER deriving partnerReportedIssue above (which
+    // reads partnerReports — one of the fields this removes).
+    sanitizeBookingForCustomer(booking);
 
     return res.json({ success: true, booking });
   } catch (err) {

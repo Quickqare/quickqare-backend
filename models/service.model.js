@@ -85,6 +85,25 @@ const serviceSchema = new mongoose.Schema(
       min: 0,
     },
 
+    // Explicit pricing rule for services with non-linear package pricing
+    // (mehendi hand tiers). When set, booking pricing uses it directly;
+    // when null, the legacy service-NAME matching in utils/pricing.js
+    // applies — which silently stops working if the service is renamed.
+    // Keep the enum in sync with DEFAULT_MEHENDI_HANDS_PRICING keys.
+    pricingRuleKey: {
+      type: String,
+      enum: [
+        null,
+        "mehendi_minimal_hands",
+        "mehendi_palm_length_hands",
+        "mehendi_bangle_length_hands",
+        "mehendi_mid_length_hands",
+        "mehendi_elbow_bridal_hands",
+        "mehendi_above_elbow_bridal_hands",
+      ],
+      default: null,
+    },
+
     commissionPercent: {
       type: Number,
       default: 20,
@@ -129,6 +148,19 @@ const serviceSchema = new mongoose.Schema(
       default: [],
     },
 
+    // Grace-period override for last-minute advance orders (cakes). An order
+    // PLACED with less than appliesBelowLeadHours of notice before its
+    // scheduled start lands inside a low/zero refund tier the moment it's
+    // booked; this gives the customer windowMinutes from booking creation to
+    // cancel for a 100% refund before the normal tiers take over.
+    // windowMinutes = 0 disables the grace entirely.
+    // appliesBelowLeadHours = 0 (with windowMinutes > 0) applies the grace to
+    // every order regardless of notice.
+    cancellationGrace: {
+      windowMinutes:         { type: Number, default: 0, min: 0 },
+      appliesBelowLeadHours: { type: Number, default: 0, min: 0 },
+    },
+
     /* =====================
        CUSTOMIZATION (per-order options, e.g. cakes)
        Base price = 1-tier cake with the cheapest flavour delta.
@@ -167,6 +199,11 @@ const serviceSchema = new mongoose.Schema(
       },
       nameOnCakeEnabled: { type: Boolean, default: true },
 
+      // Every cake can be made with or without egg — this is the customer's
+      // per-order choice, distinct from the `isEggless` flag below (which
+      // marks a listing as egg-free only, e.g. "Eggless Special Cake").
+      egglessPriceDelta: { type: Number, default: 0, min: 0 },
+
       // Per-section admin toggles — when false the customer can't pick that
       // option for this cake (section hidden client-side, mismatching values
       // rejected server-side). Flavours stay configured even when selection
@@ -177,6 +214,7 @@ const serviceSchema = new mongoose.Schema(
       tiersEnabled:          { type: Boolean, default: true },
       addonsEnabled:         { type: Boolean, default: true },
       referencePhotoEnabled: { type: Boolean, default: true },
+      egglessOptionEnabled:  { type: Boolean, default: true },
     },
 
     // Ingredients shown to the customer (e.g. cakes).
@@ -250,6 +288,45 @@ const serviceSchema = new mongoose.Schema(
       type: Number, // minutes
       default: 60,
       min: 1,
+    },
+
+    // LEARNED duration — the nightly learnServiceDurations cron blends the
+    // real on-site time (inProgressAt -> completedAt) of completed bookings
+    // into this via EWMA. The team packer prefers it over the admin-entered
+    // `duration`, but always CLAMPED to +/-40% of `duration` so one bad
+    // timestamp can never wreck slot capacity or team sizing. null until the
+    // cron has enough samples; falls back to `duration` cleanly.
+    learnedDurationMinutes: {
+      type: Number,
+      default: null,
+    },
+
+    learnedDurationSamples: {
+      type: Number,
+      default: 0,
+    },
+
+    // Minimum partner skill tier required to perform this service (AC only).
+    // 1 = serviceman (cleaning/filter wash), 2 = technician (gas refill,
+    // repair, install/uninstall). Matches Partner.skillTier collected at
+    // signup — the assignment engine blocks partners below this tier.
+    skillTier: {
+      type: Number,
+      default: 1,
+      min: 1,
+      max: 2,
+    },
+
+    // How the team-sizing packer treats this service (mehendi only).
+    // BRIDAL      = dedicated 2-artist allocation per bride
+    // HAND        = guest hand work, pairable with a feet add-on
+    // FEET_ADDON  = feet add-on merged onto a hand task (same guest)
+    // INDEPENDENT = standalone task (guest mehendi, long leg work)
+    // null        = not applicable / fall back to name-based detection.
+    packingRole: {
+      type: String,
+      enum: ["BRIDAL", "HAND", "FEET_ADDON", "INDEPENDENT", null],
+      default: null,
     },
 
     /* =====================

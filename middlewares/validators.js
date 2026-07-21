@@ -99,8 +99,8 @@ exports.createBookingValidator = [
 
   body("services.*.quantity")
     .optional()
-    .isInt({ min: 1 })
-    .withMessage("quantity must be at least 1"),
+    .isInt({ min: 1, max: 50 })
+    .withMessage("quantity must be between 1 and 50"),
 
   body("services.*.price")
     .optional()

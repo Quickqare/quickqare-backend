@@ -56,12 +56,20 @@ module.exports = async (req, res, next) => {
 
     /* =====================
        ROLE CHECK (SAFE)
+       Current user tokens are signed { id, role: "user" }. Legacy tokens
+       predate the role claim and carry only { userId } (no id) — still honored
+       until they age out (90-day TTL). Everything else is rejected: a role that
+       isn't "user", OR a role-less { id } token (which no current signer issues)
+       — so a non-user token signed with JWT_SECRET can't slip through as a user.
     ===================== */
-    if (decoded.role && decoded.role !== "user") {
-      return res.status(403).json({
-        success: false,
-        message: "User access required",
-      });
+    if (decoded.role !== "user") {
+      const isLegacyUserToken = !decoded.role && !decoded.id && decoded.userId;
+      if (!isLegacyUserToken) {
+        return res.status(403).json({
+          success: false,
+          message: "User access required",
+        });
+      }
     }
 
     /* =====================

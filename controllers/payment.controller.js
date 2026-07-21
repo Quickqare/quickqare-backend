@@ -77,18 +77,29 @@ exports.createOrder = async (req, res) => {
     }
 
     if (!booking.lockedUntil || new Date(booking.lockedUntil).getTime() <= Date.now()) {
-      await releaseSlotCapacityByBookingId(booking._id, {
-        releaseReason: "payment_order_expired",
-      });
-      booking.status = "CANCELLED";
-      booking.payment.status = "FAILED";
-      booking.cancelledBy = "system";
-      booking.cancelReason = "Payment lock expired before order creation";
-      booking.lockedUntil = null;
-      booking.slotReservationExpiresAt = null;
-      booking.slotLockId = null;
-      booking.slotReservationUnits = 0;
-      await booking.save();
+      // GUARDED cancel: only while the booking is still unpaid and awaiting
+      // payment. The old full-doc save could overwrite a payment that the
+      // webhook finalized between our read and this write. Release runs after
+      // (and only if) the cancel won, and it clears the slot fields itself.
+      const cancelled = await Booking.findOneAndUpdate(
+        { _id: booking._id, status: "PENDING_PAYMENT", "payment.status": { $ne: "PAID" } },
+        {
+          $set: {
+            status: "CANCELLED",
+            "payment.status": "FAILED",
+            cancelledBy: "system",
+            cancelledAt: new Date(),
+            cancelReason: "Payment lock expired before order creation",
+          },
+        },
+        { new: true }
+      );
+
+      if (cancelled) {
+        await releaseSlotCapacityByBookingId(booking._id, {
+          releaseReason: "payment_order_expired",
+        });
+      }
 
       return res.status(409).json({
         success: false,

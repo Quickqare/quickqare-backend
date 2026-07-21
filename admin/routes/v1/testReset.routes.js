@@ -3,19 +3,49 @@
  * Keeps: AdminUser, AdminSession, AdminSetting, Service, Category, SubCategory,
  *        Zone, Banner, Policy, Coupon, ReferralSettings, CatalogItem.
  *
- * Protected by:
+ * Protected by (defense in depth — this endpoint is irreversibly destructive):
  *   1. Admin JWT (authenticateAdmin middleware)
- *   2. Body must include { confirm: "RESET ALL DATA" }
+ *   2. SuperAdmin-only permission (authorize(SYSTEM_RESET)) — every other
+ *      destructive admin route is permission-gated; this one used to be gated
+ *      by authentication ALONE, so any admin (incl. SupportAdmin) could wipe
+ *      the whole database. It now requires SuperAdmin like the rest.
+ *   3. Blocked when NODE_ENV=production, unless ALLOW_TEST_RESET_IN_PRODUCTION
+ *      is explicitly set to "true" — a deliberate, greppable opt-in for the
+ *      one-time pre-launch cleanup, off by default so it can never fire by
+ *      accident on a live database.
+ *   4. Body must include { confirm: "RESET ALL DATA" }
  */
 
 const express = require("express");
 const authenticateAdmin = require("../../middleware/authenticateAdmin");
+const authorize = require("../../middleware/authorize");
 const audit = require("../../middleware/audit");
+const { PERMISSIONS } = require("../../constants/permissions");
 const { success, fail } = require("../../utils/response");
 
 const router = express.Router();
 
-router.use(authenticateAdmin);
+const IS_PRODUCTION = String(process.env.NODE_ENV || "").toLowerCase() === "production";
+const ALLOW_IN_PRODUCTION =
+  String(process.env.ALLOW_TEST_RESET_IN_PRODUCTION || "").toLowerCase() === "true";
+
+// Refuse to even reach the handler on a production deploy unless explicitly
+// opted in. Returns 403 with a clear code so a misfire is obvious in logs.
+function blockInProduction(req, res, next) {
+  if (IS_PRODUCTION && !ALLOW_IN_PRODUCTION) {
+    return fail(
+      res,
+      403,
+      "RESET_DISABLED_IN_PRODUCTION",
+      "Test data reset is disabled in production. Set ALLOW_TEST_RESET_IN_PRODUCTION=true to enable it deliberately.",
+      null,
+      { requestId: req.requestId }
+    );
+  }
+  return next();
+}
+
+router.use(authenticateAdmin, authorize(PERMISSIONS.SYSTEM_RESET), blockInProduction);
 
 router.post("/", audit("admin.test_reset"), async (req, res) => {
   try {
