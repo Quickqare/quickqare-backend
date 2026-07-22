@@ -3,25 +3,17 @@ services:
     build: .
     env_file: .env
     environment:
-      # Calendar-day logic (cake lead times, baker daily caps) assumes IST.
-      # Set here (not only in the image) so it survives a base-image change
-      # and overrides any stray TZ in .env.
       - TZ=Asia/Kolkata
-    ports:
-      # Bind to loopback ONLY. nginx (on the host) reverse-proxies to
-      # 127.0.0.1:4000 and terminates TLS + sets the security headers. Publishing
-      # on 0.0.0.0 would expose the raw Node app to the internet on :4000,
-      # bypassing TLS, helmet headers, and the maintenance page. If you ever run
-      # nginx in another container/host, put both on a shared Docker network and
-      # proxy by service name instead of re-opening this to 0.0.0.0.
-      - "127.0.0.1:4000:4000"
+    network_mode: host
+    # Host networking: Mongo runs as a replica set on 127.0.0.1 (mongoose
+    # connects with directConnection=true). Under bridge networking, 127.0.0.1
+    # inside the container is the container itself, not the host, so the
+    # connection breaks. Host mode fixes that. SECURITY: this bypasses
+    # Docker's own loopback-only port binding, so ufw is the real boundary —
+    # never open 4000 there.
     restart: unless-stopped
-    # Cap container logs. Without this, Docker's default json-file driver keeps
-    # every winston line forever and eventually fills the droplet disk (which
-    # takes the app — and a co-located Mongo — down). Keep the last ~50MB.
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "5"
-
