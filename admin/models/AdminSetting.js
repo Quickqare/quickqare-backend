@@ -191,6 +191,16 @@ const adminSettingSchema = new mongoose.Schema(
       twitter:   { type: String, default: "" }, // X (formerly Twitter)
       youtube:   { type: String, default: "" },
     },
+
+    /* =============================================
+       CONTACT US
+       Shown on the web/app "Contact Us" page. Empty
+       string = that field is hidden on the client.
+    ============================================= */
+    contactInfo: {
+      email: { type: String, default: "" },
+      phone: { type: String, default: "" },
+    },
   },
   { timestamps: true }
 );

@@ -192,6 +192,49 @@ exports.mapsLimiter = rateLimit({
 });
 
 /* =====================================================
+   PARTNER LEAD LIMITER (REGISTER-AS-A-PROFESSIONAL FORM)
+   POST /api/partner-leads is public (no auth — a prospect isn't a user
+   yet) and just writes one document, so it needs its own ceiling rather
+   than relying on the loose global floor. Keyed per IP AND per phone: IP
+   stops a scripted flood, phone stops one number being resubmitted
+   (accidental double-taps or a deliberate callback-queue spam).
+===================================================== */
+exports.partnerLeadLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 5, // per IP
+
+  standardHeaders: true,
+  legacyHeaders: false,
+
+  handler: (req, res) => {
+    res.status(429).json({
+      success: false,
+      message: "Too many requests. Please try again later.",
+    });
+  },
+});
+
+exports.partnerLeadPhoneLimiter = rateLimit({
+  windowMs: 24 * 60 * 60 * 1000, // 24 hours
+  max: 1, // one submission per phone per day — resubmitting won't speed up a callback
+
+  standardHeaders: true,
+  legacyHeaders: false,
+
+  keyGenerator: (req) => {
+    const phone = String(req.body?.phone || "").replace(/\D/g, "");
+    return phone ? `partner-lead:${phone}` : ipKeyGenerator(req);
+  },
+
+  handler: (req, res) => {
+    res.status(429).json({
+      success: false,
+      message: "We already have your number — our team will call you soon.",
+    });
+  },
+});
+
+/* =====================================================
    PER-PHONE LOGIN LIMITER (PARTNER PASSWORD LOGIN)
    authLimiter is IP-keyed, so an attacker rotating IPs
    could grind one account's password indefinitely. This

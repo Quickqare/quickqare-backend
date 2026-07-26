@@ -1,14 +1,15 @@
 const DEFAULT_POLICY_CONTENTS = {
   about: {
     title: "About Us",
-    content: `QuickQare connects customers with trusted home service partners for AC, mehendi, plumbing, and other supported services in eligible pin codes.
+    content: `QuickQare connects customers with trusted home service partners for AC repair, plumbing, mehendi, celebration cakes, and other supported services in eligible pin codes.
 
 What you can do in the app:
 1. Browse services by category and subcategory.
 2. Check availability for your area before booking.
-3. Book securely and pay through the app.
-4. Track booking status and partner assignment.
-5. Read terms, privacy policy, and refund rules anytime.
+3. For made-to-order items like celebration cakes, customize flavour, size, and personalization before booking.
+4. Book securely and pay through the app.
+5. Track booking status and partner assignment.
+6. Read terms, privacy policy, and refund rules anytime.
 
 Our goal is to make home service booking simple, transparent, and reliable for customers while giving verified partners a clear platform to receive jobs.`,
   },
@@ -16,7 +17,7 @@ Our goal is to make home service booking simple, transparent, and reliable for c
     title: "Terms & Conditions",
     content: `Welcome to QuickQare.
 
-QuickQare is a home services platform that helps customers book service professionals for services such as AC, mehendi, plumbing, and other supported categories in eligible pin code areas.
+QuickQare is a home services platform that helps customers book service professionals for services such as AC repair, plumbing, mehendi, celebration cakes, and other supported categories in eligible pin code areas.
 
 By using the app, you agree to the following:
 1. You will provide accurate personal, address, and booking information.
@@ -26,6 +27,7 @@ By using the app, you agree to the following:
 5. You must not misuse the platform, create fake bookings, or interfere with service execution.
 6. QuickQare may suspend or block accounts involved in fraud, abuse, repeated cancellations, or policy violations.
 7. Customer and partner data is used only to provide the booking and support experience.
+8. Celebration (cake) orders are made to order and may require advance booking. Once you confirm customization details — flavour, size, tier, eggless option, name, or a reference photo — they are locked in for preparation and generally cannot be changed close to the delivery time. See the Cancellation & Refund Policy for cake-specific timelines.
 
 QuickQare may update these terms when needed. Continued use of the app means you accept the updated terms.`,
   },
@@ -38,6 +40,7 @@ What we collect:
 2. Address, pin code, booking history, and service preferences.
 3. Payment status and transaction references from the payment gateway.
 4. Device and app data needed for login, notifications, and service delivery.
+5. For celebration/cake orders: your flavour, size, and design choices, any personalization text (e.g. a name on the cake), and any reference photo you upload — used only to prepare your order and shared only with the assigned baker.
 
 How we use it:
 1. To create and manage your account.
@@ -55,6 +58,30 @@ QuickQare may use messaging, maps, cloud storage, and payment providers to compl
 
 If you have a privacy concern, contact support through the app or admin panel.`,
   },
+  anti_discrimination: {
+    title: "Anti-discrimination Policy",
+    content: `QuickQare is committed to a platform where every customer and every service partner is treated with dignity and respect, regardless of who they are.
+
+1. Our commitment
+   QuickQare does not tolerate discrimination on the basis of religion, caste, gender, gender identity or expression, sexual orientation, disability, pregnancy, marital status, age, region, language, or physical appearance. This applies to how customers treat partners, how partners treat customers, and how QuickQare itself operates the platform.
+
+2. For customers
+   You may not refuse a service, request a specific partner, cancel a booking, or leave a rating on the basis of a partner's religion, caste, gender, disability, or any other protected characteristic. Booking requests or reviews that explicitly ask for or penalise a partner on these grounds will be removed, and repeat violations may result in account suspension.
+
+3. For service partners
+   Partners must treat every customer with courtesy regardless of their background. Refusing a job, providing lower-quality service, or behaving disrespectfully toward a customer on discriminatory grounds is a serious violation of the Partner Terms & Conditions and may result in suspension or permanent removal from the platform.
+
+4. How QuickQare assigns jobs
+   Job assignment is driven by service category, location, availability, and partner rating — never by a customer's or partner's protected characteristics. QuickQare does not collect or use religion, caste, or similar data in its matching or ranking logic.
+
+5. Reporting a concern
+   If you experience or witness discriminatory behaviour on the platform, please report it through the Complaints section of the app or by contacting support with the booking details. Every report is reviewed, and confirmed violations are acted on — up to and including permanent account removal.
+
+6. Enforcement
+   QuickQare investigates reports in good faith and may request additional information from those involved. Retaliation against anyone who reports a concern in good faith is itself a violation of this policy.
+
+This policy applies to customers, service partners, and QuickQare staff, and may be updated from time to time. Continued use of the platform means you agree to uphold it.`,
+  },
   refund: {
     title: "Cancellation & Refund Policy",
     content: `Cancellation and refund rules for QuickQare:
@@ -68,7 +95,8 @@ If you have a privacy concern, contact support through the app or admin panel.`,
    - 1 to 4 hours before service: smaller partial refund may apply.
    - Less than 1 hour before service or after partner arrival: refund may be limited or not available depending on service progress.
 
-3. Cake and celebration orders (baked to order):
+3. Celebration (cake) orders — baked to order:
+   These follow a stricter, delivery-anchored timeline instead of the general rule above, because a customized cake (flavour, size, name, or photo) is baked specifically for you and cannot be resold or reused once preparation starts.
    - More than 48 hours before delivery: full refund.
    - 24 to 48 hours before delivery: 50% refund.
    - Less than 24 hours before delivery: no refund (baking has begun or the baker's slot cannot be refilled).

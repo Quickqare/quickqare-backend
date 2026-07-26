@@ -350,6 +350,8 @@ async function prepareSlotReservation(booking) {
 async function commitSlotReservation(booking, prepared, { session } = {}) {
   const { startAt, requiredCount, snapshots } = prepared;
   const reservedSlotKeys = [];
+  let lock;
+  let expiresAt;
 
   try {
     for (const snapshot of snapshots) {
@@ -379,11 +381,35 @@ async function commitSlotReservation(booking, prepared, { session } = {}) {
 
       reservedSlotKeys.push(snapshot.slotKey);
     }
+
+    // bookingId is unique in SlotLock — a rescheduled booking still owns its
+    // old (RELEASED) lock doc, so a plain create() here would E11000 and
+    // strand the units just incremented above. Upsert revives that same doc
+    // as the new live lock instead.
+    expiresAt = new Date(Date.now() + SLOT_LOCK_MINUTES * 60 * 1000);
+    lock = await SlotLock.findOneAndUpdate(
+      { bookingId: booking._id },
+      {
+        $set: {
+          bookingNumber: booking.bookingNumber || "",
+          pincode: String(booking.pincode || "").trim(),
+          dateKey: normalizeDateKey(startAt),
+          slotKeys: reservedSlotKeys,
+          units: requiredCount,
+          status: "PENDING_PAYMENT",
+          expiresAt,
+          releasedAt: null,
+          releaseReason: "",
+        },
+      },
+      { new: true, upsert: true, session }
+    );
   } catch (err) {
     // Sessionless callers (reschedule) have no transaction to roll back a
-    // partial multi-window reservation — undo any windows already incremented
-    // so a mid-loop 409 can't permanently leak reserved units. Transactional
-    // callers skip this: the aborting transaction reverts everything itself.
+    // partial reservation — undo any windows already incremented so a mid-loop
+    // 409 (or a lock-write failure) can't permanently leak reserved units.
+    // Transactional callers skip this: the aborting transaction reverts
+    // everything itself.
     if (!session && reservedSlotKeys.length) {
       for (const slotKey of reservedSlotKeys) {
         await SlotCapacity.updateOne(
@@ -394,23 +420,6 @@ async function commitSlotReservation(booking, prepared, { session } = {}) {
     }
     throw err;
   }
-
-  const expiresAt = new Date(Date.now() + SLOT_LOCK_MINUTES * 60 * 1000);
-  const [lock] = await SlotLock.create(
-    [
-      {
-        bookingId: booking._id,
-        bookingNumber: booking.bookingNumber || "",
-        pincode: String(booking.pincode || "").trim(),
-        dateKey: normalizeDateKey(startAt),
-        slotKeys: reservedSlotKeys,
-        units: requiredCount,
-        status: "PENDING_PAYMENT",
-        expiresAt,
-      },
-    ],
-    { session }
-  );
 
   await Booking.updateOne(
     { _id: booking._id },
@@ -466,8 +475,9 @@ async function releaseSlotCapacityByBookingId(
   // CLAIM FIRST: atomically flip the lock to RELEASED before touching counters.
   // Two concurrent releases for the same booking could both pass a read-then-
   // write check and double-decrement reservedUnits; only one can win this claim.
-  // Excluding RELEASED locks in the claim also keeps the reschedule case safe (a
-  // rescheduled booking can have an old RELEASED lock plus a live one).
+  // (bookingId is unique — a reschedule revives this same doc via upsert rather
+  // than creating a second one, so excluding RELEASED here also makes releasing
+  // an already-released lock a harmless no-op.)
   //
   // onlyIfPendingPayment restricts the claim to a still-unpaid lock. The expiry
   // cron uses it so it can never release a reservation the payment path has just

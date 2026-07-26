@@ -195,6 +195,25 @@ router.patch("/settings", audit("admin.settings.update"), async (req, res) => {
       settings.markModified("socialLinks");
     }
 
+    // Contact Us (web/app support page). Loosely validated — email format
+    // when present, phone left as free text since it may include a country
+    // code, extension, or WhatsApp-style formatting.
+    if (req.body.contactInfo !== undefined && typeof req.body.contactInfo === "object") {
+      const c = req.body.contactInfo;
+      const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (c.email !== undefined && c.email !== "" && !EMAIL_RE.test(String(c.email).trim())) {
+        return fail(res, 400, "VALIDATION_ERROR", "contactInfo.email must be a valid email address", null, {
+          requestId: req.requestId,
+        });
+      }
+      const cur = settings.contactInfo || {};
+      settings.contactInfo = {
+        email: c.email !== undefined ? String(c.email).trim().slice(0, 254) : (cur.email || ""),
+        phone: c.phone !== undefined ? String(c.phone).trim().slice(0, 32) : (cur.phone || ""),
+      };
+      settings.markModified("contactInfo");
+    }
+
     settings.updatedByAdminId = req.adminUser.id;
     await settings.save();
 

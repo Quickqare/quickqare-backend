@@ -8,6 +8,8 @@ const DEFAULT_SOCIAL_LINKS = {
   whatsapp: "", instagram: "", facebook: "", twitter: "", youtube: "",
 };
 
+const DEFAULT_CONTACT_INFO = { email: "", phone: "" };
+
 const ICON_ANIM_STYLES = ["none", "bob", "bounce", "tada"];
 // Legacy values (booleans from the earlier on/off version) map to bob/none.
 const iconAnimStyle = (v) => {
@@ -83,6 +85,10 @@ router.get("/", async (_req, res) => {
         twitter:   settings?.socialLinks?.twitter   || DEFAULT_SOCIAL_LINKS.twitter,
         youtube:   settings?.socialLinks?.youtube   || DEFAULT_SOCIAL_LINKS.youtube,
       },
+      contactInfo: {
+        email: settings?.contactInfo?.email || DEFAULT_CONTACT_INFO.email,
+        phone: settings?.contactInfo?.phone || DEFAULT_CONTACT_INFO.phone,
+      },
       homeTheme: {
         isActive:        Boolean(theme.isActive),
         targetPlatform:  theme.targetPlatform  || "both",
@@ -123,6 +129,7 @@ router.get("/", async (_req, res) => {
         electrician: "bob", celebration: "bob", offers: "bob",
       },
       socialLinks: DEFAULT_SOCIAL_LINKS,
+      contactInfo: DEFAULT_CONTACT_INFO,
       homeTheme: DEFAULT_THEME,
     });
   }

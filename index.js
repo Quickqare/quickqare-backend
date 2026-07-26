@@ -233,6 +233,7 @@ app.use("/api/ratings", require("./routes/rating.routes"));
 app.use("/api/app-config", require("./routes/appConfig.routes"));
 app.use("/api/addresses", require("./routes/address.routes"));
 app.use("/api/offers", require("./routes/offer.routes"));
+app.use("/api/partner-leads", require("./routes/partnerLead.routes"));
 app.use("/api/v1/admin", require("./admin/routes/v1"));
 
 /* ======================
