@@ -741,6 +741,14 @@ const bookingSchema = new mongoose.Schema(
         },
         name: String,
         price: Number,
+        // Unit the price is quoted in ("metre", "foot", "kg", "piece"...),
+        // frozen at submit time next to the price. Without it the customer's
+        // approval screen can only show a bare "Qty: 2.13" with no idea what
+        // is being measured, and a later admin unit change would retroactively
+        // reword an estimate the customer already approved.
+        unit: String,
+        // NOT an integer: measured goods (metre/foot/kg/hour) are billed
+        // fractionally — see MAX_ESTIMATE_QUANTITY in partner.controller.
         quantity: {
           type: Number,
           default: 1,

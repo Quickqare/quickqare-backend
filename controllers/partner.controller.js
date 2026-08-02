@@ -653,6 +653,14 @@ exports.getPartsCatalog = async (req, res) => {
   }
 };
 
+/* Estimate quantities are billed to 2 decimal places — measured goods (metre,
+   foot, kg, hour) are sold in fractions, so "2.13 metre" has to survive to the
+   invoice. 2dp is the precision a partner can actually type on-site; anything
+   finer is false precision. The cap is a sanity bound against a fat-fingered
+   entry turning into a five-figure charge, not a business limit. */
+const MIN_ESTIMATE_QUANTITY = 0.01;
+const MAX_ESTIMATE_QUANTITY = 10000;
+
 /**
  * =====================================================
  * SUBMIT ITEMIZED ESTIMATE
@@ -721,12 +729,35 @@ exports.submitEstimate = async (req, res) => {
     for (const item of items) {
       const catalogItem = catalogMap[String(item.serviceId)];
       if (!catalogItem) continue;
-      const qty = Math.max(1, Math.floor(Number(item.quantity) || 1));
-      const lineTotal = Math.round(catalogItem.priceInr * qty * 100) / 100;
+
+      // An omitted quantity keeps the historical default of 1 (matching the
+      // schema default). Anything present but unusable is REJECTED rather than
+      // coerced: this used to floor to an integer, which silently billed 2
+      // metres for a 2.13-metre cut, and coercing garbage to 1 charges the
+      // customer for a number nobody chose. On a money path, fail loudly.
+      const rawQty =
+        item.quantity === undefined || item.quantity === null || item.quantity === ""
+          ? 1
+          : Number(item.quantity);
+      const qty = Math.round(rawQty * 100) / 100;
+      if (!Number.isFinite(qty) || qty < MIN_ESTIMATE_QUANTITY || qty > MAX_ESTIMATE_QUANTITY) {
+        return res.status(400).json({
+          success: false,
+          message: `Invalid quantity for "${catalogItem.name}". Enter a number between ${MIN_ESTIMATE_QUANTITY} and ${MAX_ESTIMATE_QUANTITY}.`,
+        });
+      }
+
+      // Whole rupees, matching computeCakeLineTotal and the pricing engine's
+      // round(): estimateTotal is fed to calculatePricing as baseAmount, which
+      // rounds anyway. Keeping paise here would quote the partner ₹800.10 and
+      // then bill the customer ₹800 — the fractional quantity is exact, the
+      // money it lands on is not.
+      const lineTotal = Math.round(catalogItem.priceInr * qty);
       estimateItems.push({
         serviceId: catalogItem._id,
         name: catalogItem.name,
         price: catalogItem.priceInr,
+        unit: catalogItem.unit || "piece",
         quantity: qty,
         lineTotal,
       });
@@ -740,7 +771,9 @@ exports.submitEstimate = async (req, res) => {
       });
     }
 
-    estimateTotal = Math.round(estimateTotal * 100) / 100;
+    // Already whole rupees (every lineTotal is) — the round guards float drift
+    // from summing them.
+    estimateTotal = Math.round(estimateTotal);
 
     booking.estimateItems = estimateItems;
     booking.estimateTotal = estimateTotal;
