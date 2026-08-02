@@ -113,13 +113,10 @@ server {
     # so injected inline scripts are blocked. If a new integration is added, add
     # its host to the specific directive rather than loosening script-src.
     #
-    # MSG91 needs BOTH widget hosts in connect-src: control.msg91.com answers
-    # /widget/sendOtpMobile with a 302 to otpwidget.msg91.com, and CSP is
-    # enforced against redirect targets too. Dropping otpwidget.msg91.com blocks
-    # the redirect and no login OTP is ever sent (web only — the native app has
-    # no CSP). Keep this in sync with web/vite.config.ts, which injects a second
-    # CSP as a <meta> tag: the browser enforces the INTERSECTION of the two, so
-    # a host missing from either one is still blocked.
+    # BOTH MSG91 hosts are required for login: control.msg91.com answers the OTP
+    # call with a 302 to otpwidget.msg91.com, and CSP is enforced on every
+    # redirect hop. Dropping the second host silently breaks every web OTP while
+    # leaving the mobile app (no CSP) working — see web/src/services/msg91.ts.
     add_header X-Frame-Options "SAMEORIGIN" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header Referrer-Policy "strict-origin-when-cross-origin" always;
