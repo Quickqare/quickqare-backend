@@ -108,21 +108,21 @@ server {
     # `location /` or these six will stop reaching the HTML page.
     #
     # The CSP allowlist matches exactly what the app loads: Razorpay Checkout
-    # (script-src / frame-src) and the MSG91 widget + API/socket hosts
-    # (connect-src). There is no 'unsafe-inline' or 'unsafe-eval' in script-src,
-    # so injected inline scripts are blocked. If a new integration is added, add
-    # its host to the specific directive rather than loosening script-src.
+    # (script-src / frame-src) and the API/socket hosts (connect-src). There is
+    # no 'unsafe-inline' or 'unsafe-eval' in script-src, so injected inline
+    # scripts are blocked. If a new integration is added, add its host to the
+    # specific directive rather than loosening script-src.
     #
-    # BOTH MSG91 hosts are required for login: control.msg91.com answers the OTP
-    # call with a 302 to otpwidget.msg91.com, and CSP is enforced on every
-    # redirect hop. Dropping the second host silently breaks every web OTP while
-    # leaving the mobile app (no CSP) working — see web/src/services/msg91.ts.
+    # No MSG91 host is listed on purpose. Login OTP is sent and verified by the
+    # API (/api/auth/send-otp, /api/auth/verify-otp), never by the browser: the
+    # MSG91 widget endpoint answers with a cross-origin 302, and a preflighted
+    # request may not follow one, so a browser-side call fails regardless of CSP.
     add_header X-Frame-Options "SAMEORIGIN" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header Referrer-Policy "strict-origin-when-cross-origin" always;
     add_header Permissions-Policy "camera=(), microphone=()" always;
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
-    add_header Content-Security-Policy "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'self'; form-action 'self'; script-src 'self' https://checkout.razorpay.com https://cdn.razorpay.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' https://api.quickqare.in wss://api.quickqare.in https://control.msg91.com https://otpwidget.msg91.com https://*.razorpay.com; frame-src https://api.razorpay.com https://*.razorpay.com" always;
+    add_header Content-Security-Policy "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'self'; form-action 'self'; script-src 'self' https://checkout.razorpay.com https://cdn.razorpay.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' https://api.quickqare.in wss://api.quickqare.in https://*.razorpay.com; frame-src https://api.razorpay.com https://*.razorpay.com" always;
 
     # Serve static assets with long cache headers.
     location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|map)$ {
