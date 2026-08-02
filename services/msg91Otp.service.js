@@ -16,6 +16,106 @@ const toInternationalPhone = (phone) => {
   return `${countryCode}${normalized}`;
 };
 
+// ── MSG91 widget flow (server-side) ──────────────────────────────────────────
+// This is the SAME product the mobile apps use, and the one this account is
+// actually provisioned for. The `/api/v5/otp` template flow further down needs a
+// DLT-approved MSG91_TEMPLATE_ID, which is blank in .env.example and only
+// "recommended" in validateEnv — so it silently sends nothing.
+//
+// These calls must be made from the server, never the browser: the endpoint
+// answers with a cross-origin 302 to otpwidget.msg91.com, and a preflighted
+// fetch may not follow a cross-origin redirect (the request dies as "Failed to
+// fetch" regardless of CSP). Node's fetch follows the redirect normally.
+//
+// widgetId/tokenAuth are public widget credentials — they already ship inside
+// the mobile app bundles — so the fallbacks below are not leaked secrets. They
+// exist so a droplet without the new env vars keeps working.
+const WIDGET_BASE_URL = "https://control.msg91.com/api/v5/widget";
+
+const getWidgetConfig = () => ({
+  widgetId: String(process.env.MSG91_WIDGET_ID || "366462723463333736383232").trim(),
+  tokenAuth: String(process.env.MSG91_WIDGET_TOKEN_AUTH || "504623T79zrvvcR69ced429P1").trim(),
+});
+
+// MSG91 answers business-logic failures with HTTP 200 and {type:"error"}, so the
+// status code alone never tells you whether it worked.
+const isWidgetError = (data = {}) =>
+  data?.type === "error" || data?.hasError === true || data?.status === "fail";
+
+async function postWidget(endpoint, body) {
+  const { widgetId, tokenAuth } = getWidgetConfig();
+
+  const response = await fetch(`${WIDGET_BASE_URL}${endpoint}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ widgetId, tokenAuth, ...body }),
+  });
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok || isWidgetError(data)) {
+    const error = new Error(data?.message || `MSG91 request failed (HTTP ${response.status})`);
+    // MSG91's own 200-with-error responses are caller mistakes (bad number, wrong
+    // OTP), not upstream outages — surface them as 400, not 502.
+    error.statusCode = response.ok ? 400 : 502;
+    throw error;
+  }
+
+  return data;
+}
+
+// sendOtpMobile returns the reqId in `message`. Persist it — verifyOtp needs it.
+async function sendWidgetOtp(phone) {
+  const mobile = toInternationalPhone(phone);
+  if (!mobile) {
+    const error = new Error("Valid phone number required");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const data = await postWidget("/sendOtpMobile", { identifier: mobile });
+  const reqId = String(data?.message || "").trim();
+
+  if (!reqId) {
+    const error = new Error("MSG91 did not return a request id");
+    error.statusCode = 502;
+    throw error;
+  }
+
+  return { reqId };
+}
+
+// retryOtp re-sends against an existing reqId and keeps the same one.
+async function retryWidgetOtp(reqId) {
+  await postWidget("/retryOtp", { reqId });
+  return { reqId };
+}
+
+// Returns MSG91's access token (a JWT) proving this reqId's OTP was entered
+// correctly. The caller already knows which phone the reqId belongs to.
+async function verifyWidgetOtp(otp, reqId) {
+  const code = String(otp || "").trim();
+  if (!code || !reqId) {
+    const error = new Error("OTP is required");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const data = await postWidget("/verifyOtp", { otp: code, reqId });
+  const accessToken = String(data?.message || "").trim();
+
+  if (!looksLikeJwt(accessToken)) {
+    const error = new Error("Invalid OTP");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  return { accessToken, data };
+}
+
+const looksLikeJwt = (value) =>
+  typeof value === "string" && value.split(".").length === 3;
+
 const getRequiredConfig = () => {
   const authKey = String(process.env.MSG91_AUTH_KEY || "").trim();
   const templateId = String(process.env.MSG91_TEMPLATE_ID || "").trim();
@@ -292,6 +392,9 @@ async function verifyAccessToken(accessToken) {
 module.exports = {
   sendOtp,
   verifyOtp,
+  sendWidgetOtp,
+  retryWidgetOtp,
+  verifyWidgetOtp,
   verifyAccessToken,
   toInternationalPhone,
   phoneMatchesVerified,
