@@ -163,6 +163,189 @@ module.exports = [
     description: "Pipes, leaks, and plumbing support",
     imageUrl: "",
   },
+  // Beauty for Women — managed through the same category, subcategory and
+  // service controls as Mehendi. Admins can change every price, image,
+  // description, duration and active state after seeding these defaults.
+  {
+    name: "Full arms waxing", categoryCode: "Salon for Women", subCategoryName: "Waxing",
+    basePriceInr: 299, commissionPercent: 20, duration: 45,
+    description: "Smooth waxing for both arms, including underarms.", imageUrl: "",
+  },
+  {
+    name: "Full legs waxing", categoryCode: "Salon for Women", subCategoryName: "Waxing",
+    basePriceInr: 349, commissionPercent: 20, duration: 45,
+    description: "Full-leg waxing from toes to upper legs.", imageUrl: "",
+  },
+  {
+    name: "Underarms waxing", categoryCode: "Salon for Women", subCategoryName: "Waxing",
+    basePriceInr: 49, commissionPercent: 20, duration: 15,
+    description: "Quick, hygienic underarm waxing.", imageUrl: "",
+  },
+  {
+    name: "Full body waxing", categoryCode: "Salon for Women", subCategoryName: "Waxing",
+    basePriceInr: 999, commissionPercent: 20, duration: 120,
+    description: "Arms, legs, underarms, stomach and back.", imageUrl: "",
+  },
+  {
+    name: "Bikini waxing", categoryCode: "Salon for Women", subCategoryName: "Waxing",
+    basePriceInr: 949, commissionPercent: 20, duration: 45,
+    description: "Professional bikini-area waxing at home.", imageUrl: "",
+  },
+  {
+    name: "Face waxing", categoryCode: "Salon for Women", subCategoryName: "Waxing",
+    basePriceInr: 199, commissionPercent: 20, duration: 20,
+    description: "Gentle facial waxing for a smooth finish.", imageUrl: "",
+  },
+  {
+    name: "Eyebrow threading", categoryCode: "Salon for Women", subCategoryName: "Threading",
+    basePriceInr: 29, commissionPercent: 20, duration: 10,
+    description: "Precise shaping for clean, defined brows.", imageUrl: "",
+  },
+  {
+    name: "Upper-lip threading", categoryCode: "Salon for Women", subCategoryName: "Threading",
+    basePriceInr: 29, commissionPercent: 20, duration: 10,
+    description: "Quick facial-hair removal with quality thread.", imageUrl: "",
+  },
+  {
+    name: "Forehead threading", categoryCode: "Salon for Women", subCategoryName: "Threading",
+    basePriceInr: 39, commissionPercent: 20, duration: 10,
+    description: "Neat forehead threading to complete your look.", imageUrl: "",
+  },
+  {
+    name: "Full-face threading", categoryCode: "Salon for Women", subCategoryName: "Threading",
+    basePriceInr: 149, commissionPercent: 20, duration: 25,
+    description: "Complete facial threading service.", imageUrl: "",
+  },
+  {
+    name: "Instant glow facial", categoryCode: "Salon for Women", subCategoryName: "Facials & cleanups",
+    basePriceInr: 770, commissionPercent: 20, duration: 60,
+    description: "Cleansing and nourishment for an instant glow.", imageUrl: "",
+  },
+  {
+    name: "Hydration facial", categoryCode: "Salon for Women", subCategoryName: "Facials & cleanups",
+    basePriceInr: 449, commissionPercent: 20, duration: 45,
+    description: "Moisture-rich facial for dry and tired skin.", imageUrl: "",
+  },
+  {
+    name: "Detan cleanup", categoryCode: "Salon for Women", subCategoryName: "Facials & cleanups",
+    basePriceInr: 499, commissionPercent: 20, duration: 55,
+    description: "Refreshes dull skin and helps reduce tan.", imageUrl: "",
+  },
+  {
+    name: "Korean glass-skin facial", categoryCode: "Salon for Women", subCategoryName: "Facials & cleanups",
+    basePriceInr: 999, commissionPercent: 20, duration: 75,
+    description: "Premium facial ritual for hydrated, dewy skin.", imageUrl: "",
+  },
+  {
+    name: "Basic manicure", categoryCode: "Salon for Women", subCategoryName: "Manicure",
+    basePriceInr: 199, commissionPercent: 20, duration: 15,
+    description: "Cut, file and polish with neat nail grooming.", imageUrl: "",
+  },
+  {
+    name: "Deluxe manicure", categoryCode: "Salon for Women", subCategoryName: "Manicure",
+    basePriceInr: 509, commissionPercent: 20, duration: 35,
+    description: "Soak, scrub, cream massage and a nourishing mask.", imageUrl: "",
+  },
+  {
+    name: "Basic pedicure", categoryCode: "Salon for Women", subCategoryName: "Pedicure",
+    basePriceInr: 199, commissionPercent: 20, duration: 15,
+    description: "Quick foot grooming with cut, file and polish.", imageUrl: "",
+  },
+  {
+    name: "Deluxe pedicure", categoryCode: "Salon for Women", subCategoryName: "Pedicure",
+    basePriceInr: 599, commissionPercent: 20, duration: 60,
+    description: "Complete foot care with soak, scrub and mask.", imageUrl: "",
+  },
+  {
+    name: "Face bleach", categoryCode: "Salon for Women", subCategoryName: "Bleach & detan",
+    basePriceInr: 399, commissionPercent: 20, duration: 30,
+    description: "Professional bleach for an even-looking complexion.", imageUrl: "",
+  },
+  {
+    name: "Face detan", categoryCode: "Salon for Women", subCategoryName: "Bleach & detan",
+    basePriceInr: 399, commissionPercent: 20, duration: 30,
+    description: "Fruit-based detan care to refresh tanned skin.", imageUrl: "",
+  },
+  {
+    name: "Hand & feet detan", categoryCode: "Salon for Women", subCategoryName: "Bleach & detan",
+    basePriceInr: 699, commissionPercent: 20, duration: 45,
+    description: "Targeted detan care for hands and feet.", imageUrl: "",
+  },
+  {
+    name: "Hair spa", categoryCode: "Salon for Women", subCategoryName: "Hair care",
+    basePriceInr: 1299, commissionPercent: 20, duration: 60,
+    description: "Steam therapy to nourish hair from scalp to ends.", imageUrl: "",
+  },
+  {
+    name: "Hair repair mask", categoryCode: "Salon for Women", subCategoryName: "Hair care",
+    basePriceInr: 649, commissionPercent: 20, duration: 40,
+    description: "Intensive repair treatment to strengthen and restore hair.", imageUrl: "",
+  },
+  {
+    name: "Hair wash & blow-dry", categoryCode: "Salon for Women", subCategoryName: "Hair care",
+    basePriceInr: 499, commissionPercent: 20, duration: 45,
+    description: "Fresh hair wash followed by a salon-style blow-dry.", imageUrl: "",
+  },
+  {
+    name: "Women’s haircut", categoryCode: "Hair Studio for Women", subCategoryName: "Cut & trim",
+    basePriceInr: 549, commissionPercent: 20, duration: 45,
+    description: "Expert haircut tailored to your style.", imageUrl: "",
+  },
+  {
+    name: "Hair styling", categoryCode: "Hair Studio for Women", subCategoryName: "Blow-dry & style",
+    basePriceInr: 599, commissionPercent: 20, duration: 45,
+    description: "Straightening, curls, waves, buns, braids and party styles.", imageUrl: "",
+  },
+  {
+    name: "Keratin treatment", categoryCode: "Hair Studio for Women", subCategoryName: "Keratin & botox",
+    basePriceInr: 4499, commissionPercent: 20, duration: 180,
+    description: "Smoothing and frizz-control treatment.", imageUrl: "",
+  },
+  {
+    name: "Hair colouring", categoryCode: "Hair Studio for Women", subCategoryName: "Hair colour",
+    basePriceInr: 2697, commissionPercent: 20, duration: 105,
+    description: "Root touch-up and global hair colour options.", imageUrl: "",
+  },
+  {
+    name: "Fashion colouring", categoryCode: "Hair Studio for Women", subCategoryName: "Fashion colour",
+    basePriceInr: 2499, commissionPercent: 20, duration: 120,
+    description: "Creative fashion colour options for a statement look.", imageUrl: "",
+  },
+  {
+    name: "Hair extensions", categoryCode: "Hair Studio for Women", subCategoryName: "Hair extensions",
+    basePriceInr: 2999, commissionPercent: 20, duration: 120,
+    description: "Length and volume enhancement options.", imageUrl: "",
+  },
+  {
+    name: "Basic makeup", categoryCode: "Makeup, Saree & Styling", subCategoryName: "Party makeup",
+    basePriceInr: 1599, commissionPercent: 20, duration: 45,
+    description: "Natural, lightweight look for daytime events.", imageUrl: "",
+  },
+  {
+    name: "HD makeup", categoryCode: "Makeup, Saree & Styling", subCategoryName: "Party makeup",
+    basePriceInr: 2499, commissionPercent: 20, duration: 60,
+    description: "Photo-ready finish for functions and photoshoots.", imageUrl: "",
+  },
+  {
+    name: "Luxe makeup", categoryCode: "Makeup, Saree & Styling", subCategoryName: "Party makeup",
+    basePriceInr: 2999, commissionPercent: 20, duration: 80,
+    description: "Full-glam look for parties and celebrations.", imageUrl: "",
+  },
+  {
+    name: "Basic saree draping", categoryCode: "Makeup, Saree & Styling", subCategoryName: "Saree draping",
+    basePriceInr: 499, commissionPercent: 20, duration: 20,
+    description: "Saree, sari or lehenga draping.", imageUrl: "",
+  },
+  {
+    name: "Advanced saree draping", categoryCode: "Makeup, Saree & Styling", subCategoryName: "Saree draping",
+    basePriceInr: 699, commissionPercent: 20, duration: 30,
+    description: "Double-pallu, heavy dupatta and lehenga styles.", imageUrl: "",
+  },
+  {
+    name: "Wedding makeup combo", categoryCode: "Makeup, Saree & Styling", subCategoryName: "Wedding combos",
+    basePriceInr: 4249, commissionPercent: 20, duration: 160,
+    description: "Makeup, hairstyling and event-ready wedding package.", imageUrl: "",
+  },
   {
     name: "Minimal Mehendi Design",
     categoryCode: "mehendi",

@@ -1252,6 +1252,19 @@ function gateBookingSelfies(booking) {
   return booking;
 }
 
+// A partner's direct phone number is only needed while the service is active.
+// Keep it out of customer history/detail responses once the booking is
+// terminal, so it cannot be recovered from the network response after the job
+// is complete or cancelled.
+function hidePartnerPhonesAfterService(booking) {
+  if (!booking || !["COMPLETED", "CANCELLED"].includes(booking.status)) return booking;
+  if (booking.partner) delete booking.partner.phone;
+  if (Array.isArray(booking.additionalPartners)) {
+    booking.additionalPartners.forEach((p) => delete p.phone);
+  }
+  return booking;
+}
+
 // Strip ops/partner-internal fields from a lean booking before it ships in a
 // customer-facing response. Customer read endpoints (getBookingById,
 // getMyBookings) previously returned the raw document, leaking the assignment
@@ -2559,6 +2572,7 @@ exports.getMyBookings = async (req, res) => {
     ]);
 
     bookings.forEach(gateBookingSelfies);
+    bookings.forEach(hidePartnerPhonesAfterService);
     bookings.forEach(sanitizeBookingForCustomer);
 
     res.json({
@@ -2913,6 +2927,7 @@ exports.getBookingById = async (req, res) => {
     }
 
     gateBookingSelfies(booking);
+    hidePartnerPhonesAfterService(booking);
 
     // Surface the latest unresolved "customer-fault" on-site report while the
     // partner is still at the door (ARRIVED), so the app can show a clear
