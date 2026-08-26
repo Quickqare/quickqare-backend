@@ -392,11 +392,15 @@ router.post("/seed-defaults", audit("admin.services.seed"), async (req, res) => 
         continue;
       }
 
-      let category = await Category.findOne({ slug: categoryCode.toLowerCase() });
+      // Category slugs are stored in normalized, hyphenated form. Using the
+      // unnormalized category name here caused the seeder to miss a category
+      // it had just created and then fail on the duplicate slug constraint.
+      const categorySlug = categoryCode.toLowerCase().replace(/\s+/g, "-");
+      let category = await Category.findOne({ slug: categorySlug });
       if (!category) {
         category = await Category.create({
           name: categoryCode,
-          slug: categoryCode.toLowerCase().replace(/\s+/g, "-"),
+          slug: categorySlug,
           isActive: true,
         });
       }
