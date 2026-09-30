@@ -176,6 +176,8 @@ const adminSettingSchema = new mongoose.Schema(
         electricianShimmer: { type: Boolean, default: true },
         celebration:        { type: String,  default: "" },
         celebrationShimmer: { type: Boolean, default: true },
+        // Image used by the bundled Women’s Salon & Self-Care home tile.
+        womenSalon:         { type: String,  default: "" },
       },
     },
 

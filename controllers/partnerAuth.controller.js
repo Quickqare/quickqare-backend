@@ -7,6 +7,7 @@ const Category = require("../models/Category");
 const {
   sendOtp: sendOtpViaMsg91,
   verifyOtp: verifyOtpViaMsg91,
+  issuePhoneProof,
   verifyAccessToken: verifyMsg91AccessToken,
   phoneMatchesVerified,
 } = require("../services/msg91Otp.service");
@@ -282,13 +283,25 @@ exports.loginPartner = async (req, res) => {
 ===================================================== */
 exports.sendPartnerOtp = async (req, res) => {
   try {
-    const { phone } = req.body;
+    const { phone, purpose } = req.body;
 
     if (!phone || typeof phone !== "string") {
       return res.status(400).json({ success: false, message: "Phone number is required" });
     }
 
     const partner = await Partner.findOne({ phone }).select("_id isBlocked");
+
+    // Signup verifies the phone BEFORE the account exists, so this send must work
+    // for an unknown number — but not for a registered one (fail before the SMS
+    // is spent; register would reject it as "Partner already exists" anyway).
+    if (purpose === "register") {
+      if (partner) {
+        return res.status(409).json({ success: false, message: "Partner already exists" });
+      }
+      await sendOtpViaMsg91(phone);
+      return res.json({ success: true, message: "OTP sent successfully" });
+    }
+
     if (!partner) {
       return res.status(404).json({ success: false, message: "Partner not found" });
     }
@@ -359,6 +372,30 @@ exports.verifyPartnerOtp = async (req, res) => {
       token,
       partner: safePartner,
     });
+  } catch (error) {
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || "OTP verification failed",
+    });
+  }
+};
+
+/* =====================================================
+   VERIFY PARTNER PHONE (no session)
+   Returns a signed proof of the phone for register / password reset, which
+   accept it in the `accessToken` field.
+===================================================== */
+exports.verifyPartnerPhone = async (req, res) => {
+  try {
+    const { phone, otp } = req.body;
+
+    if (!phone || typeof phone !== "string" || !otp || typeof otp !== "string") {
+      return res.status(400).json({ success: false, message: "Phone and OTP are required" });
+    }
+
+    await verifyOtpViaMsg91(phone, otp);
+
+    return res.json({ success: true, accessToken: issuePhoneProof(phone) });
   } catch (error) {
     return res.status(error.statusCode || 500).json({
       success: false,

@@ -111,6 +111,7 @@ router.get("/", async (_req, res) => {
           electricianShimmer: theme.categoryIcons?.electricianShimmer !== false,
           celebration:        theme.categoryIcons?.celebration ?? "",
           celebrationShimmer: theme.categoryIcons?.celebrationShimmer !== false,
+          womenSalon:         theme.categoryIcons?.womenSalon ?? "",
         },
       },
     });

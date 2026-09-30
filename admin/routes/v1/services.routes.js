@@ -464,6 +464,15 @@ router.patch("/:id", audit("admin.services.update"), async (req, res) => {
     if (typeof req.body.description === "string") patch.description = req.body.description;
     if (typeof req.body.imageUrl === "string") patch.imageUrl = req.body.imageUrl;
     if (typeof req.body.webImageUrl === "string") patch.webImageUrl = req.body.webImageUrl;
+    if (req.body.faceWaxingAreaImages && typeof req.body.faceWaxingAreaImages === "object" && !Array.isArray(req.body.faceWaxingAreaImages)) {
+      const allowedAreaKeys = new Set(["upper-lip", "chin", "forehead", "sidelocks", "jawline", "neck", "full-face"]);
+      patch.faceWaxingAreaImages = Object.fromEntries(
+        Object.entries(req.body.faceWaxingAreaImages)
+          .filter(([key]) => allowedAreaKeys.has(key))
+          .map(([key, value]) => [key, String(value || "").trim()])
+          .filter(([, value]) => value)
+      );
+    }
     if (req.body.basePriceInr !== undefined) patch.price = Number(req.body.basePriceInr);
     if (req.body.commissionPercent !== undefined) patch.commissionPercent = Number(req.body.commissionPercent);
     if (req.body.isHighlighted !== undefined) patch.isHighlighted = Boolean(req.body.isHighlighted);

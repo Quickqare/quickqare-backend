@@ -76,6 +76,15 @@ const serviceSchema = new mongoose.Schema(
       default: "",
     },
 
+    // Website-only photos for the fixed face-waxing area picker. The keys are
+    // area slugs (upper-lip, chin, forehead, sidelocks, jawline, neck,
+    // full-face) and values are uploaded image URLs.
+    faceWaxingAreaImages: {
+      type: Map,
+      of: String,
+      default: {},
+    },
+
     /* =====================
        PRICING
     ===================== */

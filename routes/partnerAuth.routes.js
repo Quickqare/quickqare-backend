@@ -7,6 +7,7 @@ const {
   sendPartnerOtp,
   setPartnerStatus,
   verifyPartnerOtp,
+  verifyPartnerPhone,
   exchangePartnerMsg91AccessToken,
   resetPartnerPasswordWithMsg91,
   resetPartnerPassword,
@@ -48,6 +49,7 @@ router.post(
 router.post("/login", authLimiter, phoneLoginLimiter, loginPartner);
 router.post("/send-otp", authLimiter, phoneOtpLimiter, phoneOtpHourlyLimiter, sendPartnerOtp);
 router.post("/verify-otp", authLimiter, phoneOtpVerifyLimiter, verifyPartnerOtp);
+router.post("/verify-phone", authLimiter, phoneOtpVerifyLimiter, verifyPartnerPhone);
 router.post("/msg91/exchange", authLimiter, exchangePartnerMsg91AccessToken);
 router.post("/reset-password-msg91", authLimiter, resetPartnerPasswordWithMsg91);
 router.post("/reset-password", authLimiter, partnerAuth, resetPartnerPassword);

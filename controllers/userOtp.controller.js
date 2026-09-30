@@ -1,10 +1,9 @@
 const User = require("../models/User");
 const jwt = require("jsonwebtoken");
-const OtpRequest = require("../models/OtpRequest");
 const {
-  sendWidgetOtp,
-  retryWidgetOtp,
-  verifyWidgetOtp,
+  sendOtp: sendMsg91Otp,
+  verifyOtp: verifyMsg91Otp,
+  issuePhoneProof,
   verifyAccessToken: verifyMsg91AccessToken,
   toInternationalPhone,
   phoneMatchesVerified,
@@ -61,29 +60,9 @@ exports.sendOtp = async (req, res) => {
       return res.status(400).json({ message: "Phone number is required" });
     }
 
-    // Re-sending for a phone that already has a live request uses MSG91's
-    // retryOtp against the SAME reqId, which is what the widget expects; a
-    // second sendOtpMobile would orphan the first reqId. If the retry is
-    // refused (expired request), fall back to starting a fresh one.
-    const existing = await OtpRequest.findOne({ phone }).lean();
-    let reqId;
-
-    if (existing?.reqId) {
-      try {
-        ({ reqId } = await retryWidgetOtp(existing.reqId));
-      } catch {
-        ({ reqId } = await sendWidgetOtp(phone));
-      }
-    } else {
-      ({ reqId } = await sendWidgetOtp(phone));
-    }
-
-    // Refresh createdAt too, so the TTL window tracks the latest send.
-    await OtpRequest.findOneAndUpdate(
-      { phone },
-      { $set: { reqId, createdAt: new Date() } },
-      { upsert: true }
-    );
+    // Re-sending is just another send: the template API issues a fresh code and
+    // MSG91 invalidates the previous one, so there is no request id to track.
+    await sendMsg91Otp(phone);
 
     return res.json({
       success: true,
@@ -104,18 +83,9 @@ exports.verifyOtp = async (req, res) => {
       return res.status(400).json({ message: "Phone and OTP are required" });
     }
 
-    // Look the reqId up BY the submitted phone. This is the phone binding: the
-    // caller never supplies a reqId, so an OTP obtained for one number can't be
-    // presented against another — that pairing only exists here, server-side.
-    const pending = await OtpRequest.findOne({ phone }).lean();
-    if (!pending?.reqId) {
-      return res.status(400).json({ message: "Please request an OTP first" });
-    }
-
-    await verifyWidgetOtp(otp, pending.reqId);
-
-    // Single-use: a correct OTP must not be replayable into a second session.
-    await OtpRequest.deleteOne({ phone });
+    // MSG91 checks the code against the phone it was sent to, which is the
+    // phone binding: an OTP for one number can't verify another.
+    await verifyMsg91Otp(phone, otp);
 
     let user = await User.findOne({ phone });
     let isNewUser = false;
@@ -180,6 +150,27 @@ exports.verifyOtp = async (req, res) => {
     });
   } catch (error) {
     console.error("Verify OTP error:", error);
+    return res.status(error.statusCode || 500).json({ message: error.message || "OTP verification failed" });
+  }
+};
+
+// POST /api/auth/verify-phone — verifies the OTP and returns a signed proof of
+// that phone instead of a session. The mobile app then calls /msg91/exchange
+// (once after OTP, again after the name/gender step), which is where the
+// account is created and the session issued.
+exports.verifyPhone = async (req, res) => {
+  try {
+    const { phone, otp } = req.body;
+
+    if (!phone || typeof phone !== "string" || !otp || typeof otp !== "string") {
+      return res.status(400).json({ message: "Phone and OTP are required" });
+    }
+
+    await verifyMsg91Otp(phone, otp);
+
+    return res.json({ success: true, accessToken: issuePhoneProof(phone) });
+  } catch (error) {
+    console.error("Verify phone error:", error);
     return res.status(error.statusCode || 500).json({ message: error.message || "OTP verification failed" });
   }
 };

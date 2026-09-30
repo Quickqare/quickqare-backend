@@ -3,6 +3,7 @@ const router = express.Router();
 const {
   sendOtp,
   verifyOtp,
+  verifyPhone,
   exchangeMsg91AccessToken,
   getMe,
   logout,
@@ -19,6 +20,7 @@ router.post("/send-otp", authLimiter, phoneOtpLimiter, phoneOtpHourlyLimiter, se
 // phoneOtpVerifyLimiter keys on the target phone, so an attacker rotating IPs
 // can't grind a 4-digit OTP for one number — mirrors the partner verify route.
 router.post("/verify-otp", authLimiter, phoneOtpVerifyLimiter, verifyOtp);
+router.post("/verify-phone", authLimiter, phoneOtpVerifyLimiter, verifyPhone);
 router.post("/msg91/exchange", authLimiter, phoneOtpVerifyLimiter, exchangeMsg91AccessToken);
 router.get("/me", userAuth, getMe);
 router.post("/logout", logout);

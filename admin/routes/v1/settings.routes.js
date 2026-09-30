@@ -157,6 +157,7 @@ router.patch("/settings", audit("admin.settings.update"), async (req, res) => {
           electricianShimmer: ci.electricianShimmer !== undefined ? Boolean(ci.electricianShimmer) : (cur.electricianShimmer !== false),
           celebration:        typeof ci.celebration === "string" ? ci.celebration.slice(0, 512) : (cur.celebration || ""),
           celebrationShimmer: ci.celebrationShimmer !== undefined ? Boolean(ci.celebrationShimmer) : (cur.celebrationShimmer !== false),
+          womenSalon:         typeof ci.womenSalon === "string" ? ci.womenSalon.slice(0, 512) : (cur.womenSalon || ""),
         };
         settings.markModified("homeTheme.categoryIcons");
       }
