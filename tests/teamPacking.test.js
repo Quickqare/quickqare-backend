@@ -14,6 +14,7 @@ const {
   calculateDurationMinutesFromRequest,
   MEHENDI_VISIT_WINDOW_MINUTES,
   AC_VISIT_WINDOW_MINUTES,
+  SALON_VISIT_WINDOW_MINUTES,
 } = require("../services/scheduling_service");
 
 // Helpers to build a serviceMap the way loadServiceMap would.
@@ -182,7 +183,7 @@ describe("planTeamAssignment — mixed teams", () => {
     expect(planTeamAssignment(ranked, teamPack)).toBeNull();
   });
 
-  test("empty-bins pack (cake/plumbing) plans a single partner", () => {
+  test("empty-bins pack (plumbing) plans a single partner", () => {
     const plan = planTeamAssignment([entry("solo")], { bins: [], requiredCount: 1 });
     expect(plan).toHaveLength(1);
     expect(plan[0].entry.partner._id).toBe("solo");
@@ -229,5 +230,140 @@ describe("calculateDurationMinutesFromRequest — elapsed makespan", () => {
       false
     );
     expect(minutes).toBe(120);
+  });
+
+  test("a long single-partner cart blocks its full length — no 240-min cap", () => {
+    // One plumber does all of it: 120 + 60 + 60 + 60 + 35 = 335 min. The
+    // old cap blocked 240 and left the last 95 min double-bookable. (A salon
+    // cart this long now splits across beauticians — see the salon suite.)
+    const plumbing = { category: "plumbing" };
+    const cart = [
+      svc({ name: "Bathroom fitting", duration: 120 }),
+      svc({ name: "Tap replacement", duration: 60 }),
+      svc({ name: "Flush repair", duration: 60 }),
+      svc({ name: "Drain cleaning", duration: 60 }),
+      svc({ name: "Leak check", duration: 35 }),
+    ];
+    const minutes = calculateDurationMinutesFromRequest(
+      cart.map((s) => line(s, 1, plumbing)),
+      mapOf(...cart),
+      false
+    );
+    expect(minutes).toBe(335);
+  });
+
+  test("short jobs still block at least one hour", () => {
+    const threading = svc({ name: "Eyebrow threading", duration: 10 });
+    const minutes = calculateDurationMinutesFromRequest(
+      [line(threading, 1, { category: "salon-for-women" })],
+      mapOf(threading),
+      false
+    );
+    expect(minutes).toBe(60);
+  });
+
+  test("an AC makespan is not truncated either", () => {
+    const install = svc({ name: "Central AC installation", duration: 400, skillTier: 2 });
+    const minutes = calculateDurationMinutesFromRequest(
+      [line(install, 1, { category: "ac" })],
+      mapOf(install),
+      true
+    );
+    expect(minutes).toBe(400); // the old 360 ceiling under-blocked by 40 min
+  });
+});
+
+describe("packTeamTasks — salon / self-care", () => {
+  const salonLine = (service, quantity = 1) =>
+    line(service, quantity, { category: "Salon for Women" });
+  const junior = { partner: { _id: "jr", skillTier: 1 }, canBridal: true, canGuest: true };
+  const senior = { partner: { _id: "sr", skillTier: 2 }, canBridal: true, canGuest: true };
+
+  // 120 + 60 + 60 + 60 + 35 = 335 min — more than one beautician's visit.
+  function longCart() {
+    return [
+      svc({ name: "Full body waxing", duration: 120 }),
+      svc({ name: "Deluxe pedicure", duration: 60 }),
+      svc({ name: "Instant glow facial", duration: 60 }),
+      svc({ name: "Hair spa", duration: 60 }),
+      svc({ name: "Deluxe manicure", duration: 35 }),
+    ];
+  }
+
+  test("a cart inside the visit window is ONE beautician, summed duration", () => {
+    const facial = svc({ name: "Hydration facial", duration: 60 });
+    const threading = svc({ name: "Eyebrow threading", duration: 15 });
+    const pack = packTeamTasks(
+      [salonLine(facial), salonLine(threading)],
+      mapOf(facial, threading),
+      { isSalon: true }
+    );
+    expect(pack.requiredCount).toBe(1);
+    expect(pack.bins).toEqual([{ minutes: 75, tier: 1, kind: "GUEST" }]);
+    expect(pack.makespanMinutes).toBe(75);
+  });
+
+  test("a cart longer than the visit window splits across beauticians", () => {
+    const cart = longCart();
+    const pack = packTeamTasks(cart.map((s) => salonLine(s)), mapOf(...cart), { isSalon: true });
+    expect(pack.requiredCount).toBe(2);
+    for (const bin of pack.bins) {
+      expect(bin.minutes).toBeLessThanOrEqual(SALON_VISIT_WINDOW_MINUTES);
+    }
+    expect(pack.bins.reduce((sum, b) => sum + b.minutes, 0)).toBe(335);
+    expect(pack.makespanMinutes).toBe(180);
+  });
+
+  test("elapsed duration of a long salon cart is the parallel makespan", () => {
+    const cart = longCart();
+    const minutes = calculateDurationMinutesFromRequest(
+      cart.map((s) => salonLine(s)),
+      mapOf(...cart),
+      false
+    );
+    expect(minutes).toBe(180); // was 335 with one beautician
+  });
+
+  test("categoryType SALON is detected even when the name gives no hint", () => {
+    const glowCat = { name: "Glow Studio", slug: "glow-studio", categoryType: "SALON" };
+    const cart = longCart().map((s) => ({ ...s, category: glowCat }));
+    const minutes = calculateDurationMinutesFromRequest(
+      cart.map((s) => line(s, 1, { category: "" })),
+      mapOf(...cart),
+      false
+    );
+    expect(minutes).toBe(180);
+  });
+
+  test("a tier-2 service makes its bin senior-only", () => {
+    const korean = svc({ name: "Korean glass-skin facial", duration: 90, skillTier: 2 });
+    const pack = packTeamTasks([salonLine(korean)], mapOf(korean), { isSalon: true });
+    expect(pack.bins).toEqual([{ minutes: 90, tier: 2, kind: "GUEST" }]);
+    expect(planTeamAssignment([junior], pack)).toBeNull();
+    expect(planTeamAssignment([junior, senior], pack)[0].entry.partner._id).toBe("sr");
+  });
+
+  test("mixed tiers in a split cart: only the tier-2 share needs a senior", () => {
+    const korean = svc({ name: "Korean glass-skin facial", duration: 90, skillTier: 2 });
+    const wax = svc({ name: "Full body waxing", duration: 120 });
+    const pedi = svc({ name: "Deluxe pedicure", duration: 60 });
+    const pack = packTeamTasks(
+      [salonLine(korean), salonLine(wax), salonLine(pedi)],
+      mapOf(korean, wax, pedi),
+      { isSalon: true }
+    );
+    expect(pack.requiredCount).toBe(2);
+    expect(pack.bins.filter((b) => b.tier === 2)).toHaveLength(1);
+
+    // Junior ranked first still can't take the senior share.
+    const plan = planTeamAssignment([junior, senior], pack);
+    expect(plan).toHaveLength(2);
+    expect(plan.find((p) => p.bin.tier === 2).entry.partner._id).toBe("sr");
+  });
+
+  test("AC and mehendi keep their own packers even if isSalon is passed", () => {
+    const guests = svc({ name: "Mehendi for Guests", duration: 30, packingRole: "INDEPENDENT" });
+    const pack = packTeamTasks([line(guests, 20)], mapOf(guests), { isMehendi: true, isSalon: true });
+    expect(pack.requiredCount).toBe(3); // mehendi sizing, unchanged
   });
 });

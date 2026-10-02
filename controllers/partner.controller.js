@@ -1,11 +1,13 @@
 const Booking = require("../models/Booking");
 const Partner = require("../models/Partner");
+const PartnerPayoutAccount = require("../models/PartnerPayoutAccount");
 const Dispute = require("../admin/models/Dispute");
 const Service = require("../models/service.model");
 const CatalogItem = require("../models/CatalogItem");
 const SubCategory = require("../models/SubCategory");
 const { reverseGeocode } = require("../services/geocode.service");
 const { syncPartnerOperationalState } = require("../services/scheduling_service");
+const { partnerEarningsFor } = require("../services/partnerSettlement.service");
 const {
   completeBooking,
   startService,
@@ -22,7 +24,11 @@ const {
 } = require("../services/zone.service");
 const { getUseH3Flag } = require("../services/assignmentEngine");
 
-function toPartnerJobPayload(booking, partnerId, { isPartnerCancelled = false } = {}) {
+// `earning` — what this booking pays THIS partner after commission (see
+// partnerSettlement.service partnerEarningsFor). The app shows amount/price as
+// the partner's "Earnings", so callers should always pass it; without it the
+// payload falls back to the customer's total, which overstates the partner's pay.
+function toPartnerJobPayload(booking, partnerId, { isPartnerCancelled = false, earning } = {}) {
   const firstService = Array.isArray(booking?.services) ? booking.services[0] || {} : {};
   // Trim each candidate so a blank/whitespace-only name falls through to the next
   // option instead of rendering as an empty card title in the partner app.
@@ -40,24 +46,36 @@ function toPartnerJobPayload(booking, partnerId, { isPartnerCancelled = false } 
   let amount = Number(booking?.totalAmount || 0);
   let isTeamJob = false;
   let isPrimary = true;
+  let myAllocation = null;
 
   if (partnerId) {
     // booking is a lean() plain object — use direct property access, not .get()
     const allocations = Array.isArray(booking.teamAllocations) ? booking.teamAllocations : [];
-    const myAllocation = allocations.find(a => a.partnerId?.toString() === partnerId.toString());
+    myAllocation = allocations.find(a => a.partnerId?.toString() === partnerId.toString()) || null;
     if (allocations.length > 1) isTeamJob = true;
     if (myAllocation) {
       amount = Number((amount * (myAllocation.payoutRatio || 1)).toFixed(2));
       isPrimary = Boolean(myAllocation.isPrimary);
     }
   }
+  if (Number.isFinite(Number(earning))) amount = Number(earning);
 
   // CONFIRMED = auto-accepted on the backend. Return PARTNER_ACCEPTED so the
   // partner app treats it identically to a manually accepted job.
   // isPartnerCancelled = this partner cancelled the booking; override status to CANCELLED.
+  // A team member who has finished their own part sees COMPLETED even while
+  // teammates are still working — otherwise the app keeps it as their active
+  // job and offers "Mark Completed" again (which the server rejects).
   const partnerStatus = isPartnerCancelled
     ? "CANCELLED"
+    : myAllocation?.status === "COMPLETED" && booking?.status !== "CANCELLED"
+    ? "COMPLETED"
     : booking?.status === "CONFIRMED" ? "PARTNER_ACCEPTED" : (booking?.status || "ASSIGNED");
+
+  // The customer's number is only for reaching them during the job. Once it's
+  // finished for this partner (completed or cancelled) it's withheld, so job
+  // history can't be used to contact customers outside the platform.
+  const jobFinished = partnerStatus === "COMPLETED" || partnerStatus === "CANCELLED";
 
   const helpers = Array.isArray(booking?.helpers)
     ? booking.helpers.map((h) => ({
@@ -67,29 +85,10 @@ function toPartnerJobPayload(booking, partnerId, { isPartnerCancelled = false } 
       }))
     : [];
 
-  // Line items with per-order customization (cakes: flavour, tiers, addons,
-  // name on cake) so the partner app can show exactly what to prepare.
   const services = Array.isArray(booking?.services)
     ? booking.services.map((s) => ({
         name: String(s?.name || ""),
         quantity: Number(s?.quantity || 1),
-        ...(s?.options && (s.options.flavour || s.options.nameOnCake)
-          ? {
-              options: {
-                flavour: String(s.options.flavour || ""),
-                weight: String(s.options.weight || ""),
-                tiers: Number(s.options.tiers) || 1,
-                addons: Array.isArray(s.options.addons)
-                  ? s.options.addons.map((a) => ({
-                      name: String(a?.name || ""),
-                      price: Number(a?.price) || 0,
-                    }))
-                  : [],
-                nameOnCake: String(s.options.nameOnCake || ""),
-                referencePhotoUrl: String(s.options.referencePhotoUrl || ""),
-              },
-            }
-          : {}),
       }))
     : [];
 
@@ -100,7 +99,7 @@ function toPartnerJobPayload(booking, partnerId, { isPartnerCancelled = false } 
     serviceCategory: booking?.serviceCategory || firstService?.category || "general",
     services,
     customerName: booking?.user?.name || "Customer",
-    customerPhone: booking?.user?.phone || "",
+    customerPhone: jobFinished ? "" : booking?.user?.phone || "",
     address: String(booking?.address || "").trim(),
     houseDetails: booking?.houseDetails ? String(booking.houseDetails).trim() : null,
     landmark: booking?.landmark ? String(booking.landmark).trim() : null,
@@ -166,6 +165,8 @@ exports.acceptBooking = async (req, res) => {
       return res.status(404).json({ success: false, message: "Booking not found" });
     }
 
+    const earning = (await partnerEarningsFor([booking], partnerId)).get(String(booking._id));
+
     // NOT_ACCEPTABLE / RACE_LOST: the booking already moved past the accept
     // gate (accepted on another device, started, …) — idempotent success so a
     // flaky-network retry doesn't error out in the partner's face.
@@ -173,7 +174,7 @@ exports.acceptBooking = async (req, res) => {
       return res.json({
         success: true,
         message: "Booking state already updated",
-        booking: toPartnerJobPayload(booking, partnerId),
+        booking: toPartnerJobPayload(booking, partnerId, { earning }),
       });
     }
 
@@ -182,7 +183,7 @@ exports.acceptBooking = async (req, res) => {
       message: result.statusChanged
         ? "Booking accepted"
         : "Noted — the job is confirmed once your team lead accepts.",
-      booking: toPartnerJobPayload(booking, partnerId),
+      booking: toPartnerJobPayload(booking, partnerId, { earning }),
     });
   } catch (err) {
     console.error("Accept booking error:", err);
@@ -299,7 +300,10 @@ exports.updateLocation = async (req, res) => {
     const latitude = Number(req.body?.latitude);
     const longitude = Number(req.body?.longitude);
 
-    if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+    if (
+      !Number.isFinite(latitude) || !Number.isFinite(longitude) ||
+      Math.abs(latitude) > 90 || Math.abs(longitude) > 180
+    ) {
       return res.status(400).json({
         success: false,
         message: "Valid latitude and longitude are required",
@@ -747,8 +751,7 @@ exports.submitEstimate = async (req, res) => {
         });
       }
 
-      // Whole rupees, matching computeCakeLineTotal and the pricing engine's
-      // round(): estimateTotal is fed to calculatePricing as baseAmount, which
+      // Whole rupees, matching the pricing engine's round(): estimateTotal is fed to calculatePricing as baseAmount, which
       // rounds anyway. Keeping paise here would quote the partner ₹800.10 and
       // then bill the customer ₹800 — the fractional quantity is exact, the
       // money it lands on is not.
@@ -865,6 +868,8 @@ exports.getPartnerBookings = async (req, res) => {
       Booking.countDocuments(query),
     ]);
 
+    const earnings = await partnerEarningsFor(bookingDocs, partnerId);
+
     const payloads = [];
     for (const booking of bookingDocs) {
       try {
@@ -872,7 +877,10 @@ exports.getPartnerBookings = async (req, res) => {
           booking.partnerCancellations.some(
             (c) => c.partner?.toString() === partnerId.toString()
           );
-        payloads.push(toPartnerJobPayload(booking, partnerId, { isPartnerCancelled }));
+        payloads.push(toPartnerJobPayload(booking, partnerId, {
+          isPartnerCancelled,
+          earning: earnings.get(String(booking._id)),
+        }));
       } catch (itemErr) {
         console.error("getPartnerBookings item error:", {
           bookingId: booking?._id?.toString?.() || String(booking?._id || ""),
@@ -941,6 +949,10 @@ exports.deletePartnerAccount = async (req, res) => {
     }
 
     const { reason = "" } = req.body;
+
+    // Payout details go with the account. Any open withdrawal keeps its own
+    // snapshot of the destination, so money already owed can still be paid.
+    await PartnerPayoutAccount.deleteOne({ partnerId });
 
     partner.name = "Deleted Partner";
     partner.phone = `deleted_${partnerId}`;

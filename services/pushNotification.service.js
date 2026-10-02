@@ -132,6 +132,24 @@ async function notifyCustomerOfBookingStatus(userId, status, bookingId) {
   }
 }
 
+/*
+ * Partner counterpart of notifyCustomerOfBookingStatus: looks up the partner's
+ * fcmToken and sends a one-off notification (payout account / withdrawal
+ * updates). Fire-and-forget — never throws into the caller.
+ */
+async function notifyPartner(partnerId, { type, title, body, data = {} }) {
+  try {
+    if (!partnerId) return;
+    const Partner = require("../models/Partner");
+    const partner = await Partner.findById(partnerId).select("fcmToken").lean();
+    if (partner?.fcmToken) {
+      await sendPush({ token: partner.fcmToken, type, title, body, data });
+    }
+  } catch (err) {
+    console.error("[push] notifyPartner error:", err.message);
+  }
+}
+
 /* ── Promotional broadcast (topic-based) ──
    The customer app subscribes every logged-in device to this FCM topic
    (see project1 src/services/fcm.ts). One send here fans out to all
@@ -163,5 +181,6 @@ module.exports = {
   sendJobCompletedPush,
   sendBookingStatusPush,
   notifyCustomerOfBookingStatus,
+  notifyPartner,
   sendPromoBroadcast,
 };

@@ -2,6 +2,16 @@ const Partner = require("../models/Partner");
 const Booking = require("../models/Booking");
 const TechnicianHelper = require("../models/TechnicianHelper");
 const { sendPushNotification } = require("../services/pushNotification.service");
+const { isACCategory } = require("../services/scheduling_service");
+
+// skillTier 2 also marks senior salon beauticians, so an AC technician is
+// tier 2 AND not registered solely for non-AC categories. Legacy partners
+// with no categories on file keep the old tier-only behaviour.
+function isACTechnician(partner) {
+  if (Number(partner?.skillTier) !== 2) return false;
+  const cats = Array.isArray(partner?.serviceCategories) ? partner.serviceCategories : [];
+  return !cats.length || cats.some((c) => isACCategory(String(c || "")));
+}
 
 /* Statuses during which a technician may still edit the booking's helpers —
    anything before the partner reaches the customer. */
@@ -32,7 +42,7 @@ exports.inviteHelper = async (req, res) => {
     const technician = req.partner;
     const phone = String(req.body?.phone || "").trim();
 
-    if (technician.skillTier !== 2) {
+    if (!isACTechnician(technician)) {
       return res.status(403).json({
         success: false,
         message: "Only AC technicians can invite helpers",
@@ -441,7 +451,8 @@ exports.listHelperJobs = async (req, res) => {
       address: b.address || "",
       pincode: b.pincode || "",
       customerName: b.user?.name || "Customer",
-      customerPhone: b.user?.phone || "",
+      // Withheld once the job is done — same rule as the partner job list.
+      customerPhone: b.status === "COMPLETED" ? "" : b.user?.phone || "",
       technicianName: b.partner?.name || "",
       technicianPhone: b.partner?.phone || "",
     }));

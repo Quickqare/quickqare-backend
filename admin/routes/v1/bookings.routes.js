@@ -24,6 +24,23 @@ const ASSIGNABLE_STATES = [
   "PARTNER_ACCEPTED", "ON_THE_WAY", "ARRIVED", "NO_PARTNER_AVAILABLE",
 ];
 
+// The category partner-gender rule (Category.partnerGender) binds manual
+// assignment too: a customer who booked a women-only service must not get a
+// male partner because an admin picked one. Returns why this partner can't
+// take the booking, or null.
+async function partnerGenderBlockReason(booking, partner) {
+  const { getPartnerGenderRule } = require("../../../services/scheduling_service");
+  const { required, conflict } = await getPartnerGenderRule(booking);
+  if (conflict) {
+    return "This booking mixes women-only and men-only services, so no single partner can take it";
+  }
+  if (required && partner.gender !== required) {
+    const who = required === "FEMALE" ? "women" : "men";
+    return `Only ${who} professionals can take this booking; ${partner.name || "this partner"}'s registered gender is ${partner.gender || "not set"}`;
+  }
+  return null;
+}
+
 // Notify a partner that a job has been (re)assigned to them. Emits the exact
 // socket events the partner app listens for (jobAssigned / job_assigned — see
 // mobile/src/services/socket.ts), with a full job payload, plus a push for
@@ -59,6 +76,15 @@ async function notifyPartnerOfAssignment(booking, partner) {
       { path: "user", select: "name phone" },
       { path: "primaryService", select: "name" },
     ]);
+    // The partner app shows amount/price as "Earnings": send what this job
+    // pays the partner after commission, not the customer's total.
+    let earning = Number(booking.totalAmount || 0);
+    try {
+      const { calculatePartnerSettlement } = require("../../../services/partnerSettlement.service");
+      earning = (await calculatePartnerSettlement(booking, partner)).partnerEarningAmount;
+    } catch (settlementErr) {
+      console.error("notifyPartnerOfAssignment earning estimate failed:", settlementErr.message);
+    }
     const payload = {
       bookingId: booking._id.toString(),
       _id: booking._id.toString(),
@@ -71,9 +97,8 @@ async function notifyPartnerOfAssignment(booking, partner) {
       location: booking.location || undefined,
       scheduledDate: booking.scheduledDate || undefined,
       scheduledTime: booking.scheduledTime || undefined,
-      totalAmount: booking.totalAmount || 0,
-      amount: booking.totalAmount || 0,
-      price: booking.totalAmount || 0,
+      amount: earning,
+      price: earning,
       status: "ASSIGNED",
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -232,6 +257,12 @@ router.post("/:id/assign", audit("admin.bookings.assign"), async (req, res) => {
       return fail(res, 400, "SAME_PARTNER", "Booking is already assigned to this partner", null, { requestId: req.requestId });
     }
 
+    // Safeguard: the category's partner-gender rule (e.g. women only)
+    const genderBlock = await partnerGenderBlockReason(booking, partner);
+    if (genderBlock) {
+      return fail(res, 400, "PARTNER_GENDER_MISMATCH", genderBlock, null, { requestId: req.requestId });
+    }
+
     const previousPartnerId = booking.partner;
     const previousAdditional = (booking.additionalPartners || []).map(String);
 
@@ -371,6 +402,12 @@ router.post("/:id/reassign", audit("admin.bookings.reassign"), async (req, res) 
     // Safeguard: can't reassign to the same partner
     if (booking.partner && String(booking.partner) === String(newPartner._id)) {
       return fail(res, 400, "SAME_PARTNER", "Booking is already assigned to this partner", null, { requestId: req.requestId });
+    }
+
+    // Safeguard: the category's partner-gender rule (e.g. women only)
+    const genderBlock = await partnerGenderBlockReason(booking, newPartner);
+    if (genderBlock) {
+      return fail(res, 400, "PARTNER_GENDER_MISMATCH", genderBlock, null, { requestId: req.requestId });
     }
 
     const oldPartnerId = booking.partner;

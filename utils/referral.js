@@ -116,6 +116,9 @@ exports.processReferralReward = async (userId, bookingId) => {
       description: settings.couponDescription,
       usageLimit: 1,
       perUserLimit: 1,
+      // Personal to the referred customer: unassigned, this single-use code was
+      // listed on the public coupon feed and redeemable by whoever used it first.
+      assignedTo: userId,
       applicableCategories: [],
       createdBy: "system"
     });

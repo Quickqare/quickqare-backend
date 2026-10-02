@@ -76,6 +76,7 @@ router.get("/", async (_req, res) => {
         mehendi:     iconAnimStyle(settings?.homeIconAnimation?.mehendi),
         electrician: iconAnimStyle(settings?.homeIconAnimation?.electrician),
         celebration: iconAnimStyle(settings?.homeIconAnimation?.celebration),
+        beauty:      iconAnimStyle(settings?.homeIconAnimation?.beauty),
         offers:      iconAnimStyle(settings?.homeIconAnimation?.offers),
       },
       socialLinks: {
@@ -111,6 +112,7 @@ router.get("/", async (_req, res) => {
           electricianShimmer: theme.categoryIcons?.electricianShimmer !== false,
           celebration:        theme.categoryIcons?.celebration ?? "",
           celebrationShimmer: theme.categoryIcons?.celebrationShimmer !== false,
+          beauty:             theme.categoryIcons?.beauty      ?? "",
           womenSalon:         theme.categoryIcons?.womenSalon ?? "",
         },
       },
@@ -127,7 +129,7 @@ router.get("/", async (_req, res) => {
       homeIconAnimationEnabled: true,
       homeIconAnimation: {
         acRepair: "bob", plumbing: "bob", mehendi: "bob",
-        electrician: "bob", celebration: "bob", offers: "bob",
+        electrician: "bob", celebration: "bob", beauty: "bob", offers: "bob",
       },
       socialLinks: DEFAULT_SOCIAL_LINKS,
       contactInfo: DEFAULT_CONTACT_INFO,

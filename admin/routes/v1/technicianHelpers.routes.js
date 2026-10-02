@@ -9,6 +9,7 @@ const { PERMISSIONS } = require("../../constants/permissions");
 const { asSingleString, getPagination } = require("../../utils/common");
 const { success, fail } = require("../../utils/response");
 const { sendPushNotification } = require("../../../services/pushNotification.service");
+const { isACCategory } = require("../../../services/scheduling_service");
 
 const router = express.Router();
 
@@ -157,7 +158,7 @@ router.post("/reassign", audit("admin.technicianHelpers.reassign"), async (req, 
 
     const [helper, technician] = await Promise.all([
       Partner.findById(helperId).select("_id name fcmToken isBlocked").lean(),
-      Partner.findById(newTechnicianId).select("_id name skillTier isBlocked fcmToken").lean(),
+      Partner.findById(newTechnicianId).select("_id name skillTier serviceCategories isBlocked fcmToken").lean(),
     ]);
 
     if (!helper) {
@@ -171,7 +172,13 @@ router.post("/reassign", audit("admin.technicianHelpers.reassign"), async (req, 
         requestId: req.requestId,
       });
     }
-    if (technician.skillTier !== 2) {
+    // skillTier 2 also marks senior salon beauticians — require an AC
+    // registration too (legacy partners with no categories keep tier-only).
+    const technicianCats = technician.serviceCategories || [];
+    if (
+      technician.skillTier !== 2 ||
+      (technicianCats.length && !technicianCats.some((c) => isACCategory(String(c || ""))))
+    ) {
       return fail(res, 400, "VALIDATION_ERROR", "Target partner is not an AC technician", null, {
         requestId: req.requestId,
       });

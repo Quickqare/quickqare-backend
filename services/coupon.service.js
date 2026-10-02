@@ -75,7 +75,13 @@ const validateCouponForAmount = async ({ code, amount, customerId = null, servic
     isActive: true,
   });
 
-  if (!coupon) {
+  // A personal coupon (e.g. a referral reward) is redeemable only by the
+  // customer it was issued to — anyone else, or a caller with no customer, gets
+  // the same answer as an unknown code, so the check can't confirm a guess.
+  const isOtherCustomersCoupon =
+    coupon && coupon.assignedTo && String(coupon.assignedTo) !== String(customerId || "");
+
+  if (!coupon || isOtherCustomersCoupon) {
     const err = new Error("Invalid coupon");
     err.statusCode = 400;
     throw err;
@@ -174,14 +180,21 @@ const validateCouponForAmount = async ({ code, amount, customerId = null, servic
   };
 };
 
-const listApplicableCoupons = async ({ amount, serviceIds = [] }) => {
+const listApplicableCoupons = async ({ amount, serviceIds = [], customerId = null }) => {
   const baseAmount = Number(amount || 0);
 
   if (!Number.isFinite(baseAmount) || baseAmount <= 0) {
     return [];
   }
 
-  const coupons = await Coupon.find({ isActive: true })
+  // General promo codes for everyone, plus the signed-in caller's own personal
+  // coupons. Other customers' personal coupons are never listed — this feed is
+  // public, and it used to hand out every referral reward code to anyone.
+  // (`assignedTo: null` also matches coupons created before the field existed.)
+  const coupons = await Coupon.find({
+    isActive: true,
+    assignedTo: customerId ? { $in: [null, customerId] } : null,
+  })
     .sort({ createdAt: -1 })
     .lean();
 

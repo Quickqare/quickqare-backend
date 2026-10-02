@@ -5,7 +5,6 @@ const {
   verifyOtp: verifyMsg91Otp,
   issuePhoneProof,
   verifyAccessToken: verifyMsg91AccessToken,
-  toInternationalPhone,
   phoneMatchesVerified,
 } = require("../services/msg91Otp.service");
 const {
@@ -17,6 +16,7 @@ const {
   setUserAuthCookie,
   clearUserAuthCookie,
 } = require("../utils/authCookie");
+const { toNationalPhone, INVALID_PHONE_MESSAGE } = require("../utils/phone");
 
 const USER_TOKEN_TTL = String(process.env.USER_JWT_TTL || "90d");
 const IS_PRODUCTION = String(process.env.NODE_ENV || "").toLowerCase() === "production";
@@ -77,10 +77,17 @@ exports.sendOtp = async (req, res) => {
 // VERIFY OTP
 exports.verifyOtp = async (req, res) => {
   try {
-    const { phone, otp, name, gender, referralCode } = req.body;
+    const { otp, name, gender, referralCode } = req.body;
 
-    if (!phone || typeof phone !== "string" || !otp || typeof otp !== "string") {
+    if (!req.body.phone || !otp || typeof otp !== "string") {
       return res.status(400).json({ message: "Phone and OTP are required" });
+    }
+
+    // The account key is the canonical number (utils/phone) — the same one
+    // MSG91 verifies — so reformatting a phone can't open a second account.
+    const phone = toNationalPhone(req.body.phone);
+    if (!phone) {
+      return res.status(400).json({ message: INVALID_PHONE_MESSAGE });
     }
 
     // MSG91 checks the code against the phone it was sent to, which is the
@@ -177,12 +184,18 @@ exports.verifyPhone = async (req, res) => {
 
 exports.exchangeMsg91AccessToken = async (req, res) => {
   try {
-    const { phone, accessToken, name, gender, referralCode } = req.body;
+    const { accessToken, name, gender, referralCode } = req.body;
 
-    if (!phone || !accessToken) {
+    if (!req.body.phone || !accessToken) {
       return res.status(400).json({
         message: "Phone number and MSG91 access token are required",
       });
+    }
+
+    // Canonical account key — see verifyOtp.
+    const phone = toNationalPhone(req.body.phone);
+    if (!phone) {
+      return res.status(400).json({ message: INVALID_PHONE_MESSAGE });
     }
 
     const skipServerVerify =

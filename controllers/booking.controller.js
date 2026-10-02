@@ -3,6 +3,7 @@ const Partner = require("../models/Partner");
 const Service = require("../models/service.model");
 const mongoose = require("mongoose");
 const Category = require("../models/Category");
+const SubCategory = require("../models/SubCategory");
 const { creditWallet, debitWallet } = require("./partnerWallet.controller");
 const { getAvailableSlots } = require("../services/slotAvailability_service");
 const { assignBooking, reassignBooking } = require("../services/assignmentEngine");
@@ -29,9 +30,6 @@ const {
   getPricingSettings,
   getMehendiPricingRuleKey,
   getMehendiHandsPriceWithSettings,
-  validateCakeOptions,
-  computeCakeLineTotal,
-  hasCustomization,
 } = require("../utils/pricing");
 const { validateCouponForAmount } = require("../services/coupon.service");
 const {
@@ -108,119 +106,9 @@ const normalizeText = (value = "") =>
 const roundAmount = (value) =>
   Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
 
-const clampPercent = (value, fallback = 20) => {
-  const numeric = Number(value);
-  if (!Number.isFinite(numeric)) return fallback;
-  return Math.min(Math.max(numeric, 0), 100);
-};
-
-/*
-  Approved AND PAID on-site estimate items are part of the partner's delivered
-  work — settle them exactly like booking lines (commission per item's service,
-  falling back to the partner's own rate). Estimates that were approved but
-  never paid contribute nothing: crediting a partner for money the platform
-  never collected would leak funds.
-*/
-const calculateEstimateSettlement = async (booking, partner) => {
-  const paid =
-    booking.estimateStatus === "approved" &&
-    booking.estimatePayment?.status === "PAID" &&
-    Array.isArray(booking.estimateItems) &&
-    booking.estimateItems.length > 0;
-
-  if (!paid) return { grossAmount: 0, commissionAmount: 0 };
-
-  // Estimate line items reference CatalogItem records (see submitEstimate),
-  // which carry no per-item commission — so commission on approved estimate
-  // work is charged at the partner's own rate. A previous version queried the
-  // Service collection with these CatalogItem ids, which never matched and
-  // silently produced this exact fallback for every item; the dead lookup is
-  // removed so the behaviour is explicit (and one DB round-trip is saved).
-  const commissionPercent = clampPercent(partner?.commissionPercent, 20);
-
-  let grossAmount = 0;
-  let commissionAmount = 0;
-  for (const item of booking.estimateItems) {
-    const lineTotal = roundAmount(Number(item.lineTotal || 0));
-    if (lineTotal <= 0) continue;
-    grossAmount = roundAmount(grossAmount + lineTotal);
-    commissionAmount = roundAmount(
-      commissionAmount + roundAmount((lineTotal * commissionPercent) / 100)
-    );
-  }
-
-  return {
-    grossAmount,
-    commissionAmount: Math.min(commissionAmount, grossAmount),
-  };
-};
-
-const calculatePartnerSettlement = async (booking, partner) => {
-  const taxableAmount = Math.max(
-    roundAmount(Number(booking.baseAmount || 0) - Number(booking.discountAmount || 0)),
-    0
-  );
-
-  const estimate = await calculateEstimateSettlement(booking, partner);
-
-  const bookingLines = Array.isArray(booking.services) ? booking.services : [];
-
-  if (bookingLines.length) {
-    const lineTotalBase = bookingLines.reduce(
-      (sum, item) => sum + Number(item.lineTotal || 0),
-      0
-    );
-    const discountFactor =
-      lineTotalBase > 0 ? taxableAmount / lineTotalBase : 1;
-
-    const validIds = bookingLines
-      .map((item) => String(item.serviceId || ""))
-      .filter((id) => mongoose.Types.ObjectId.isValid(id));
-
-    const serviceRows = await Service.find({ _id: { $in: validIds } })
-      .select("commissionPercent")
-      .lean();
-    const serviceMap = new Map(serviceRows.map((row) => [String(row._id), row]));
-
-    let commissionAmount = 0;
-
-    for (const item of bookingLines) {
-      const lineTotal = roundAmount(Number(item.lineTotal || 0) * discountFactor);
-      const commissionPercent = clampPercent(
-        serviceMap.get(String(item.serviceId || ""))?.commissionPercent,
-        clampPercent(partner?.commissionPercent, 20)
-      );
-      commissionAmount += roundAmount((lineTotal * commissionPercent) / 100);
-    }
-
-    commissionAmount = Math.min(roundAmount(commissionAmount), taxableAmount);
-
-    return {
-      grossAmount: roundAmount(taxableAmount + estimate.grossAmount),
-      commissionAmount: roundAmount(commissionAmount + estimate.commissionAmount),
-      partnerEarningAmount: roundAmount(
-        taxableAmount - commissionAmount + estimate.grossAmount - estimate.commissionAmount
-      ),
-    };
-  }
-
-  let commissionPercent = clampPercent(partner?.commissionPercent, 20);
-  if (booking.serviceId && mongoose.Types.ObjectId.isValid(String(booking.serviceId))) {
-    const service = await Service.findById(booking.serviceId)
-      .select("commissionPercent")
-      .lean();
-    commissionPercent = clampPercent(service?.commissionPercent, commissionPercent);
-  }
-
-  const commissionAmount = roundAmount((taxableAmount * commissionPercent) / 100);
-  return {
-    grossAmount: roundAmount(taxableAmount + estimate.grossAmount),
-    commissionAmount: roundAmount(commissionAmount + estimate.commissionAmount),
-    partnerEarningAmount: roundAmount(
-      taxableAmount - commissionAmount + estimate.grossAmount - estimate.commissionAmount
-    ),
-  };
-};
+// Commission / partner-share maths lives in partnerSettlement.service so the
+// wallet credit here and the earnings shown in the partner app share one source.
+const { calculatePartnerSettlement } = require("../services/partnerSettlement.service");
 
 /* =======================
    USER CREATES BOOKING
@@ -395,13 +283,7 @@ exports.createBooking = async (req, res) => {
     let finalPrimaryService = primaryService;
     const categorySlugCache = new Map();
     const allServiceCancellationTiers = [];
-    // Customization-configured (cake) services drive lead-time and the
-    // SINCE_BOOKING cancellation policy for the whole booking.
-    let hasCustomizedService = false;
-    let hasPlainService = false;
-    let maxMinLeadDays = 0;
-    let sinceBookingPolicy = null; // { tiers } from the first SINCE_BOOKING service
-    // Most lenient grace-period config across booked services (cakes).
+    // Most lenient grace-period config across booked services.
     // graceLeadThresholdHours is Infinity when a service applies its grace to
     // every order (appliesBelowLeadHours = 0).
     let graceWindowMinutes = 0;
@@ -454,6 +336,24 @@ exports.createBooking = async (req, res) => {
       return resolved;
     };
 
+    // Admin can switch off a service, its sub-category or its category (the
+    // category switch does not cascade to services). Listings hide switched-off
+    // services, but a stale cart or a direct API call can still send one.
+    const switchedOffCache = new Map();
+    const isSwitchedOff = async (service) => {
+      if (service?.isActive === false) return true;
+      for (const [Model, ref] of [[Category, service?.category], [SubCategory, service?.subCategory]]) {
+        const id = String(ref || "").trim();
+        if (!mongoose.Types.ObjectId.isValid(id)) continue;
+        if (!switchedOffCache.has(id)) {
+          const row = await Model.findById(id).select("isActive").lean();
+          switchedOffCache.set(id, row?.isActive === false);
+        }
+        if (switchedOffCache.get(id)) return true;
+      }
+      return false;
+    };
+
     /* =====================
        NEW MULTI-SERVICE FLOW
     ===================== */
@@ -487,6 +387,13 @@ exports.createBooking = async (req, res) => {
           });
         }
 
+        if (await isSwitchedOff(service)) {
+          return res.status(400).json({
+            success: false,
+            message: `${service.name} is currently unavailable`,
+          });
+        }
+
         const categorySlug = await resolveServiceCategorySlug(service);
         const quantity = Math.min(Math.max(Number(item.quantity || 1), 1), MAX_ITEM_QUANTITY);
         // Pricing is ALWAYS taken from the server-side Service record. The
@@ -502,36 +409,6 @@ exports.createBooking = async (req, res) => {
           });
         }
 
-        // Customized services (cakes): options are validated against the
-        // Service's admin-managed customization config and priced entirely
-        // server-side — flavour/tier/addon deltas come from the DB record.
-        let resolvedOptions = null;
-        let customizedTotals = null;
-        if (hasCustomization(service)) {
-          const validation = validateCakeOptions(service, item.options || {});
-          if (!validation.ok) {
-            return res.status(400).json({
-              success: false,
-              message: validation.message,
-            });
-          }
-          resolvedOptions = validation.options;
-          customizedTotals = computeCakeLineTotal(service, resolvedOptions, quantity);
-
-          hasCustomizedService = true;
-          maxMinLeadDays = Math.max(maxMinLeadDays, Number(service.minLeadDays) || 0);
-          if (
-            service.cancellationPolicyType === "SINCE_BOOKING" &&
-            !sinceBookingPolicy &&
-            Array.isArray(service.sinceBookingTiers) &&
-            service.sinceBookingTiers.length > 0
-          ) {
-            sinceBookingPolicy = { tiers: service.sinceBookingTiers };
-          }
-        } else {
-          hasPlainService = true;
-        }
-
         // Mehendi hand designs use tiered "package" pricing by number of hands
         // (e.g. 2 hands of Minimal Mehendi = ₹699, not 2 × ₹399 = ₹798). The
         // per-hand base price stays in `price`; only the line total is tiered.
@@ -543,11 +420,9 @@ exports.createBooking = async (req, res) => {
         const mehendiPackageTotal = mehendiPricingRuleKey
           ? await getMehendiHandsPriceWithSettings(mehendiPricingRuleKey, quantity)
           : null;
-        const itemTotal = customizedTotals
-          ? customizedTotals.lineTotal
-          : mehendiPackageTotal != null
-            ? mehendiPackageTotal
-            : price * quantity;
+        const itemTotal = mehendiPackageTotal != null
+          ? mehendiPackageTotal
+          : price * quantity;
         const categoryValue =
           categorySlug || (service.category ? String(service.category) : "");
         const subCategoryValue = service.subCategory
@@ -559,12 +434,11 @@ exports.createBooking = async (req, res) => {
         bookingServices.push({
           serviceId: service._id,
           name: service.name,
-          price: customizedTotals ? customizedTotals.unitPrice : price,
+          price,
           lineTotal: itemTotal,
           quantity,
           category: categoryValue,
           subCategory: subCategoryValue,
-          ...(resolvedOptions ? { options: resolvedOptions } : {}),
         });
 
         // Collect cancellation tiers from each service for snapshot
@@ -572,16 +446,6 @@ exports.createBooking = async (req, res) => {
           allServiceCancellationTiers.push(service.cancellationTiers);
         }
         collectCancellationGrace(service);
-      }
-
-      // Customized (cake) orders can't be mixed with other services in one
-      // booking — lead time, cancellation policy, and baker capacity would
-      // become ambiguous for the combined cart.
-      if (hasCustomizedService && hasPlainService) {
-        return res.status(400).json({
-          success: false,
-          message: "Cake orders must be booked separately from other services",
-        });
       }
 
       // if primary service not provided → take first service
@@ -671,12 +535,11 @@ exports.createBooking = async (req, res) => {
         });
       }
 
-      // Customized services (cakes) need an options payload the legacy
-      // single-service format can't carry — require the multi-service flow.
-      if (hasCustomization(legacyService)) {
+      // Same switched-off rule as the multi-service flow.
+      if (await isSwitchedOff(legacyService)) {
         return res.status(400).json({
           success: false,
-          message: "This service requires customization options. Please update your app to book it.",
+          message: `${legacyService.name} is currently unavailable`,
         });
       }
 
@@ -756,34 +619,6 @@ exports.createBooking = async (req, res) => {
         success: false,
         message: "Selected service is not enabled in this pincode",
       });
-    }
-
-    // Advance-only orders (cakes): the scheduled date must be at least
-    // minLeadDays calendar days ahead of today (local server time — same
-    // semantics as buildDateTime/normalizeDateKey). "1 day ahead" means
-    // tomorrow is fine at any hour; today is never allowed.
-    if (maxMinLeadDays > 0) {
-      const now = new Date();
-      const earliestAllowed = new Date(
-        now.getFullYear(),
-        now.getMonth(),
-        now.getDate() + maxMinLeadDays
-      );
-      const sched = new Date(scheduledDate);
-      const scheduledDay = new Date(
-        sched.getFullYear(),
-        sched.getMonth(),
-        sched.getDate()
-      );
-      if (scheduledDay.getTime() < earliestAllowed.getTime()) {
-        return res.status(400).json({
-          success: false,
-          message:
-            maxMinLeadDays === 1
-              ? "Cake orders must be placed at least 1 day in advance. Please pick tomorrow or later."
-              : `This order must be placed at least ${maxMinLeadDays} days in advance.`,
-        });
-      }
     }
 
       /* =====================
@@ -902,13 +737,7 @@ exports.createBooking = async (req, res) => {
       payment: { status: "PENDING" },
       status: "PENDING_PAYMENT",
       cancellationTiersSnapshot,
-      cancellationPolicyTypeSnapshot: sinceBookingPolicy ? "SINCE_BOOKING" : "BEFORE_SERVICE",
-      sinceBookingTiersSnapshot: sinceBookingPolicy
-        ? sinceBookingPolicy.tiers.map((t) => ({
-            maxHoursAfterBooking: Number(t.maxHoursAfterBooking),
-            refundPercent: Number(t.refundPercent),
-          }))
-        : [],
+      cancellationPolicyTypeSnapshot: "BEFORE_SERVICE",
       freeCancelUntil,
     };
 
@@ -1025,7 +854,8 @@ exports.getAvailableSlots = async (req, res) => {
       slots,
     });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    console.error("getAvailableSlots error:", error);
+    res.status(500).json({ message: "Unable to load slots. Please try again." });
   }
 };
 
@@ -1055,6 +885,12 @@ exports.markOnTheWay = async (req, res) => {
       (booking.additionalPartners || []).some((p) => p.toString() === pid);
     if (!isAssigned) {
       return res.status(403).json({ message: "Not assigned to this booking" });
+    }
+
+    // Already on the way or further along — a teammate got there first, or a
+    // double tap / network retry. Idempotent success, nothing re-notified.
+    if (["ON_THE_WAY", "ARRIVED", "IN_PROGRESS"].includes(booking.status)) {
+      return res.json({ success: true, message: "Already on the way", status: booking.status });
     }
 
     // Status guard
@@ -1157,6 +993,11 @@ exports.markArrived = async (req, res) => {
       (booking.additionalPartners || []).some((p) => p.toString() === pid);
     if (!isAssigned) {
       return res.status(403).json({ message: "Not assigned to this booking" });
+    }
+
+    // Already arrived or started (teammate first / retry) — idempotent success.
+    if (["ARRIVED", "IN_PROGRESS"].includes(booking.status)) {
+      return res.json({ success: true, message: "Arrival already recorded", status: booking.status });
     }
 
     if (booking.status !== "ON_THE_WAY") {
@@ -1476,6 +1317,13 @@ exports.startService = async (req, res) => {
       return res.status(403).json({ message: "Not assigned to this booking" });
     }
 
+    // Already started — a teammate entered the customer's code, or this is a
+    // retry. Nothing to verify: the start-code/selfie gates guard the
+    // transition into IN_PROGRESS, which has already happened.
+    if (booking.status === "IN_PROGRESS") {
+      return res.json({ success: true, message: "Service already started", status: booking.status });
+    }
+
     if (!["ON_THE_WAY", "ARRIVED"].includes(booking.status)) {
       return res.status(400).json({
         message: `Cannot start service from status ${booking.status}`,
@@ -1566,6 +1414,17 @@ exports.completeBooking = async (req, res) => {
 
     if (!booking) return res.status(404).json({ message: "Booking not found" });
 
+    // Authorization FIRST — only an assigned partner can complete, or see the
+    // settlement. (The idempotent early return below used to run before this
+    // check, so any partner could read any completed booking's payout split.)
+    const pid = String(partnerId);
+    const isAssigned =
+      booking.partner?._id?.toString() === pid ||
+      (booking.additionalPartners || []).some((p) => p.toString() === pid);
+    if (!isAssigned) {
+      return res.status(403).json({ message: "Not assigned to this booking" });
+    }
+
     // Idempotency — partner taps "Complete" twice on flaky network.
     if (booking.status === "COMPLETED") {
       return res.json({
@@ -1578,15 +1437,6 @@ exports.completeBooking = async (req, res) => {
 
     if (booking.status !== "IN_PROGRESS") {
       return res.status(400).json({ message: "Booking not in progress" });
-    }
-
-    // Authorization — only an assigned partner can complete
-    const pid = String(partnerId);
-    const isAssigned =
-      booking.partner?._id?.toString() === pid ||
-      (booking.additionalPartners || []).some((p) => p.toString() === pid);
-    if (!isAssigned) {
-      return res.status(403).json({ message: "Not assigned to this booking" });
     }
 
     const partner = booking.partner;
@@ -1816,7 +1666,7 @@ exports.completeBooking = async (req, res) => {
     });
   } catch (error) {
     console.error("completeBooking error:", { bookingId: req.params?.bookingId, err: error.message });
-    res.status(500).json({ message: error.message });
+    res.status(500).json({ message: "Could not complete the job. Please try again." });
   }
 };
 
@@ -2197,28 +2047,6 @@ function mergeCancellationTiers(tiersArrays) {
     .sort((a, b) => b.minHoursBefore - a.minHoursBefore);
 }
 
-// SINCE_BOOKING policy (cakes): refund keyed on hours ELAPSED since the
-// booking was created, not hours remaining until the service. Tiers ascend by
-// maxHoursAfterBooking; the first tier the elapsed time fits under wins.
-// e.g. [{1, 100}, {8760, 50}] → within 1h of booking = 100%, afterwards = 50%.
-function calculateSinceBookingRefund(totalAmount, hoursSinceBooking, tiers) {
-  if (!Array.isArray(tiers) || tiers.length === 0) return { percent: 0, amount: 0 };
-  const sorted = [...tiers].sort(
-    (a, b) => Number(a.maxHoursAfterBooking) - Number(b.maxHoursAfterBooking)
-  );
-  for (const tier of sorted) {
-    if (hoursSinceBooking <= Number(tier.maxHoursAfterBooking)) {
-      const percent = Number(tier.refundPercent) || 0;
-      return { percent, amount: Math.round(totalAmount * percent / 100) };
-    }
-  }
-  // Elapsed time beyond the last tier — apply the final (least generous) tier
-  // rather than silently refunding 0%.
-  const last = sorted[sorted.length - 1];
-  const percent = Number(last.refundPercent) || 0;
-  return { percent, amount: Math.round(totalAmount * percent / 100) };
-}
-
 // Resolves refund percent from tiers sorted descending by minHoursBefore.
 function calculateRefund(totalAmount, hoursToService, tiers) {
   if (hoursToService < 0) return { percent: 0, amount: 0 };
@@ -2291,20 +2119,6 @@ exports.cancelBookingByUser = async (req, res) => {
         // grace window the customer gets 100% back regardless of tier.
         refund = { percent: 100, amount: Number(booking.totalAmount || 0) };
         graceApplied = true;
-      } else if (
-        booking.cancellationPolicyTypeSnapshot === "SINCE_BOOKING" &&
-        Array.isArray(booking.sinceBookingTiersSnapshot) &&
-        booking.sinceBookingTiersSnapshot.length > 0
-      ) {
-        // Cake orders: refund depends on how long ago the booking was placed
-        // (free-cancel window right after booking), not on time to service.
-        const hoursSinceBooking =
-          (Date.now() - new Date(booking.createdAt).getTime()) / (1000 * 60 * 60);
-        refund = calculateSinceBookingRefund(
-          Number(booking.totalAmount || 0),
-          hoursSinceBooking,
-          booking.sinceBookingTiersSnapshot
-        );
       } else {
         refund = calculateRefund(
           Number(booking.totalAmount || 0),
@@ -2338,8 +2152,7 @@ exports.cancelBookingByUser = async (req, res) => {
       });
     }
 
-    // Instant refund for the free-cancel window (cake orders cancelled inside
-    // their SINCE_BOOKING first tier or the grace-period window, 100% refund)
+    // Instant refund for the grace-period free-cancel window (100% refund)
     // — the customer shouldn't have to wait for manual back-office processing
     // when they're getting their money back in full. Any other tier/percent
     // still goes through the existing manual PENDING → back-office flow.
@@ -2348,8 +2161,7 @@ exports.cancelBookingByUser = async (req, res) => {
     if (
       refund.amount > 0 &&
       refund.percent === 100 &&
-      (graceApplied ||
-        booking.cancellationPolicyTypeSnapshot === "SINCE_BOOKING") &&
+      graceApplied &&
       booking.payment?.razorpay_payment_id &&
       process.env.RAZORPAY_KEY_ID &&
       process.env.RAZORPAY_KEY_SECRET
@@ -2400,9 +2212,12 @@ exports.cancelBookingByUser = async (req, res) => {
     // Bust slot cache so freed slot is visible to other customers immediately
     clearSlotCache(booking.pincode, booking.scheduledDate);
 
-    // Notify partner — they need to know the booking is no longer in their queue
+    // Notify partner — they need to know the booking is no longer in their queue.
+    // "job_cancelled" is the event the partner app listens for (it used to be
+    // "booking_cancelled", which no partner app version handled, so a partner
+    // with the app open never heard about customer cancellations).
     if (global.io && booking.partner) {
-      global.io.to(`partner_${booking.partner._id}`).emit("booking_cancelled", {
+      global.io.to(`partner_${booking.partner._id}`).emit("job_cancelled", {
         bookingId: booking._id.toString(),
         cancelledBy: "user",
       });
@@ -2421,7 +2236,7 @@ exports.cancelBookingByUser = async (req, res) => {
     if (booking.additionalPartners?.length) {
       if (global.io) {
         for (const pId of booking.additionalPartners) {
-          global.io.to(`partner_${pId}`).emit("booking_cancelled", {
+          global.io.to(`partner_${pId}`).emit("job_cancelled", {
             bookingId: booking._id.toString(),
             cancelledBy: "user",
           });

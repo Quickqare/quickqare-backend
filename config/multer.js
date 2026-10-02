@@ -2,6 +2,7 @@ const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
 const { extFromMime } = require("../utils/imageExt");
+const { verifiedImageContentType } = require("../utils/imageContentType");
 
 // General image uploads (services, cakes, banners, customer reference photos,
 // job-start selfies). Storage backend is selectable:
@@ -51,7 +52,8 @@ function buildStorage() {
   return multerS3({
     s3: r2Client,
     bucket: process.env.R2_BUCKET_NAME,
-    contentType: multerS3.AUTO_CONTENT_TYPE,
+    // Real JPEG/PNG/WebP only, typed from the file's bytes (utils/imageContentType).
+    contentType: verifiedImageContentType,
     // Keys are unique and never rewritten (a re-upload mints a new key), so
     // browsers + Cloudflare edge may cache forever — repeat views never hit
     // the bucket (saves R2 Class B reads).

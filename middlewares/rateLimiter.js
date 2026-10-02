@@ -1,5 +1,19 @@
 const rateLimit = require("express-rate-limit");
 const { ipKeyGenerator } = require("express-rate-limit");
+const { toNationalPhone } = require("../utils/phone");
+
+// Key for the per-phone limiters: the canonical national number (utils/phone —
+// the same form MSG91 dials and the DB stores), so every formatting of one real
+// number ("9876543210", "+91 98765 43210", "98765-43210") shares ONE bucket.
+// Keying on the raw string gave each variant its own budget. A missing or
+// unparseable phone falls back to the client IP; those requests are rejected
+// with a 400 before any SMS is sent.
+//
+// ipKeyGenerator takes the IP string (and masks IPv6 to a /56). It was
+// previously handed the whole request object, which made every fallback key
+// unique — i.e. never limited.
+const phoneOrIpKey = (req, prefix) =>
+  `${prefix}:${toNationalPhone(req.body?.phone) || ipKeyGenerator(req.ip)}`;
 
 /* =====================================================
    GLOBAL FLOOR LIMITER
@@ -104,12 +118,7 @@ exports.phoneOtpLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
 
-  keyGenerator: (req) => {
-    // Normalise: strip spaces, leading +, ensure string so
-    // an empty/missing phone falls back to IP (authLimiter catches it anyway).
-    const phone = String(req.body?.phone || "").replace(/\s+/g, "").replace(/^\+/, "");
-    return phone || ipKeyGenerator(req);
-  },
+  keyGenerator: (req) => phoneOrIpKey(req, "otp-send"),
 
   handler: (req, res) => {
     res.status(429).json({
@@ -136,7 +145,7 @@ exports.bookingCreateLimiter = rateLimit({
   legacyHeaders: false,
 
   keyGenerator: (req) =>
-    req.user?._id ? `booking-create:${req.user._id}` : ipKeyGenerator(req),
+    req.user?._id ? `booking-create:${req.user._id}` : ipKeyGenerator(req.ip),
 
   handler: (req, res) => {
     res.status(429).json({
@@ -221,10 +230,7 @@ exports.partnerLeadPhoneLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
 
-  keyGenerator: (req) => {
-    const phone = String(req.body?.phone || "").replace(/\D/g, "");
-    return phone ? `partner-lead:${phone}` : ipKeyGenerator(req);
-  },
+  keyGenerator: (req) => phoneOrIpKey(req, "partner-lead"),
 
   handler: (req, res) => {
     res.status(429).json({
@@ -253,10 +259,7 @@ exports.phoneLoginLimiter = rateLimit({
 
   skipSuccessfulRequests: true,
 
-  keyGenerator: (req) => {
-    const phone = String(req.body?.phone || "").replace(/\s+/g, "").replace(/^\+/, "");
-    return `login:${phone || ipKeyGenerator(req)}`;
-  },
+  keyGenerator: (req) => phoneOrIpKey(req, "login"),
 
   handler: (req, res) => {
     res.status(429).json({
@@ -288,10 +291,7 @@ exports.phoneOtpVerifyLimiter = rateLimit({
 
   skipSuccessfulRequests: true,
 
-  keyGenerator: (req) => {
-    const phone = String(req.body?.phone || "").replace(/\s+/g, "").replace(/^\+/, "");
-    return `otp-verify:${phone || ipKeyGenerator(req)}`;
-  },
+  keyGenerator: (req) => phoneOrIpKey(req, "otp-verify"),
 
   handler: (req, res) => {
     res.status(429).json({
@@ -309,10 +309,7 @@ exports.phoneOtpHourlyLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
 
-  keyGenerator: (req) => {
-    const phone = String(req.body?.phone || "").replace(/\s+/g, "").replace(/^\+/, "");
-    return `hourly:${phone || ipKeyGenerator(req)}`;
-  },
+  keyGenerator: (req) => phoneOrIpKey(req, "hourly"),
 
   handler: (req, res) => {
     res.status(429).json({

@@ -8,8 +8,10 @@ const {
 /* =====================================================
    AVAILABLE COUPONS
    GET /api/coupons/available?amount=1234
+   Public. A signed-in customer (Bearer or web cookie) also sees their own
+   personal coupons, e.g. a referral reward — nobody else's.
 ===================================================== */
-router.get("/available", async (req, res) => {
+router.get("/available", userAuth.optional, async (req, res) => {
   try {
     const amount = Number(req.query.amount || req.query.cartValue || 0);
     if (!Number.isFinite(amount) || amount <= 0) {
@@ -21,7 +23,15 @@ router.get("/available", async (req, res) => {
 
     const rawServiceIds = req.query.serviceIds || "";
     const serviceIds = rawServiceIds ? String(rawServiceIds).split(",").filter(Boolean) : [];
-    const coupons = await listApplicableCoupons({ amount, serviceIds });
+    const coupons = await listApplicableCoupons({
+      amount,
+      serviceIds,
+      customerId: req.user?._id || null,
+    });
+
+    // The list can include the caller's personal codes — never let a shared
+    // cache (CDN/proxy) store it and serve it to someone else.
+    res.set("Cache-Control", "private, no-store");
 
     return res.json({
       success: true,

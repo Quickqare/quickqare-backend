@@ -108,43 +108,6 @@ exports.createBookingValidator = [
     .withMessage("price must be a non-negative number"),
 
   /* =====================
-     CUSTOMIZATION OPTIONS (CAKES)
-     Deep validation (valid flavour/addon names, pricing) happens in
-     createBooking against the Service's customization config.
-  ===================== */
-  body("services.*.options.flavour")
-    .optional()
-    .isString()
-    .withMessage("flavour must be a string"),
-
-  body("services.*.options.weight")
-    .optional()
-    .isString()
-    .withMessage("weight must be a string"),
-
-  body("services.*.options.tiers")
-    .optional()
-    .isInt({ min: 1, max: 2 })
-    .withMessage("tiers must be 1 or 2"),
-
-  body("services.*.options.addons")
-    .optional()
-    .isArray()
-    .withMessage("addons must be an array of addon names"),
-
-  body("services.*.options.nameOnCake")
-    .optional()
-    .isString()
-    .isLength({ max: 40 })
-    .withMessage("nameOnCake must be at most 40 characters"),
-
-  body("services.*.options.referencePhotoUrl")
-    .optional()
-    .isString()
-    .isLength({ max: 1024 })
-    .withMessage("referencePhotoUrl must be at most 1024 characters"),
-
-  /* =====================
      PRIMARY SERVICE (NEW)
   ===================== */
   body("primaryService")

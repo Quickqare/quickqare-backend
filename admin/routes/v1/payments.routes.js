@@ -13,8 +13,12 @@ const PayoutBatch = require("../../models/PayoutBatch");
 const { PERMISSIONS } = require("../../constants/permissions");
 const { getPagination, asSingleString } = require("../../utils/common");
 const { success, fail } = require("../../utils/response");
-const { decryptBankDetails } = require("../../../utils/fieldCrypto");
+const PartnerPayoutAccount = require("../../../models/PartnerPayoutAccount");
+const { decryptBankDetails, decryptField } = require("../../../utils/fieldCrypto");
 const { debitWallet } = require("../../../controllers/partnerWallet.controller");
+const { notifyPartner } = require("../../../services/pushNotification.service");
+
+const inr = (amount) => `₹${Number(amount || 0).toLocaleString("en-IN")}`;
 
 const router = express.Router();
 
@@ -144,10 +148,13 @@ router.get(
         Withdrawal.countDocuments(filter),
       ]);
 
-      // Decrypt the at-rest bank details so the admin sees the real account
-      // number/IFSC needed to make the payout. rows are lean → mutate in place.
+      // Decrypt the at-rest destination so the admin sees the real account
+      // number/IFSC or UPI ID needed to make the payout. rows are lean →
+      // mutate in place. Legacy rows (no payoutMethod) are always bank.
       for (const row of rows) {
+        row.payoutMethod = row.payoutMethod || "BANK";
         if (row.bankDetails) row.bankDetails = decryptBankDetails(row.bankDetails);
+        if (row.upiId) row.upiId = decryptField(row.upiId);
       }
 
       return success(res, rows, {
@@ -165,6 +172,12 @@ router.get(
 /* =====================================================
    APPROVE WITHDRAWAL
    PATCH /api/v1/admin/payments/withdrawals/:id/approve
+   Body: { referenceId }  — UTR of the transfer the admin already made.
+
+   The PENDING → APPROVED flip is a status-guarded claim done FIRST, so two
+   admins (or a double click) can't both approve, and approve can't race a
+   reject. Wallet bookkeeping runs only for the request that won the claim;
+   if it fails, the claim is rolled back to PENDING.
 ===================================================== */
 router.patch(
   "/withdrawals/:id/approve",
@@ -177,50 +190,83 @@ router.patch(
         return fail(res, 400, "INVALID_ID", "Invalid withdrawal id", null, { requestId: req.requestId });
       }
 
-      const referenceId = String(req.body.referenceId || "").trim();
-
-      const withdrawal = await Withdrawal.findById(id);
-      if (!withdrawal) {
-        return fail(res, 404, "NOT_FOUND", "Withdrawal not found", null, { requestId: req.requestId });
-      }
-      if (withdrawal.status !== "PENDING") {
-        return fail(res, 400, "ALREADY_PROCESSED", "Withdrawal already processed", null, { requestId: req.requestId });
-      }
-
-      if (withdrawal.balanceHeld) {
-        // Funds were already reserved out of withdrawableBalance when the
-        // partner submitted the request. Approving must NOT debit again —
-        // just move the held amount into totalWithdrawn and write the ledger row.
-        await PartnerWallet.updateOne(
-          { partnerId: withdrawal.partnerId },
-          {
-            $inc: { totalWithdrawn: withdrawal.amount },
-            $set: { lastUpdated: new Date() },
-          }
+      const referenceId = String(req.body.referenceId || "").trim().slice(0, 100);
+      if (!referenceId) {
+        return fail(
+          res,
+          400,
+          "VALIDATION_ERROR",
+          "Enter the UTR / transaction reference of the transfer you made",
+          null,
+          { requestId: req.requestId }
         );
-        await WalletTransaction.create({
-          partnerId: withdrawal.partnerId,
-          amount: withdrawal.amount,
-          type: "debit",
-          reason: "withdrawal",
-          status: "success",
-          description: `Withdrawal approved by admin. Ref: ${referenceId || "N/A"}`,
-        });
-      } else {
-        // Legacy request (no hold at creation) — debit now. Throws if insufficient balance.
-        await debitWallet({
-          partnerId: withdrawal.partnerId,
-          amount: withdrawal.amount,
-          reason: "withdrawal",
-          description: `Withdrawal approved by admin. Ref: ${referenceId || "N/A"}`,
-        });
       }
 
-      withdrawal.status = "APPROVED";
-      withdrawal.referenceId = referenceId || null;
-      withdrawal.processedBy = req.adminUser.id;
-      withdrawal.processedAt = new Date();
-      await withdrawal.save();
+      const withdrawal = await Withdrawal.findOneAndUpdate(
+        { _id: id, status: "PENDING" },
+        {
+          $set: {
+            status: "APPROVED",
+            referenceId,
+            processedBy: req.adminUser.id,
+            processedAt: new Date(),
+          },
+        },
+        { new: true }
+      );
+      if (!withdrawal) {
+        const exists = await Withdrawal.exists({ _id: id });
+        return exists
+          ? fail(res, 400, "ALREADY_PROCESSED", "Withdrawal already processed", null, { requestId: req.requestId })
+          : fail(res, 404, "NOT_FOUND", "Withdrawal not found", null, { requestId: req.requestId });
+      }
+
+      try {
+        if (withdrawal.balanceHeld) {
+          // Funds were already reserved out of withdrawableBalance when the
+          // partner submitted the request. Approving must NOT debit again —
+          // just move the held amount into totalWithdrawn and write the ledger row.
+          await PartnerWallet.updateOne(
+            { partnerId: withdrawal.partnerId },
+            {
+              $inc: { totalWithdrawn: withdrawal.amount },
+              $set: { lastUpdated: new Date() },
+            }
+          );
+          await WalletTransaction.create({
+            partnerId: withdrawal.partnerId,
+            amount: withdrawal.amount,
+            type: "debit",
+            reason: "withdrawal",
+            status: "success",
+            referenceId,
+            description: `Withdrawal paid. Ref: ${referenceId}`,
+          });
+        } else {
+          // Legacy request (no hold at creation) — debit now. Throws if insufficient balance.
+          await debitWallet({
+            partnerId: withdrawal.partnerId,
+            amount: withdrawal.amount,
+            reason: "withdrawal",
+            description: `Withdrawal paid. Ref: ${referenceId}`,
+          });
+        }
+      } catch (bookkeepingError) {
+        await Withdrawal.updateOne(
+          { _id: id, status: "APPROVED" },
+          { $set: { status: "PENDING", referenceId: null, processedBy: null, processedAt: null } }
+        );
+        throw bookkeepingError;
+      }
+
+      notifyPartner(withdrawal.partnerId, {
+        type: "WITHDRAWAL_APPROVED",
+        title: "Withdrawal paid",
+        body: `${inr(withdrawal.amount)} has been sent to your ${
+          withdrawal.payoutMethod === "UPI" ? "UPI ID" : "bank account"
+        }. Ref: ${referenceId}`,
+        data: { withdrawalId: String(withdrawal._id) },
+      });
 
       return success(res, withdrawal, { requestId: req.requestId });
     } catch (error) {
@@ -234,6 +280,9 @@ router.patch(
 /* =====================================================
    REJECT WITHDRAWAL
    PATCH /api/v1/admin/payments/withdrawals/:id/reject
+   Same claim-first pattern as approve: only the request that flips
+   PENDING → REJECTED returns the held amount, so concurrent rejects can't
+   refund it twice.
 ===================================================== */
 router.patch(
   "/withdrawals/:id/reject",
@@ -246,44 +295,202 @@ router.patch(
         return fail(res, 400, "INVALID_ID", "Invalid withdrawal id", null, { requestId: req.requestId });
       }
 
-      const reason = String(req.body.reason || "").trim();
+      const reason = String(req.body.reason || "").trim().slice(0, 300);
 
-      const withdrawal = await Withdrawal.findById(id);
+      const withdrawal = await Withdrawal.findOneAndUpdate(
+        { _id: id, status: "PENDING" },
+        {
+          $set: {
+            status: "REJECTED",
+            reason,
+            processedBy: req.adminUser.id,
+            processedAt: new Date(),
+          },
+        },
+        { new: true }
+      );
       if (!withdrawal) {
-        return fail(res, 404, "NOT_FOUND", "Withdrawal not found", null, { requestId: req.requestId });
-      }
-      if (withdrawal.status !== "PENDING") {
-        return fail(res, 400, "ALREADY_PROCESSED", "Withdrawal already processed", null, { requestId: req.requestId });
+        const exists = await Withdrawal.exists({ _id: id });
+        return exists
+          ? fail(res, 400, "ALREADY_PROCESSED", "Withdrawal already processed", null, { requestId: req.requestId })
+          : fail(res, 404, "NOT_FOUND", "Withdrawal not found", null, { requestId: req.requestId });
       }
 
       if (withdrawal.balanceHeld) {
         // The amount was reserved out of withdrawableBalance at request time.
         // Rejecting returns it to the partner's withdrawable bucket.
-        await PartnerWallet.findOneAndUpdate(
-          { partnerId: withdrawal.partnerId },
-          [
-            {
-              $set: {
-                withdrawableBalance: {
-                  $round: [{ $add: [{ $ifNull: ["$withdrawableBalance", 0] }, withdrawal.amount] }, 2],
+        try {
+          await PartnerWallet.findOneAndUpdate(
+            { partnerId: withdrawal.partnerId },
+            [
+              {
+                $set: {
+                  withdrawableBalance: {
+                    $round: [{ $add: [{ $ifNull: ["$withdrawableBalance", 0] }, withdrawal.amount] }, 2],
+                  },
+                  lastUpdated: new Date(),
                 },
-                lastUpdated: new Date(),
               },
-            },
-            { $set: { balance: "$withdrawableBalance" } },
-          ]
-        );
+              { $set: { balance: "$withdrawableBalance" } },
+            ]
+          );
+        } catch (refundError) {
+          await Withdrawal.updateOne(
+            { _id: id, status: "REJECTED" },
+            { $set: { status: "PENDING", reason: "", processedBy: null, processedAt: null } }
+          );
+          throw refundError;
+        }
       }
 
-      withdrawal.status = "REJECTED";
-      withdrawal.reason = reason;
-      withdrawal.processedBy = req.adminUser.id;
-      withdrawal.processedAt = new Date();
-      await withdrawal.save();
+      notifyPartner(withdrawal.partnerId, {
+        type: "WITHDRAWAL_REJECTED",
+        title: "Withdrawal not processed",
+        body: `Your withdrawal of ${inr(withdrawal.amount)} was not processed${
+          reason ? `: ${reason}` : ""
+        }. The amount is back in your wallet.`,
+        data: { withdrawalId: String(withdrawal._id) },
+      });
 
       return success(res, withdrawal, { requestId: req.requestId });
     } catch (error) {
       return fail(res, 500, "WITHDRAWAL_REJECT_FAILED", "Unable to reject withdrawal", error.message, {
+        requestId: req.requestId,
+      });
+    }
+  }
+);
+
+/* =====================================================
+   LIST PARTNER PAYOUT ACCOUNTS
+   GET /api/v1/admin/payments/payout-accounts?status=PENDING
+   Full (decrypted) details: the admin checks the holder name against the
+   partner before verifying.
+===================================================== */
+router.get(
+  "/payout-accounts",
+  authorize(PERMISSIONS.PAYMENTS_PAYOUT),
+  async (req, res) => {
+    try {
+      const { page, pageSize, skip, limit } = getPagination(req);
+      const status = String(asSingleString(req.query.status) || "").toUpperCase();
+      const filter = ["PENDING", "VERIFIED", "REJECTED"].includes(status) ? { status } : {};
+
+      const [rows, total] = await Promise.all([
+        PartnerPayoutAccount.find(filter)
+          .populate("partnerId", "name phone")
+          .sort({ submittedAt: -1 })
+          .skip(skip)
+          .limit(limit)
+          .lean(),
+        PartnerPayoutAccount.countDocuments(filter),
+      ]);
+
+      const data = rows.map((row) => ({
+        _id: row._id,
+        partner: row.partnerId
+          ? { id: row.partnerId._id, name: row.partnerId.name, phone: row.partnerId.phone }
+          : null,
+        method: row.method,
+        accountHolderName: row.accountHolderName || "",
+        accountNumber: row.method === "BANK" ? decryptField(row.accountNumber) : "",
+        ifsc: row.method === "BANK" ? decryptField(row.ifsc) : "",
+        bankName: row.bankName || "",
+        upiId: row.method === "UPI" ? decryptField(row.upiId) : "",
+        status: row.status,
+        rejectionReason: row.rejectionReason || "",
+        revision: row.revision,
+        submittedAt: row.submittedAt,
+        verifiedAt: row.verifiedAt,
+        withdrawalsBlockedUntil: row.withdrawalsBlockedUntil,
+      }));
+
+      return success(res, data, {
+        requestId: req.requestId,
+        pagination: { page, pageSize, total },
+      });
+    } catch (error) {
+      return fail(res, 500, "PAYOUT_ACCOUNTS_LIST_FAILED", "Unable to fetch payout accounts", error.message, {
+        requestId: req.requestId,
+      });
+    }
+  }
+);
+
+/* =====================================================
+   VERIFY / REJECT A PAYOUT ACCOUNT
+   PATCH /api/v1/admin/payments/payout-accounts/:id/verify
+   Body: { status: "VERIFIED" | "REJECTED", revision, reason? }
+   `revision` must match what the admin was shown: if the partner resubmitted
+   in the meantime the update matches nothing and the admin must reload, so
+   unseen details can never be verified.
+===================================================== */
+router.patch(
+  "/payout-accounts/:id/verify",
+  authorize(PERMISSIONS.PAYMENTS_PAYOUT),
+  audit("admin.payments.payout_account.verify"),
+  async (req, res) => {
+    try {
+      const id = asSingleString(req.params.id);
+      if (!id || !mongoose.Types.ObjectId.isValid(id)) {
+        return fail(res, 400, "INVALID_ID", "Invalid payout account id", null, { requestId: req.requestId });
+      }
+
+      const status = String(req.body.status || "").toUpperCase();
+      const reason = String(req.body.reason || "").trim().slice(0, 300);
+      const revision = Number(req.body.revision);
+
+      if (!["VERIFIED", "REJECTED"].includes(status)) {
+        return fail(res, 400, "VALIDATION_ERROR", "status must be VERIFIED or REJECTED", null, { requestId: req.requestId });
+      }
+      if (status === "REJECTED" && !reason) {
+        return fail(res, 400, "VALIDATION_ERROR", "Give a reason so the partner knows what to fix", null, {
+          requestId: req.requestId,
+        });
+      }
+      if (!Number.isInteger(revision)) {
+        return fail(res, 400, "VALIDATION_ERROR", "revision is required", null, { requestId: req.requestId });
+      }
+
+      const account = await PartnerPayoutAccount.findOneAndUpdate(
+        { _id: id, status: "PENDING", revision },
+        {
+          $set: {
+            status,
+            rejectionReason: status === "REJECTED" ? reason : "",
+            verifiedAt: status === "VERIFIED" ? new Date() : null,
+            verifiedBy: req.adminUser.id,
+          },
+        },
+        { new: true }
+      ).lean();
+
+      if (!account) {
+        const current = await PartnerPayoutAccount.findById(id).select("status revision").lean();
+        if (!current) {
+          return fail(res, 404, "NOT_FOUND", "Payout account not found", null, { requestId: req.requestId });
+        }
+        if (current.revision !== revision) {
+          return fail(res, 409, "STALE_REVISION", "The partner changed these details since you loaded them. Reload and check again.", null, {
+            requestId: req.requestId,
+          });
+        }
+        return fail(res, 400, "ALREADY_PROCESSED", "Payout account already processed", null, { requestId: req.requestId });
+      }
+
+      notifyPartner(account.partnerId, {
+        type: "PAYOUT_ACCOUNT_STATUS",
+        title: status === "VERIFIED" ? "Payout account verified" : "Payout account rejected",
+        body:
+          status === "VERIFIED"
+            ? "Your payout account is verified. You can now withdraw your earnings."
+            : `Your payout account was rejected: ${reason}. Please update it in Verification Center.`,
+        data: { status },
+      });
+
+      return success(res, { _id: account._id, status: account.status, revision: account.revision }, { requestId: req.requestId });
+    } catch (error) {
+      return fail(res, 500, "PAYOUT_ACCOUNT_VERIFY_FAILED", "Unable to update payout account", error.message, {
         requestId: req.requestId,
       });
     }

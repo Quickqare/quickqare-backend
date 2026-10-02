@@ -12,7 +12,9 @@ const { success, fail } = require("../../utils/response");
 const { MEHENDI_PRICING_RULE_KEYS } = require("../../../utils/pricing");
 const defaultServices = require("../../data/defaultServices");
 
-const CATEGORY_TYPES = ["GENERAL", "AC", "MEHENDI", "CELEBRATION"];
+const CATEGORY_TYPES = ["GENERAL", "AC", "MEHENDI", "CELEBRATION", "SALON"];
+// Must stay in sync with the Category schema's partnerGender enum.
+const CATEGORY_PARTNER_GENDERS = ["ANY", "FEMALE", "MALE"];
 // Must stay in sync with the Service schema's packingRole enum.
 const SERVICE_PACKING_ROLES = ["BRIDAL", "HAND", "FEET_ADDON", "INDEPENDENT"];
 
@@ -104,6 +106,12 @@ router.post("/categories", audit("admin.services.category.create"), async (req, 
         requestId: req.requestId,
       });
     }
+    const partnerGender = String(req.body.partnerGender || "").trim().toUpperCase();
+    if (partnerGender && !CATEGORY_PARTNER_GENDERS.includes(partnerGender)) {
+      return fail(res, 400, "VALIDATION_ERROR", `Unknown partnerGender: ${partnerGender}`, null, {
+        requestId: req.requestId,
+      });
+    }
 
     const slug = name.toLowerCase().replace(/\s+/g, "-");
     const existing = await Category.findOne({ $or: [{ name }, { slug }] }).lean();
@@ -118,6 +126,7 @@ router.post("/categories", audit("admin.services.category.create"), async (req, 
       ...(imageUrl ? { imageUrl } : {}),
       ...(webImageUrl ? { webImageUrl } : {}),
       ...(categoryType ? { categoryType } : {}),
+      ...(partnerGender ? { partnerGender } : {}),
     });
     return success(res, row, { requestId: req.requestId });
   } catch (error) {
@@ -142,7 +151,7 @@ router.patch("/categories/:id", audit("admin.services.category.update"), async (
     if (typeof req.body.imageUrl === "string") patch.imageUrl = req.body.imageUrl.trim();
     if (typeof req.body.webImageUrl === "string") patch.webImageUrl = req.body.webImageUrl.trim();
     if (req.body.isActive !== undefined) patch.isActive = Boolean(req.body.isActive);
-    // Behaviour class (AC / MEHENDI / CELEBRATION) — makes renames safe by
+    // Behaviour class (AC / MEHENDI / CELEBRATION / SALON) — makes renames safe by
     // giving detection an explicit signal instead of name matching.
     if (req.body.categoryType !== undefined) {
       const categoryType = String(req.body.categoryType || "").trim().toUpperCase();
@@ -152,6 +161,17 @@ router.patch("/categories/:id", audit("admin.services.category.update"), async (
         });
       }
       patch.categoryType = categoryType;
+    }
+    // Who may deliver this category (ANY / FEMALE / MALE) — enforced by the
+    // assignment engine, slot listing and admin manual assignment.
+    if (req.body.partnerGender !== undefined) {
+      const partnerGender = String(req.body.partnerGender || "").trim().toUpperCase();
+      if (!CATEGORY_PARTNER_GENDERS.includes(partnerGender)) {
+        return fail(res, 400, "VALIDATION_ERROR", `Unknown partnerGender: ${partnerGender}`, null, {
+          requestId: req.requestId,
+        });
+      }
+      patch.partnerGender = partnerGender;
     }
 
     const row = await Category.findByIdAndUpdate(categoryId, { $set: patch }, { new: true }).lean();
@@ -436,8 +456,6 @@ router.post("/seed-defaults", audit("admin.services.seed"), async (req, res) => 
         ...(Array.isArray(service.cancellationTiers) ? { cancellationTiers: service.cancellationTiers } : {}),
         ...(Array.isArray(service.sinceBookingTiers) ? { sinceBookingTiers: service.sinceBookingTiers } : {}),
         ...(service.cancellationGrace ? { cancellationGrace: service.cancellationGrace } : {}),
-        ...(Array.isArray(service.ingredients) ? { ingredients: service.ingredients } : {}),
-        ...(service.customization ? { customization: service.customization } : {}),
         isActive: true,
       });
 
@@ -484,7 +502,7 @@ router.patch("/:id", audit("admin.services.update"), async (req, res) => {
     if (req.body.skillTier !== undefined) {
       const tier = Number(req.body.skillTier);
       if (![1, 2].includes(tier)) {
-        return fail(res, 400, "VALIDATION_ERROR", "skillTier must be 1 (serviceman) or 2 (technician)", null, {
+        return fail(res, 400, "VALIDATION_ERROR", "skillTier must be 1 (standard) or 2 (technician / senior beautician)", null, {
           requestId: req.requestId,
         });
       }
@@ -512,7 +530,6 @@ router.patch("/:id", audit("admin.services.update"), async (req, res) => {
       }
       patch.pricingRuleKey = key || null;
     }
-    if (req.body.isEggless !== undefined) patch.isEggless = Boolean(req.body.isEggless);
     if (req.body.autoSlideEnabled !== undefined) patch.autoSlideEnabled = Boolean(req.body.autoSlideEnabled);
     if (req.body.autoSlideSeconds !== undefined) {
       patch.autoSlideSeconds = Math.min(30, Math.max(1, Number(req.body.autoSlideSeconds) || 3));
@@ -520,12 +537,6 @@ router.patch("/:id", audit("admin.services.update"), async (req, res) => {
     if (req.body.webAutoSlideEnabled !== undefined) patch.webAutoSlideEnabled = Boolean(req.body.webAutoSlideEnabled);
     if (req.body.webAutoSlideSeconds !== undefined) {
       patch.webAutoSlideSeconds = Math.min(30, Math.max(1, Number(req.body.webAutoSlideSeconds) || 3));
-    }
-    if (Array.isArray(req.body.ingredients)) {
-      patch.ingredients = req.body.ingredients
-        .map((item) => String(item || "").trim())
-        .filter(Boolean)
-        .slice(0, 50);
     }
     if (Array.isArray(req.body.media360)) {
       patch.media360 = req.body.media360
@@ -577,8 +588,8 @@ router.patch("/:id/status", audit("admin.services.status"), async (req, res) => 
 // PATCH /:id/cancellation-policy — set per-service cancellation tiers
 // Body: { tiers: [{ minHoursBefore: 24, refundPercent: 100 }, ...] }
 // Optional: policyType ("BEFORE_SERVICE" | "SINCE_BOOKING") and
-// sinceBookingTiers: [{ maxHoursAfterBooking, refundPercent }, ...] for
-// advance-order categories (cakes).
+// sinceBookingTiers: [{ maxHoursAfterBooking, refundPercent }, ...] — legacy
+// (discontinued cake orders); new bookings no longer apply SINCE_BOOKING.
 // Optional: grace: { windowMinutes, appliesBelowLeadHours } — free-cancel
 // window for orders placed with under appliesBelowLeadHours of notice
 // (windowMinutes 0 disables; appliesBelowLeadHours 0 = applies to all).
@@ -675,117 +686,6 @@ router.patch("/:id/cancellation-policy", audit("admin.services.cancellation"), a
     );
   } catch (error) {
     return fail(res, 500, "CANCELLATION_POLICY_FAILED", "Unable to update cancellation policy", error.message, {
-      requestId: req.requestId,
-    });
-  }
-});
-
-// PATCH /:id/customization — set per-order customization options (cakes)
-// Body: { weights, flavours: [{name, priceDelta}], twoTierPriceDelta, addons: [{name, price}], nameOnCakeEnabled,
-//         egglessPriceDelta, flavoursEnabled, weightsEnabled, tiersEnabled, addonsEnabled, referencePhotoEnabled,
-//         egglessOptionEnabled }
-router.patch("/:id/customization", audit("admin.services.customization"), async (req, res) => {
-  try {
-    const serviceId = asSingleString(req.params.id);
-    if (!serviceId || !mongoose.Types.ObjectId.isValid(serviceId)) {
-      return fail(res, 400, "INVALID_ID", "Invalid service id", null, { requestId: req.requestId });
-    }
-
-    const body = req.body || {};
-
-    const weights = [];
-    if (body.weights !== undefined) {
-      if (!Array.isArray(body.weights)) {
-        return fail(res, 400, "INVALID_WEIGHTS", "weights must be an array", null, { requestId: req.requestId });
-      }
-      for (const w of body.weights) {
-        const label = String(w?.label || "").trim();
-        const priceDelta = Number(w?.priceDelta) || 0;
-        if (!label) {
-          return fail(res, 400, "INVALID_WEIGHT", "Each weight needs a label", null, { requestId: req.requestId });
-        }
-        if (priceDelta < 0) {
-          return fail(res, 400, "INVALID_WEIGHT", "priceDelta must be >= 0", null, { requestId: req.requestId });
-        }
-        weights.push({ label, priceDelta });
-      }
-    }
-
-    const flavours = [];
-    if (body.flavours !== undefined) {
-      if (!Array.isArray(body.flavours)) {
-        return fail(res, 400, "INVALID_FLAVOURS", "flavours must be an array", null, { requestId: req.requestId });
-      }
-      for (const f of body.flavours) {
-        const name = String(f?.name || "").trim();
-        const priceDelta = Number(f?.priceDelta) || 0;
-        if (!name) {
-          return fail(res, 400, "INVALID_FLAVOUR", "Each flavour needs a name", null, { requestId: req.requestId });
-        }
-        if (priceDelta < 0) {
-          return fail(res, 400, "INVALID_FLAVOUR", "priceDelta must be >= 0", null, { requestId: req.requestId });
-        }
-        flavours.push({ name, priceDelta });
-      }
-    }
-
-    const addons = [];
-    if (body.addons !== undefined) {
-      if (!Array.isArray(body.addons)) {
-        return fail(res, 400, "INVALID_ADDONS", "addons must be an array", null, { requestId: req.requestId });
-      }
-      for (const a of body.addons) {
-        const name = String(a?.name || "").trim();
-        const price = Number(a?.price);
-        if (!name || !Number.isFinite(price) || price < 0) {
-          return fail(res, 400, "INVALID_ADDON", "Each addon needs a name and a price >= 0", null, { requestId: req.requestId });
-        }
-        addons.push({ name, price });
-      }
-    }
-
-    const twoTierPriceDelta = Math.max(0, Number(body.twoTierPriceDelta) || 0);
-    const egglessPriceDelta = Math.max(0, Number(body.egglessPriceDelta) || 0);
-    const nameOnCakeEnabled = body.nameOnCakeEnabled !== false;
-
-    // Per-section customer-facing toggles (default enabled).
-    const flavoursEnabled = body.flavoursEnabled !== false;
-    const weightsEnabled = body.weightsEnabled !== false;
-    const tiersEnabled = body.tiersEnabled !== false;
-    const addonsEnabled = body.addonsEnabled !== false;
-    const referencePhotoEnabled = body.referencePhotoEnabled !== false;
-    const egglessOptionEnabled = body.egglessOptionEnabled !== false;
-
-    const row = await Service.findByIdAndUpdate(
-      serviceId,
-      {
-        $set: {
-          customization: {
-            weights,
-            flavours,
-            twoTierPriceDelta,
-            egglessPriceDelta,
-            addons,
-            nameOnCakeEnabled,
-            flavoursEnabled,
-            weightsEnabled,
-            tiersEnabled,
-            addonsEnabled,
-            referencePhotoEnabled,
-            egglessOptionEnabled,
-          },
-        },
-      },
-      { new: true }
-    ).lean();
-
-    if (!row) {
-      return fail(res, 404, "NOT_FOUND", "Service not found", null, { requestId: req.requestId });
-    }
-
-    return success(res, { customization: row.customization }, { requestId: req.requestId });
-  } catch (error) {
-    return fail(res, 500, "CUSTOMIZATION_UPDATE_FAILED", "Unable to update customization", error.message, {
       requestId: req.requestId,
     });
   }

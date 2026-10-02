@@ -72,7 +72,8 @@ If you have a privacy concern, contact support through the app or admin panel.`,
    Partners must treat every customer with courtesy regardless of their background. Refusing a job, providing lower-quality service, or behaving disrespectfully toward a customer on discriminatory grounds is a serious violation of the Partner Terms & Conditions and may result in suspension or permanent removal from the platform.
 
 4. How QuickQare assigns jobs
-   Job assignment is driven by service category, location, availability, and partner rating — never by a customer's or partner's protected characteristics. QuickQare does not collect or use religion, caste, or similar data in its matching or ranking logic.
+   Job assignment is driven by service category, location, availability, skills, and partner rating — never by a customer's protected characteristics, and never by a partner's religion, caste, or similar data, which QuickQare does not collect or use in its matching or ranking logic.
+   One exception applies to partner gender: services that involve close personal care for women — such as waxing, threading, facials, and other treatments in our women's salon, hair studio, and makeup categories — are delivered only by women professionals. This is a category-level rule QuickQare sets for customer privacy and comfort. It applies equally to every booking in those categories, and individual customers and partners cannot request or override it.
 
 5. Reporting a concern
    If you experience or witness discriminatory behaviour on the platform, please report it through the Complaints section of the app or by contacting support with the booking details. Every report is reviewed, and confirmed violations are acted on — up to and including permanent account removal.

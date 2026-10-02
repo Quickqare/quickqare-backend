@@ -69,6 +69,7 @@ router.post("/", audit("admin.test_reset"), async (req, res) => {
       "userwallettransactions",
       "wallettransactions",
       "withdrawals",
+      "partnerpayoutaccounts", // PartnerPayoutAccount
       "referrals",
       "complaints",
       "complainttimelines",

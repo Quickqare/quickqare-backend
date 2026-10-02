@@ -1,16 +1,15 @@
 /**
- * CRITICAL PATH: advance (cake) orders must reach a baker at PAYMENT time,
- * not 3 hours before delivery.
+ * CRITICAL PATH: advance bookings (start far in the future) are queued at
+ * payment and dispatched inside the T-3h window, and their assigned partner
+ * gets a wide acknowledgement window instead of the 2-minute socket timer.
  *
- *   - finalizePaidBooking: a customized (cake) order scheduled >24h out is
- *     assigned immediately — never parked in QUEUED (where it is invisible to
- *     the per-baker daily cap and the day-before reminder cron).
- *   - finalizePaidBooking: plain far-future bookings still queue (regression).
- *   - dispatchQueuedBookings: a straggler QUEUED cake is dispatched on the
- *     next pass regardless of the T-3h window.
+ *   - finalizePaidBooking: a booking scheduled >24h out is QUEUED; one
+ *     scheduled sooner is assigned immediately.
+ *   - dispatchQueuedBookings: only QUEUED bookings inside the T-3h window are
+ *     dispatched.
  *   - handleAckTimeout: an advance assignment is NOT reassigned after the
- *     2-minute socket window — the baker gets 12h (capped at T-3h). Imminent
- *     assignments keep the old 2-minute behaviour.
+ *     2-minute socket window — the partner gets 12h (capped at T-3h).
+ *     Imminent assignments keep the old 2-minute behaviour.
  */
 const mongoose = require("mongoose");
 
@@ -38,16 +37,6 @@ const HOUR_MS = 60 * 60 * 1000;
 function hoursFromNow(h) {
   return new Date(Date.now() + h * HOUR_MS);
 }
-
-const cakeLine = {
-  serviceId: new mongoose.Types.ObjectId(),
-  name: "Classic Round Cake",
-  price: 549,
-  lineTotal: 549,
-  quantity: 1,
-  category: "celebration",
-  options: { flavour: "Chocolate Truffle", tiers: 1, addons: [], nameOnCake: "Happy Birthday" },
-};
 
 const plainLine = {
   serviceId: new mongoose.Types.ObjectId(),
@@ -79,24 +68,8 @@ beforeEach(() => {
   reassignBooking.mockClear();
 });
 
-describe("finalizePaidBooking — advance (cake) orders", () => {
-  test("cake order 72h out is assigned immediately, never QUEUED", async () => {
-    const booking = await makeBooking({ services: [cakeLine] });
-
-    const { outcome } = await finalizePaidBooking(booking, {
-      razorpay_payment_id: "pay_1",
-      razorpay_order_id: "order_test_123",
-    });
-
-    expect(outcome).toBe("searching");
-    expect(assignBooking).toHaveBeenCalledTimes(1);
-
-    const fresh = await Booking.findById(booking._id).lean();
-    expect(fresh.status).not.toBe("QUEUED");
-    expect(fresh.payment.status).toBe("PAID");
-  });
-
-  test("plain booking 72h out still queues for the T-3h dispatch (regression)", async () => {
+describe("finalizePaidBooking — advance bookings", () => {
+  test("booking 72h out queues for the T-3h dispatch", async () => {
     const booking = await makeBooking({ services: [plainLine] });
 
     const { outcome } = await finalizePaidBooking(booking, {
@@ -111,7 +84,7 @@ describe("finalizePaidBooking — advance (cake) orders", () => {
     expect(fresh.status).toBe("QUEUED");
   });
 
-  test("plain booking 5h out is assigned immediately (regression)", async () => {
+  test("booking 5h out is assigned immediately", async () => {
     const booking = await makeBooking({
       services: [plainLine],
       scheduledDate: hoursFromNow(5),
@@ -128,27 +101,32 @@ describe("finalizePaidBooking — advance (cake) orders", () => {
   });
 });
 
-describe("dispatchQueuedBookings — QUEUED cake stragglers", () => {
-  test("QUEUED cake 72h out is dispatched on the next pass; plain booking is not", async () => {
-    const cake = await makeBooking({ services: [cakeLine], status: "QUEUED" });
-    const plain = await makeBooking({ services: [plainLine], status: "QUEUED" });
+describe("dispatchQueuedBookings — T-3h window", () => {
+  test("QUEUED booking inside the window is dispatched; one 72h out is not", async () => {
+    const soon = await makeBooking({
+      services: [plainLine],
+      status: "QUEUED",
+      scheduledDate: hoursFromNow(2),
+      scheduledStartAt: hoursFromNow(2),
+    });
+    const later = await makeBooking({ services: [plainLine], status: "QUEUED" });
 
     await dispatchQueuedBookings();
 
     expect(assignBooking).toHaveBeenCalledTimes(1);
-    expect(String(assignBooking.mock.calls[0][0])).toBe(String(cake._id));
+    expect(String(assignBooking.mock.calls[0][0])).toBe(String(soon._id));
 
-    const freshCake = await Booking.findById(cake._id).lean();
-    const freshPlain = await Booking.findById(plain._id).lean();
-    expect(freshCake.status).toBe("SEARCHING");
-    expect(freshPlain.status).toBe("QUEUED");
+    const freshSoon = await Booking.findById(soon._id).lean();
+    const freshLater = await Booking.findById(later._id).lean();
+    expect(freshSoon.status).toBe("SEARCHING");
+    expect(freshLater.status).toBe("QUEUED");
   });
 });
 
 describe("handleAckTimeout — advance assignments get the wide window", () => {
   test("advance assignment inside its 12h window is NOT reassigned", async () => {
     const booking = await makeBooking({
-      services: [cakeLine],
+      services: [plainLine],
       status: "ASSIGNED",
       partner: new mongoose.Types.ObjectId(),
       assignedAt: new Date(), // just assigned
@@ -161,7 +139,7 @@ describe("handleAckTimeout — advance assignments get the wide window", () => {
 
   test("advance assignment unacknowledged for >12h IS reassigned", async () => {
     const booking = await makeBooking({
-      services: [cakeLine],
+      services: [plainLine],
       status: "ASSIGNED",
       partner: new mongoose.Types.ObjectId(),
       assignedAt: new Date(Date.now() - 13 * HOUR_MS),
@@ -174,7 +152,7 @@ describe("handleAckTimeout — advance assignments get the wide window", () => {
 
   test("advance assignment reaching the T-3h window IS reassigned even within 12h", async () => {
     const booking = await makeBooking({
-      services: [cakeLine],
+      services: [plainLine],
       status: "ASSIGNED",
       partner: new mongoose.Types.ObjectId(),
       scheduledDate: hoursFromNow(2),
@@ -204,7 +182,7 @@ describe("handleAckTimeout — advance assignments get the wide window", () => {
 
   test("acknowledged advance assignment is left alone after 12h", async () => {
     const booking = await makeBooking({
-      services: [cakeLine],
+      services: [plainLine],
       status: "ASSIGNED",
       partner: new mongoose.Types.ObjectId(),
       assignedAt: new Date(Date.now() - 13 * HOUR_MS),

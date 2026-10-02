@@ -62,7 +62,7 @@ router.patch("/settings", audit("admin.settings.update"), async (req, res) => {
     // Per-icon home icon animation style. Unknown keys/values are ignored;
     // legacy booleans (old on/off version) map to bob/none.
     if (req.body.homeIconAnimation !== undefined && typeof req.body.homeIconAnimation === "object") {
-      const iconKeys = ["acRepair", "plumbing", "mehendi", "electrician", "celebration", "offers"];
+      const iconKeys = ["acRepair", "plumbing", "mehendi", "electrician", "celebration", "beauty", "offers"];
       const styles = ["none", "bob", "bounce", "tada"];
       for (const k of iconKeys) {
         let v = req.body.homeIconAnimation[k];
@@ -87,19 +87,6 @@ router.patch("/settings", audit("admin.settings.update"), async (req, res) => {
       const c = req.body.cancellation;
       if (c.arrivedCancelPenaltyInr !== undefined) {
         settings.cancellation.arrivedCancelPenaltyInr = Math.max(0, Number(c.arrivedCancelPenaltyInr) || 0);
-      }
-    }
-
-    // Assignment business knobs. Invalid values are ignored (not clamped to
-    // a surprise) — the current setting stays in force.
-    if (req.body.assignment !== undefined && typeof req.body.assignment === "object") {
-      const a = req.body.assignment;
-      if (a.cakeMaxOrdersPerPartnerPerDay !== undefined) {
-        const v = Math.floor(Number(a.cakeMaxOrdersPerPartnerPerDay));
-        if (Number.isFinite(v) && v >= 1 && v <= 20) {
-          settings.assignment = settings.assignment || {};
-          settings.assignment.cakeMaxOrdersPerPartnerPerDay = v;
-        }
       }
     }
 
@@ -157,6 +144,7 @@ router.patch("/settings", audit("admin.settings.update"), async (req, res) => {
           electricianShimmer: ci.electricianShimmer !== undefined ? Boolean(ci.electricianShimmer) : (cur.electricianShimmer !== false),
           celebration:        typeof ci.celebration === "string" ? ci.celebration.slice(0, 512) : (cur.celebration || ""),
           celebrationShimmer: ci.celebrationShimmer !== undefined ? Boolean(ci.celebrationShimmer) : (cur.celebrationShimmer !== false),
+          beauty:             typeof ci.beauty === "string" ? ci.beauty.slice(0, 512) : (cur.beauty || ""),
           womenSalon:         typeof ci.womenSalon === "string" ? ci.womenSalon.slice(0, 512) : (cur.womenSalon || ""),
         };
         settings.markModified("homeTheme.categoryIcons");
@@ -242,6 +230,8 @@ router.patch("/settings", audit("admin.settings.update"), async (req, res) => {
           electricianShimmer: t.categoryIcons?.electricianShimmer !== false,
           celebration:        t.categoryIcons?.celebration ?? "",
           celebrationShimmer: t.categoryIcons?.celebrationShimmer !== false,
+          beauty:             t.categoryIcons?.beauty      ?? "",
+          womenSalon:         t.categoryIcons?.womenSalon  ?? "",
         },
       });
     }

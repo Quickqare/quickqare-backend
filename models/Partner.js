@@ -65,6 +65,12 @@ const partnerSchema = new mongoose.Schema(
       select: false,
     },
 
+    // Set when the password changes; login tokens issued before it are void.
+    passwordChangedAt: {
+      type: Date,
+      default: null,
+    },
+
     /* =====================
        ADMIN CONTROL
     ===================== */
@@ -118,11 +124,12 @@ const partnerSchema = new mongoose.Schema(
     },
 
     /* =====================
-       AC SKILL TIER
-       1 = Non-Technician (cleaning, installation help)
-       2 = Technician (gas, PCB, advanced repairs)
-       The assignment engine gates AC Level 2+ jobs on this.
-       Mehendi / non-AC partners stay at the default 1 (never read for them).
+       SKILL TIER
+       AC (set at signup / profile): 1 = Non-Technician (cleaning,
+       installation help), 2 = Technician (gas, PCB, advanced repairs).
+       Salon / self-care (admin-set): 1 = beautician, 2 = senior
+       beautician. The assignment engine gates tier-2 services on this.
+       Mehendi / other partners stay at the default 1 (never read for them).
     ===================== */
     skillTier: {
       type: Number,
@@ -219,11 +226,19 @@ const partnerSchema = new mongoose.Schema(
     /* =====================
        FAIRNESS ENGINE
     ===================== */
+    // Average of the partner's customer ratings (5 until the first one), kept
+    // with totalReviews by services/rating.service.js.
     rating: {
       type: Number,
       default: 5,
       min: 0,
       max: 5,
+    },
+
+    totalReviews: {
+      type: Number,
+      default: 0,
+      min: 0,
     },
 
     activeJobs: {
@@ -450,6 +465,10 @@ partnerSchema.pre("save", async function (next) {
   if (!this.isModified("password")) return next();
 
   this.password = await bcrypt.hash(this.password, 10);
+  // A changed password ends every existing session (partnerAuth / the socket
+  // room join reject tokens issued before this). Back-dated a second because
+  // JWT iat is in whole seconds — the login right after a reset must pass.
+  if (!this.isNew) this.passwordChangedAt = new Date(Date.now() - 1000);
   next();
 });
 

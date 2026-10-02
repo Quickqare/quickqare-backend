@@ -126,11 +126,22 @@ function maskAccountNumber(value) {
   return `••••${plain.slice(-4)}`;
 }
 
+// UPI equivalent: keep the first two characters and the handle, e.g.
+// "ra••••@okhdfc", so the partner can recognise their ID without it being
+// readable in full over someone's shoulder.
+function maskUpiId(value) {
+  const plain = String(decryptField(value) || "");
+  const at = plain.indexOf("@");
+  if (at < 0) return plain ? "••••" : "";
+  return `${plain.slice(0, Math.min(2, at))}••••${plain.slice(at)}`;
+}
+
 module.exports = {
   encryptField,
   decryptField,
   encryptBankDetails,
   decryptBankDetails,
   maskAccountNumber,
+  maskUpiId,
   isEncrypted,
 };

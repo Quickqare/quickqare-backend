@@ -4,6 +4,7 @@ const router = express.Router();
 const partnerAuth = require("../middlewares/partnerAuth");
 const partnerController = require("../controllers/partner.controller");
 const walletController = require("../controllers/partnerWallet.controller");
+const payoutAccountController = require("../controllers/partnerPayoutAccount.controller");
 const guestAddonController = require("../controllers/guestAddon.controller");
 const upload = require("../config/multer");
 const r2Upload = require("../config/multerR2");
@@ -194,6 +195,10 @@ router.post(
 router.get("/wallet", partnerAuth, walletController.getWallet);
 router.get("/wallet/history", partnerAuth, walletController.getWalletHistory);
 router.post("/wallet/withdraw", partnerAuth, walletController.requestWithdrawal);
+
+// Where withdrawals are paid: one bank account or UPI ID, admin-verified.
+router.get("/payout-account", partnerAuth, payoutAccountController.getPayoutAccount);
+router.put("/payout-account", partnerAuth, payoutAccountController.savePayoutAccount);
 
 /**
  * Delete partner account (soft delete)

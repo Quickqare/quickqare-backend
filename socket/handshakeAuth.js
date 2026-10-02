@@ -29,6 +29,9 @@ function handshakeAuth(socket, next) {
     // userId/sub fallbacks are kept only for any legacy tokens still in the wild.
     if (payload?.role === "partner" && (payload?.id || payload?.partnerId)) {
       socket.verifiedPartnerId = String(payload?.id || payload?.partnerId);
+      // Checked against the account (blocked / password changed since) when
+      // the partner joins their room — see partnerSocketAllowed.
+      socket.partnerTokenIssuedAt = Number(payload?.iat) || 0;
     } else if (payload?.role === "user" && payload?.id) {
       socket.verifiedUserId = String(payload.id);
     } else if (payload?.userId || payload?.sub) {
@@ -38,4 +41,24 @@ function handshakeAuth(socket, next) {
   next();
 }
 
-module.exports = { handshakeAuth };
+// The handshake only proves the token's signature. Before a socket may act as a
+// partner (join their room → receive job details with customer contacts, accept
+// or reject jobs) the account itself must still be allowed: present, not
+// blocked or deleted, and not signed out by a password change since the token
+// was issued — the same rules partnerAuth applies to HTTP requests.
+async function partnerSocketAllowed(socket) {
+  const Partner = require("../models/Partner");
+  const partner = await Partner.findById(socket.verifiedPartnerId)
+    .select("isBlocked isDeleted passwordChangedAt")
+    .lean();
+  if (!partner || partner.isBlocked || partner.isDeleted) return false;
+  if (
+    partner.passwordChangedAt &&
+    Number(socket.partnerTokenIssuedAt) * 1000 < new Date(partner.passwordChangedAt).getTime()
+  ) {
+    return false;
+  }
+  return true;
+}
+
+module.exports = { handshakeAuth, partnerSocketAllowed };

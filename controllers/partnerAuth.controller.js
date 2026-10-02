@@ -11,6 +11,9 @@ const {
   verifyAccessToken: verifyMsg91AccessToken,
   phoneMatchesVerified,
 } = require("../services/msg91Otp.service");
+// Every partner lookup/create keys on the canonical number (utils/phone) — the
+// same one MSG91 verifies — so reformatting a phone can't open a second account.
+const { toNationalPhone, INVALID_PHONE_MESSAGE } = require("../utils/phone");
 
 const PARTNER_TOKEN_TTL = String(process.env.PARTNER_JWT_TTL || "90d");
 const IS_PRODUCTION = String(process.env.NODE_ENV || "").toLowerCase() === "production";
@@ -20,9 +23,13 @@ const IS_PRODUCTION = String(process.env.NODE_ENV || "").toLowerCase() === "prod
 // completed OTP — without binding it to the claimed number, a valid token for
 // one phone could be replayed to log in as, or reset the password of, ANY
 // partner (account takeover). Mirrors the customer flow in userOtp.controller.js.
-//   "enforce" (default) — reject when the verified phone differs from the claim.
+//   "strict"  (default) — reject on a mismatch AND when no phone can be
+//                         recovered (fail closed).
+//   "enforce"           — reject on a mismatch but ALLOW when no phone can be
+//                         recovered (fail open; emergency use only — takeover
+//                         is possible while set).
 //   "off"               — skip the check (emergency kill-switch).
-const PHONE_BINDING_MODE = String(process.env.MSG91_PHONE_BINDING || "enforce").toLowerCase();
+const PHONE_BINDING_MODE = String(process.env.MSG91_PHONE_BINDING || "strict").toLowerCase();
 
 const lastFour = (value) => {
   const d = String(value || "").replace(/\D/g, "");
@@ -42,17 +49,25 @@ const passwordPolicyError = (password) => {
   return null;
 };
 
-// True when the exchange must be REJECTED (verified phone ≠ claimed phone).
-// Fails OPEN (returns false) when no phone can be recovered from MSG91, so a
-// change in MSG91's response format degrades protection and logs loudly rather
-// than locking every partner out.
+// True when the exchange must be REJECTED: the verified phone differs from the
+// claim, or (strict, the default) no phone could be recovered at all — an
+// unbindable token must not unlock an arbitrary partner's account.
 const isPhoneBindingMismatch = (verification, phone) => {
   if (PHONE_BINDING_MODE === "off") return false;
   const verifiedPhones = verification?.verifiedPhones || [];
   if (verifiedPhones.length === 0) {
+    if (PHONE_BINDING_MODE === "strict") {
+      console.error(
+        "[partner-auth] MSG91 phone binding could not be checked — no phone in token/response. Rejecting for",
+        lastFour(phone)
+      );
+      return true;
+    }
     console.error(
-      "[partner-auth] MSG91 phone binding could not be checked — no phone in token/response. Allowing for",
-      lastFour(phone)
+      "[partner-auth] MSG91 phone binding could not be checked — no phone in token/response. " +
+        "ALLOWING for %s because MSG91_PHONE_BINDING=%s (fail-open) — takeover is possible while set.",
+      lastFour(phone),
+      PHONE_BINDING_MODE
     );
     return false;
   }
@@ -76,7 +91,6 @@ exports.registerPartner = async (req, res) => {
   try {
     const {
       name,
-      phone,
       email,
       password,
       gender,
@@ -91,11 +105,16 @@ exports.registerPartner = async (req, res) => {
       accessToken, // MSG91 access token — phone must be verified before account is created
     } = req.body;
 
-    if (!name || !phone || !password) {
+    if (!name || !req.body.phone || !password) {
       return res.status(400).json({
         success: false,
         message: "name, phone and password are required",
       });
+    }
+
+    const phone = toNationalPhone(req.body.phone);
+    if (!phone) {
+      return res.status(400).json({ success: false, message: INVALID_PHONE_MESSAGE });
     }
 
     // Phone OTP verification is mandatory — account cannot be created without it
@@ -215,7 +234,8 @@ exports.registerPartner = async (req, res) => {
       partner: safePartner,
     });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    console.error("registerPartner error:", error);
+    res.status(500).json({ success: false, message: "Something went wrong. Please try again." });
   }
 };
 
@@ -224,7 +244,10 @@ exports.registerPartner = async (req, res) => {
 ===================================================== */
 exports.loginPartner = async (req, res) => {
   try {
-    const { phone, password } = req.body;
+    const { password } = req.body;
+    // An unparseable phone ("") matches no partner → the same generic
+    // "Invalid credentials" as an unknown number.
+    const phone = toNationalPhone(req.body.phone);
 
     const partner = await Partner.findOne({ phone }).select("+password");
     if (!partner) {
@@ -274,7 +297,8 @@ exports.loginPartner = async (req, res) => {
       partner: safePartner,
     });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    console.error("loginPartner error:", error);
+    res.status(500).json({ success: false, message: "Something went wrong. Please try again." });
   }
 };
 
@@ -283,10 +307,15 @@ exports.loginPartner = async (req, res) => {
 ===================================================== */
 exports.sendPartnerOtp = async (req, res) => {
   try {
-    const { phone, purpose } = req.body;
+    const { purpose } = req.body;
 
-    if (!phone || typeof phone !== "string") {
+    if (!req.body.phone) {
       return res.status(400).json({ success: false, message: "Phone number is required" });
+    }
+
+    const phone = toNationalPhone(req.body.phone);
+    if (!phone) {
+      return res.status(400).json({ success: false, message: INVALID_PHONE_MESSAGE });
     }
 
     const partner = await Partner.findOne({ phone }).select("_id isBlocked");
@@ -319,7 +348,7 @@ exports.sendPartnerOtp = async (req, res) => {
   } catch (error) {
     return res.status(error.statusCode || 500).json({
       success: false,
-      message: error.message || "Failed to send OTP",
+      message: error.statusCode && error.statusCode < 500 ? error.message : "Failed to send OTP",
     });
   }
 };
@@ -329,10 +358,15 @@ exports.sendPartnerOtp = async (req, res) => {
 ===================================================== */
 exports.verifyPartnerOtp = async (req, res) => {
   try {
-    const { phone, otp } = req.body;
+    const { otp } = req.body;
 
-    if (!phone || typeof phone !== "string" || !otp || typeof otp !== "string") {
+    if (!req.body.phone || !otp || typeof otp !== "string") {
       return res.status(400).json({ success: false, message: "Phone and OTP are required" });
+    }
+
+    const phone = toNationalPhone(req.body.phone);
+    if (!phone) {
+      return res.status(400).json({ success: false, message: INVALID_PHONE_MESSAGE });
     }
 
     await verifyOtpViaMsg91(phone, otp);
@@ -375,7 +409,7 @@ exports.verifyPartnerOtp = async (req, res) => {
   } catch (error) {
     return res.status(error.statusCode || 500).json({
       success: false,
-      message: error.message || "OTP verification failed",
+      message: error.statusCode && error.statusCode < 500 ? error.message : "OTP verification failed",
     });
   }
 };
@@ -399,20 +433,25 @@ exports.verifyPartnerPhone = async (req, res) => {
   } catch (error) {
     return res.status(error.statusCode || 500).json({
       success: false,
-      message: error.message || "OTP verification failed",
+      message: error.statusCode && error.statusCode < 500 ? error.message : "OTP verification failed",
     });
   }
 };
 
 exports.exchangePartnerMsg91AccessToken = async (req, res) => {
   try {
-    const { phone, accessToken } = req.body;
+    const { accessToken } = req.body;
 
-    if (!phone || !accessToken) {
+    if (!req.body.phone || !accessToken) {
       return res.status(400).json({
         success: false,
         message: "Phone number and MSG91 access token are required",
       });
+    }
+
+    const phone = toNationalPhone(req.body.phone);
+    if (!phone) {
+      return res.status(400).json({ success: false, message: INVALID_PHONE_MESSAGE });
     }
 
     const skipServerVerify =
@@ -472,21 +511,26 @@ exports.exchangePartnerMsg91AccessToken = async (req, res) => {
   } catch (error) {
     return res.status(error.statusCode || 500).json({
       success: false,
-      message: error.message || "MSG91 verification failed",
+      message: error.statusCode && error.statusCode < 500 ? error.message : "MSG91 verification failed",
     });
   }
 };
 
 exports.resetPartnerPasswordWithMsg91 = async (req, res) => {
   try {
-    const { phone, accessToken, newPassword } = req.body;
+    const { accessToken, newPassword } = req.body;
 
-    if (!phone || !accessToken || !newPassword) {
+    if (!req.body.phone || !accessToken || !newPassword) {
       return res.status(400).json({
         success: false,
         message:
           "Phone number, MSG91 access token and new password are required",
       });
+    }
+
+    const phone = toNationalPhone(req.body.phone);
+    if (!phone) {
+      return res.status(400).json({ success: false, message: INVALID_PHONE_MESSAGE });
     }
 
     const policyError = passwordPolicyError(newPassword);
@@ -535,7 +579,7 @@ exports.resetPartnerPasswordWithMsg91 = async (req, res) => {
   } catch (error) {
     return res.status(error.statusCode || 500).json({
       success: false,
-      message: error.message || "Unable to reset password",
+      message: error.statusCode && error.statusCode < 500 ? error.message : "Unable to reset password",
     });
   }
 };
@@ -569,7 +613,7 @@ exports.resetPartnerPassword = async (req, res) => {
   } catch (error) {
     return res.status(500).json({
       success: false,
-      message: error.message || "Unable to reset password",
+      message: error.statusCode && error.statusCode < 500 ? error.message : "Unable to reset password",
     });
   }
 };
@@ -596,6 +640,7 @@ exports.setPartnerStatus = async (req, res) => {
       isOnline: req.partner.isOnline,
     });
   } catch (error) {
-    res.status(500).json({ message: error.message });
+    console.error("setPartnerStatus error:", error);
+    res.status(500).json({ success: false, message: "Something went wrong. Please try again." });
   }
 };

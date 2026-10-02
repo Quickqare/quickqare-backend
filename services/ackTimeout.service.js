@@ -29,7 +29,7 @@ DRIVERS
 const ACK_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
 
 // A booking whose start is further away than this is an ADVANCE assignment
-// (cake orders assigned at payment, evening payments for a morning slot, …).
+// (e.g. evening payments for a morning slot).
 // The partner may legitimately be offline when it lands, so the 2-minute
 // timer does not apply — they get ADVANCE_ACK_WINDOW_MS from assignedAt to
 // acknowledge, capped at T-ADVANCE_IMMINENT_MS. Enforced by the

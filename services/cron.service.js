@@ -58,12 +58,6 @@ const REMINDER_INTERVAL_MS = 5 * 60 * 1000; // every 5 minutes
 const REMINDER_LEAD_MINUTES = 30; // pre-job reminder fires ~30 min before service
 const HELPER_NUDGE_AFTER_HOURS = 6; // nudge a still-pending helper invite after 6h
 
-// Cake order reminder — reminds the assigned baker ~24h before delivery so a
-// multi-day-ahead order doesn't get forgotten. Checked hourly; the window is
-// wide enough (24-25h) that an hourly cadence can't skip a booking entirely.
-const CAKE_REMINDER_INTERVAL_MS = 60 * 60 * 1000; // every hour
-const CAKE_REMINDER_LEAD_HOURS = 24;
-
 // Statuses that indicate a booking is stuck and should be auto-cancelled
 const STALE_PENDING_STATUSES = [
   "PENDING_ASSIGNMENT",
@@ -192,7 +186,7 @@ async function dispatchQueuedBookings() {
     // Find QUEUED bookings whose scheduled start is within the dispatch window.
     // We use scheduledStartAt when available, falling back to scheduledDate+scheduledTime.
     const queued = await Booking.find({ status: "QUEUED" })
-      .select("_id scheduledDate scheduledTime scheduledStartAt user pincode services.options.flavour")
+      .select("_id scheduledDate scheduledTime scheduledStartAt user pincode")
       .lean();
 
     const toDispatch = queued.filter((b) => {
@@ -205,13 +199,7 @@ async function dispatchQueuedBookings() {
       // QUEUED for 48h until the stale cron cancelled it, with no timely
       // customer notification or refund.
       if (start <= now) return true;
-      // Customized (cake) orders never wait for the T-3h window — the baker
-      // needs the full lead time to bake. Normally they're assigned at payment
-      // (paymentFinalize skips QUEUED for them), so any QUEUED one here is a
-      // straggler (admin requeue, queueOnFailure retry, legacy row): dispatch
-      // it on this pass regardless of how far ahead it's scheduled.
-      const isCake = (b.services || []).some((s) => s?.options?.flavour);
-      return isCake || start <= dispatchWindow;
+      return start <= dispatchWindow;
     });
 
     if (!toDispatch.length) return;
@@ -378,91 +366,10 @@ async function sendJobReminders() {
 
 /*
 =====================================================
-SEND CAKE ORDER REMINDERS (DAY-BEFORE)
-Cake orders are booked at least a day ahead, so it's
-easy for a baker to forget one. Pushes a reminder to
-the assigned baker once the delivery is within
-CAKE_REMINDER_LEAD_HOURS, mirroring sendJobReminders'
-"catch it whenever it enters the lead window" approach
-but with a much wider (24h) window checked hourly —
-still ~24x oversampling, same safety margin.
-=====================================================
-*/
-async function sendCakeOrderReminders() {
-  try {
-    const Booking = require("../models/Booking");
-    const Partner = require("../models/Partner");
-    const { buildDateTime } = require("./scheduling_service");
-    const { sendPushNotification } = require("./pushNotification.service");
-
-    const now = new Date();
-    const windowEnd = new Date(now.getTime() + CAKE_REMINDER_LEAD_HOURS * 60 * 60 * 1000);
-
-    const candidates = await Booking.find({
-      status: { $in: ["ASSIGNED", "CONFIRMED", "PARTNER_ACCEPTED"] },
-      cakeReminderSentAt: null,
-      partner: { $ne: null },
-      "services.options.flavour": { $exists: true, $ne: null },
-    })
-      .select("_id scheduledDate scheduledTime scheduledStartAt partner services")
-      .lean();
-
-    let sentCount = 0;
-
-    for (const booking of candidates) {
-      const start = booking.scheduledStartAt
-        ? new Date(booking.scheduledStartAt)
-        : buildDateTime(booking.scheduledDate, booking.scheduledTime);
-
-      if (!(start instanceof Date) || Number.isNaN(start.getTime())) continue;
-      if (!(start > now && start <= windowEnd)) continue;
-
-      // Atomic claim so the reminder is sent exactly once even with multiple
-      // server instances running this cron.
-      const claimed = await Booking.findOneAndUpdate(
-        { _id: booking._id, cakeReminderSentAt: null },
-        { $set: { cakeReminderSentAt: now } }
-      );
-      if (!claimed) continue;
-
-      const cakeLine = (booking.services || []).find((s) => s?.options?.flavour);
-      const flavour = cakeLine?.options?.flavour || "";
-      const nameOnCake = cakeLine?.options?.nameOnCake || "";
-      const dateLabel = new Date(booking.scheduledDate).toLocaleDateString("en-IN", {
-        day: "numeric",
-        month: "short",
-      });
-
-      const body = nameOnCake
-        ? `Cake order due ${dateLabel}: ${flavour}, "${nameOnCake}". Get baking!`
-        : `Cake order due ${dateLabel}: ${flavour}. Get baking!`;
-
-      const partner = await Partner.findById(booking.partner).select("fcmToken").lean();
-      if (partner?.fcmToken) {
-        sendPushNotification(
-          partner.fcmToken,
-          "Cake order due tomorrow",
-          body,
-          { type: "CAKE_ORDER_REMINDER", bookingId: String(booking._id) }
-        );
-        sentCount += 1;
-      }
-    }
-
-    if (sentCount > 0) {
-      console.log(`[cron] Sent cake order reminders for ${sentCount} booking(s)`);
-    }
-  } catch (err) {
-    console.error("[cron] sendCakeOrderReminders error:", err.message);
-  }
-}
-
-/*
-=====================================================
 ENFORCE ADVANCE-ASSIGNMENT ACK DEADLINES
-Advance assignments (start >3h away — cake orders
-assigned at payment, evening payments for a morning
-slot) don't run the 2-minute socket ACK timer: the
+Advance assignments (start >3h away — e.g. evening
+payments for a morning slot) don't run the 2-minute
+socket ACK timer: the
 partner may legitimately be offline when the job
 lands. This cron enforces the wider deadline instead —
 reassign if still unacknowledged 12h after assignment,
@@ -803,8 +710,8 @@ partners from ever seeing those jobs again (the query filter is the first
 gate; this scrub is the permanent one).
 
 The status filter matters: createdAt alone can't tell a delivered job from
-one still in flight. A cake pre-order can be booked (createdAt) months before
-its scheduled delivery date, and a NEEDS_RESCHEDULING/ASSIGNED booking can sit
+one still in flight. A booking can be made (createdAt) well before its
+scheduled date, and a NEEDS_RESCHEDULING/ASSIGNED booking can sit
 for a while mid-dispute-free lifecycle — purging the partner reference off
 either of those strands an active job with no assigned partner. Only a
 booking that has actually finished (or been cancelled) is safe to scrub.
@@ -1044,7 +951,10 @@ function _shadowScore(candidate, weights) {
     (Number(candidate.earningsScore) || 0) * weights.earnings +
     (Number(candidate.distanceScore) || 0) * weights.distance +
     (Number(candidate.skillScore) || 0) * weights.skill +
-    (Number(candidate.reliabilityScore) || 0) * weights.reliability
+    (Number(candidate.reliabilityScore) || 0) * weights.reliability +
+    // Repeat-partner affinity is added on top of the weighted sum live, so
+    // replay it unchanged under both weightings.
+    (Number(candidate.repeatBonus) || 0)
   );
 }
 
@@ -1066,7 +976,11 @@ async function runScoreWeightShadow() {
     const Booking = require("../models/Booking");
     const LearnedStat = require("../models/LearnedStat");
     const { isACBooking } = require("./assignmentEngine");
-    const { AC_SCORE_WEIGHTS, GENERAL_SCORE_WEIGHTS } = require("./scheduling_service");
+    const {
+      AC_SCORE_WEIGHTS,
+      GENERAL_SCORE_WEIGHTS,
+      SCORE_WEIGHTS_BY_PROFILE,
+    } = require("./scheduling_service");
     const cutoff = new Date(Date.now() - SHADOW_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
 
     const candidateWeights = (base) => ({
@@ -1104,7 +1018,11 @@ async function runScoreWeightShadow() {
       );
       if (!hasComponents) continue;
 
-      const base = isACBooking(b) ? AC_SCORE_WEIGHTS : GENERAL_SCORE_WEIGHTS;
+      // Audits written since weight profiles were recorded say exactly which
+      // set ranked them (incl. SALON); older ones fall back to AC/general.
+      const base =
+        SCORE_WEIGHTS_BY_PROFILE[assignEntry.weightProfile] ||
+        (isACBooking(b) ? AC_SCORE_WEIGHTS : GENERAL_SCORE_WEIGHTS);
       const cand = candidateWeights(base);
       const livePick = _shadowTopPick(cands, base);
       const candPick = _shadowTopPick(cands, cand);
@@ -1196,7 +1114,6 @@ function initCronJobs() {
     { name: "dispatchQueuedBookings", fn: dispatchQueuedBookings, interval: CHECK_INTERVAL_MS },
     { name: "cleanupExpiredSlotLocks", fn: cleanupExpiredSlotLocks, interval: SLOT_LOCK_CHECK_INTERVAL_MS },
     { name: "sendJobReminders", fn: sendJobReminders, interval: REMINDER_INTERVAL_MS },
-    { name: "sendCakeOrderReminders", fn: sendCakeOrderReminders, interval: CAKE_REMINDER_INTERVAL_MS },
     { name: "enforceAdvanceAckDeadlines", fn: enforceAdvanceAckDeadlines, interval: REMINDER_INTERVAL_MS },
     { name: "sendHelperInviteReminders", fn: sendHelperInviteReminders, interval: REMINDER_INTERVAL_MS },
     { name: "retryPendingPayouts", fn: retryPendingPayouts, interval: PAYOUT_RETRY_INTERVAL_MS },
@@ -1237,7 +1154,6 @@ module.exports = {
   dispatchQueuedBookings,
   cleanupExpiredSlotLocks,
   sendJobReminders,
-  sendCakeOrderReminders,
   enforceAdvanceAckDeadlines,
   sendHelperInviteReminders,
   retryPendingPayouts,

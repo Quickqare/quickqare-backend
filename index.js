@@ -259,7 +259,7 @@ setSocketIO(io);
 // Optional JWT auth on handshake — clients that send a token get
 // socket.verifiedPartnerId / socket.verifiedUserId attached.
 // Clients without a token still connect (backward compat).
-const { handshakeAuth } = require("./socket/handshakeAuth");
+const { handshakeAuth, partnerSocketAllowed } = require("./socket/handshakeAuth");
 io.use(handshakeAuth);
 
 // Short-lived dedup sets: prevent double-fire of acceptJob / rejectJob on flaky
@@ -283,8 +283,16 @@ io.on("connection", (socket) => {
   /* ======================
      PARTNER ROOM
   ====================== */
-  socket.on("joinPartnerRoom", (partnerId) => {
+  socket.on("joinPartnerRoom", async (partnerId) => {
     if (!socket.verifiedPartnerId || socket.verifiedPartnerId !== String(partnerId)) return;
+    try {
+      // Blocked / deleted accounts and tokens from before a password change
+      // get no partner room — and so no job details or accept/reject rights.
+      if (!(await partnerSocketAllowed(socket))) return;
+    } catch (err) {
+      logger.error("joinPartnerRoom check failed", { error: err.message });
+      return;
+    }
     socket.join(`partner_${partnerId}`);
     socket.partnerId = String(partnerId);
   });

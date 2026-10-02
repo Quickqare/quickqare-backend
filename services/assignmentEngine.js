@@ -5,7 +5,6 @@ const {
   findEligiblePartnersForBooking,
   syncPartnerOperationalState,
   buildDateTime,
-  verifyCakeCapAfterClaim,
   isACCategory,
   computeTeamPackForBooking,
   planTeamAssignment,
@@ -20,6 +19,7 @@ const {
 } = require("./zone.service");
 const { escalateUnassignedBooking } = require("./escalation.service");
 const { sendJobAssignedPush } = require("./pushNotification.service");
+const { calculatePartnerSettlement } = require("./partnerSettlement.service");
 const { getH3CellsForStage } = require("../utils/h3");
 // Shared cached AdminSetting.useH3Zones flag. Re-exported below because
 // several modules (booking/partner controllers, zone routes, slotCapacity)
@@ -165,7 +165,7 @@ function describeTeamPack(teamPack) {
   const rest = bins.length - bridal - tier2;
   const parts = [];
   if (bridal) parts.push(`${bridal} bridal`);
-  if (tier2) parts.push(`${tier2} technician-tier`);
+  if (tier2) parts.push(`${tier2} tier-2 (technician / senior)`);
   if (rest > 0) parts.push(`${rest} general`);
   return parts.join(", ");
 }
@@ -491,38 +491,10 @@ async function assignBooking(bookingId, opts = {}) {
         continue;
       }
 
-      // ── Cake daily-cap re-verification ─────────────────────────────────
-      // The cap filter inside findEligiblePartnersForBooking ran BEFORE
-      // scoring/team sizing, so two concurrent cake bookings for the same
-      // baker on the same day (different time slots — which the busySlots
-      // claim guard does not serialize) can both have passed it. Now that our
-      // claim is placed, recount: any claimed baker who is meanwhile at the
-      // cap gets released, and we retry as claim contention.
-      const overCapPartnerIds = await verifyCakeCapAfterClaim(
-        booking,
-        selectedPartners.map((p) => p._id)
-      );
-      if (overCapPartnerIds.length) {
-        for (const claimedPartner of selectedPartners) {
-          await syncPartnerOperationalState(claimedPartner._id);
-        }
-        booking.assignmentAudit.push({
-          stage,
-          event: "CLAIM_CONTENTION",
-          searchedPincodes: pincodesToSearch,
-          notes: `Cake daily cap reached for partner(s) ${overCapPartnerIds.join(", ")} between eligibility check and claim — released claims, retrying`,
-          candidates: rankedPartners
-            .slice(0, 5)
-            .map((e) => ({ partnerId: e.partner._id, score: e.score })),
-        });
-        await booking.save();
-        // Same-pool retry is worth it: the next attempt re-runs eligibility,
-        // which now sees the winner's booking and drops the full baker.
-        prevStageFailedDeterministically = false;
-        continue;
-      }
-
       const primaryPartner = selectedPartners[0];
+      const primaryEntry = rankedPartners.find(
+        (e) => String(e.partner._id) === String(primaryPartner._id)
+      );
       const additionalPartners = selectedPartners.slice(1);
 
       // Identify standby partners (up to 3 next best candidates we didn't claim)
@@ -602,7 +574,10 @@ async function assignBooking(bookingId, opts = {}) {
               selectedPartnerId: primaryPartner._id,
               notes: `[${acBooking ? "AC" : "BEAUTY"}] Selected top-ranked partner${
                 autoAccepted ? " with auto-accept enabled" : ""
+              }${
+                primaryEntry?.repeatBonus > 0 ? " (customer rated them well before)" : ""
               } — ${requiredCount} partner(s) required`,
+              weightProfile: rankedPartners[0]?.weightProfile || null,
               candidates: rankedPartners.slice(0, 10).map((entry) => ({
                 partnerId: entry.partner._id,
                 score: Number(entry.score || 0),
@@ -619,6 +594,7 @@ async function assignBooking(bookingId, opts = {}) {
                 distanceScore: Number(entry.distanceScore || 0),
                 skillScore: Number(entry.skillScore || 0),
                 reliabilityScore: Number(entry.reliabilityScore || 0),
+                repeatBonus: Number(entry.repeatBonus || 0),
                 autoAccept: Boolean(entry.partner?.autoAccept),
               })),
             },
@@ -645,8 +621,8 @@ async function assignBooking(bookingId, opts = {}) {
       // no partner action required, so no timeout needed.
       //
       // The 2-minute timer is for IMMINENT jobs only. Advance assignments
-      // (start >3h away — e.g. cake orders assigned at payment time, or any
-      // evening payment for a next-morning slot) may land while the partner is
+      // (start >3h away — e.g. an evening payment for a next-morning slot)
+      // may land while the partner is
       // legitimately offline/asleep; a 2-minute window would churn through
       // every candidate in the zone within minutes. Those get the wider
       // deadline (12h from assignment, capped at T-3h) enforced by the
@@ -737,21 +713,32 @@ async function assignBooking(bookingId, opts = {}) {
           updatedAt: new Date().toISOString(),
         };
 
+        // What the job pays the partners after commission — the app shows the
+        // amount as "Earnings", so never the customer's total (which includes
+        // GST, platform fee and our commission). Same maths as the completion
+        // credit; commission falls back to the primary partner's rate.
+        // Best-effort: a lookup failure must never block the assignment itself.
+        let settlement = null;
+        try {
+          settlement = await calculatePartnerSettlement(booking, primaryPartner);
+        } catch (settlementErr) {
+          console.error("[assign] partner earning estimate failed:", settlementErr.message);
+        }
+
         for (const teamPartner of selectedPartners) {
           const allocation = teamAllocations.find(
             (a) => a.partnerId?.toString() === teamPartner._id.toString()
           );
           const payoutRatio = allocation ? allocation.payoutRatio : 1;
           const partnerAutoAccept = Boolean(teamPartner.autoAccept);
+          const partnerEarning = Number(
+            ((settlement ? settlement.partnerEarningAmount : booking.totalAmount) * payoutRatio).toFixed(2)
+          );
 
           const partnerSpecificPayload = {
             ...assignmentPayload,
-            amount: Number(
-              (booking.totalAmount * payoutRatio).toFixed(2)
-            ),
-            price: Number(
-              (booking.totalAmount * payoutRatio).toFixed(2)
-            ),
+            amount: partnerEarning,
+            price: partnerEarning,
             isTeamJob: teamAllocations.length > 1,
             isPrimary: allocation ? Boolean(allocation.isPrimary) : true,
             status: partnerAutoAccept ? "CONFIRMED" : "ASSIGNED",

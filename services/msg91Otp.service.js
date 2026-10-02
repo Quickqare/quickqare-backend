@@ -1,22 +1,7 @@
 const jwt = require("jsonwebtoken");
-
-const normalizePhone = (phone = "") =>
-  String(phone).replace(/\D/g, "");
-
-const getCountryCode = () =>
-  String(process.env.MSG91_COUNTRY_CODE || "91").replace(/\D/g, "") || "91";
-
-const toInternationalPhone = (phone) => {
-  const normalized = normalizePhone(phone);
-  const countryCode = getCountryCode();
-
-  if (!normalized) return "";
-  if (normalized.startsWith(countryCode) && normalized.length > 10) {
-    return normalized;
-  }
-
-  return `${countryCode}${normalized}`;
-};
+// Shared with the DB lookups and per-phone rate limiters, so the number MSG91
+// dials is always the same one those key on.
+const { toInternationalPhone, INVALID_PHONE_MESSAGE } = require("../utils/phone");
 
 // Must match the validity wording in the registered DLT template.
 const getOtpExpiryMinutes = () => {
@@ -48,7 +33,7 @@ async function sendOtp(phone) {
   }
 
   if (!mobile) {
-    const error = new Error("Valid phone number required");
+    const error = new Error(INVALID_PHONE_MESSAGE);
     error.statusCode = 400;
     throw error;
   }
@@ -119,12 +104,12 @@ async function verifyOtp(phone, otp) {
   });
 
   const data = await response.json().catch(() => ({}));
-  const message = String(data?.message || "").toLowerCase();
-  const isSuccess =
-    response.ok &&
-    (data?.type === "success" ||
-      message.includes("verified") ||
-      message.includes("success"));
+  // Only MSG91's explicit success flag counts. Matching words in `message`
+  // ("verified", "success") let error replies through — MSG91 answers failures
+  // with HTTP 200 + type "error", and an error text such as "Mobile no. already
+  // verified" contains "verified". Accepting that would hand out a session for
+  // a phone the caller never proved they own.
+  const isSuccess = response.ok && data?.type === "success";
 
   if (!isSuccess) {
     const error = new Error(data?.message || "Invalid OTP");
@@ -138,29 +123,17 @@ async function verifyOtp(phone, otp) {
   };
 }
 
-const getMessage = (data = {}) =>
-  String(
-    data?.message ||
-      data?.msg ||
-      data?.error ||
-      data?.description ||
-      ""
-  ).toLowerCase();
-
-const isAccessTokenVerified = (data = {}) => {
-  const message = getMessage(data);
-
-  return Boolean(
+// Structured success flags only — never words inside `message` (an error such
+// as "token already verified" would otherwise pass; see verifyOtp).
+const isAccessTokenVerified = (data = {}) =>
+  Boolean(
     data?.type === "success" ||
       data?.success === true ||
       data?.verified === true ||
       data?.status === true ||
       data?.status === "success" ||
-      data?.result === "success" ||
-      message.includes("verified") ||
-      message.includes("success")
+      data?.result === "success"
   );
-};
 
 // ── Phone binding ─────────────────────────────────────────────────────────────
 // The MSG91 access token certifies that *some* phone completed OTP. To stop a

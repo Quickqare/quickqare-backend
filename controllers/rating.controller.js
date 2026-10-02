@@ -1,7 +1,6 @@
 const Rating = require("../models/Rating");
 const Booking = require("../models/Booking");
-const Partner = require("../models/Partner");
-const Service = require("../models/service.model");
+const { refreshPartnerRating, refreshServiceRating } = require("../services/rating.service");
 
 exports.submitRating = async (req, res) => {
   try {
@@ -59,33 +58,12 @@ exports.submitRating = async (req, res) => {
     });
     await newRating.save();
 
-    // Calculate weighted average for Partner
-    if (partnerId) {
-      const partner = await Partner.findById(partnerId);
-      if (partner) {
-        const totalReviews = partner.totalReviews || 0;
-        const oldAvg = partner.rating || 0;
-        const newAvg = (oldAvg * totalReviews + ratingValue) / (totalReviews + 1);
-
-        partner.rating = parseFloat(newAvg.toFixed(2));
-        partner.totalReviews = totalReviews + 1;
-        await partner.save();
-      }
-    }
-
-    // Calculate weighted average for Service
-    if (serviceId) {
-      const service = await Service.findById(serviceId);
-      if (service) {
-        const totalReviews = service.totalReviews || 0;
-        const oldAvg = service.rating || 0;
-        const newAvg = (oldAvg * totalReviews + ratingValue) / (totalReviews + 1);
-
-        service.rating = parseFloat(newAvg.toFixed(2));
-        service.totalReviews = totalReviews + 1;
-        await service.save();
-      }
-    }
+    // Recompute the partner's and service's averages from their ratings. The
+    // rating itself is already stored, so a failure here is logged instead of
+    // failing the request — the next rating recomputes the summary anyway.
+    await Promise.all([refreshPartnerRating(partnerId), refreshServiceRating(serviceId)]).catch(
+      (err) => console.error("Rating summary refresh failed:", err)
+    );
 
     res.status(201).json({ success: true, message: "Rating submitted successfully" });
   } catch (err) {

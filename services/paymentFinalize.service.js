@@ -107,18 +107,7 @@ async function finalizePaidBooking(booking, payment = {}) {
 
   const hoursToService = (scheduledStart.getTime() - Date.now()) / (1000 * 60 * 60);
 
-  // Customized (cake) orders are assigned IMMEDIATELY however far ahead they
-  // are scheduled — never parked in QUEUED. The minLeadDays window exists so
-  // the baker can bake; parking the order until the T-3h dispatch cron would
-  // (a) give the baker 3 hours' notice for a made-to-order cake, (b) leave the
-  // order partnerless so the per-baker daily cap can't count it — letting a
-  // zone sell more cakes for a date than its bakers can make — and (c) starve
-  // the day-before reminder cron, which only matches ASSIGNED+partner rows.
-  // assignBooking's requireOnline default already relaxes to false for
-  // non-imminent bookings, so the baker doesn't need to be online right now.
-  const isCustomizedOrder = (booking.services || []).some((s) => s?.options?.flavour);
-  const newStatus =
-    hoursToService > 24 && !isCustomizedOrder ? "QUEUED" : "PENDING_ASSIGNMENT";
+  const newStatus = hoursToService > 24 ? "QUEUED" : "PENDING_ASSIGNMENT";
 
   // ATOMIC: only the first caller (client verify OR webhook) flips to PAID, and
   // only while the booking is still alive (see doc comment above).

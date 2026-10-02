@@ -65,6 +65,21 @@ module.exports = async (req, res, next) => {
     }
 
     /* =====================
+       SESSION REVOKED BY PASSWORD CHANGE
+       Tokens live 90 days; a password reset must end sessions on every other
+       device (e.g. a lost or shared phone), not leave them working.
+    ===================== */
+    if (
+      partner.passwordChangedAt &&
+      Number(decoded.iat) * 1000 < new Date(partner.passwordChangedAt).getTime()
+    ) {
+      return res.status(401).json({
+        success: false,
+        message: "Your password was changed. Please log in again.",
+      });
+    }
+
+    /* =====================
        ATTACH PARTNER CONTEXT
     ===================== */
     req.partner = partner;

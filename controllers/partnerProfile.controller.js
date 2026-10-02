@@ -105,6 +105,22 @@ exports.updatePartnerServices = async (req, res) => {
     }));
 
     /* =============================
+       APPROVED PARTNERS: NO SELF-ESCALATION
+       Admin approval vets a partner for their category and level. Once
+       approved they can still add/remove services within that category, but:
+       - switching category sends them back for approval (no jobs in the new
+         trade until an admin re-approves);
+       - raising their own technician tier is refused — an admin sets it
+         (admin partners → skill tier). Otherwise any helper could self-promote
+         into gas/PCB technician jobs.
+    ============================= */
+    const isApproved = req.partner?.approvalStatus === "APPROVED";
+    const currentCategory = String(req.partner?.serviceCategories?.[0] || "").trim().toLowerCase();
+    const switchesCategory =
+      isApproved && currentCategory !== "" && currentCategory !== serviceCategoryName.trim().toLowerCase();
+    const approvalUpdate = switchesCategory ? { approvalStatus: "PENDING" } : {};
+
+    /* =============================
        AC SKILL TIER
        1 = Non-Technician, 2 = Technician
     ============================= */
@@ -117,6 +133,12 @@ exports.updatePartnerServices = async (req, res) => {
         return res.status(400).json({
           success: false,
           message: "skillTier is required for AC category (1 = Non-Technician, 2 = Technician)",
+        });
+      }
+      if (isApproved && !switchesCategory && tier > Number(req.partner?.skillTier || 1)) {
+        return res.status(403).json({
+          success: false,
+          message: "Moving up to Technician needs a skills check by the QuickQare team. Please contact support.",
         });
       }
       skillTierUpdate.skillTier = tier;
@@ -171,6 +193,7 @@ exports.updatePartnerServices = async (req, res) => {
         serviceCategories: [serviceCategoryName],
         ...skillTierUpdate,
         ...mehendiUpdate,
+        ...approvalUpdate,
       },
       { new: true }
     )
@@ -179,14 +202,17 @@ exports.updatePartnerServices = async (req, res) => {
 
     res.json({
       success: true,
-      message: "Services updated successfully",
+      message: switchesCategory
+        ? `Your services were updated. Working in ${serviceCategoryName} needs a quick review by the QuickQare team — you'll get jobs again once it's approved.`
+        : "Services updated successfully",
+      reapprovalRequired: switchesCategory,
       partner,
     });
   } catch (error) {
     console.error("Update services error:", error);
     res.status(500).json({
       success: false,
-      message: error.message,
+      message: "Something went wrong. Please try again.",
     });
   }
 };
@@ -213,9 +239,10 @@ exports.getPartnerProfile = async (req, res) => {
       partner,
     });
   } catch (error) {
+    console.error("getPartnerProfile error:", error);
     res.status(500).json({
       success: false,
-      message: error.message,
+      message: "Something went wrong. Please try again.",
     });
   }
 };
@@ -259,9 +286,10 @@ exports.updatePartnerProfile = async (req, res) => {
       partner,
     });
   } catch (error) {
+    console.error("updatePartnerProfile error:", error);
     return res.status(500).json({
       success: false,
-      message: error.message,
+      message: "Something went wrong. Please try again.",
     });
   }
 };
@@ -316,6 +344,7 @@ exports.getMyHub = async (req, res) => {
       },
     });
   } catch (error) {
-    return res.status(500).json({ success: false, message: error.message });
+    console.error("getMyHub error:", error);
+    return res.status(500).json({ success: false, message: "Something went wrong. Please try again." });
   }
 };

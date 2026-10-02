@@ -80,6 +80,18 @@ const couponSchema = new mongoose.Schema(
     ],
 
     /* =====================
+       PERSONAL COUPONS
+       Set when a coupon is issued to one customer (e.g. a referral reward).
+       Only that customer can see or redeem it. null = a general promo code.
+    ===================== */
+    assignedTo: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+      index: true,
+    },
+
+    /* =====================
        EXPIRY
     ===================== */
     expiresAt: {

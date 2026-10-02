@@ -135,8 +135,8 @@ const serviceSchema = new mongoose.Schema(
 
     // BEFORE_SERVICE: refund tiers keyed on hours remaining until the service
     // (cancellationTiers above). SINCE_BOOKING: tiers keyed on hours elapsed
-    // since the booking was placed (sinceBookingTiers below) — used for
-    // advance-order categories like cakes.
+    // since the booking was placed (sinceBookingTiers below) — legacy, used
+    // only by the discontinued cake orders and no longer applied to bookings.
     cancellationPolicyType: {
       type: String,
       enum: ["BEFORE_SERVICE", "SINCE_BOOKING"],
@@ -157,7 +157,7 @@ const serviceSchema = new mongoose.Schema(
       default: [],
     },
 
-    // Grace-period override for last-minute advance orders (cakes). An order
+    // Grace-period override for last-minute orders. An order
     // PLACED with less than appliesBelowLeadHours of notice before its
     // scheduled start lands inside a low/zero refund tier the moment it's
     // booked; this gives the customer windowMinutes from booking creation to
@@ -170,78 +170,9 @@ const serviceSchema = new mongoose.Schema(
       appliesBelowLeadHours: { type: Number, default: 0, min: 0 },
     },
 
-    /* =====================
-       CUSTOMIZATION (per-order options, e.g. cakes)
-       Base price = 1-tier cake with the cheapest flavour delta.
-    ===================== */
-    customization: {
-      // Weight/size tiers (e.g. "0.5 kg", "1 kg", "2 kg"). First entry is the
-      // base weight (priceDelta 0 by convention, not enforced). Optional —
-      // an empty array means the service has no weight choice.
-      weights: {
-        type: [
-          {
-            label:      { type: String, required: true, trim: true },
-            priceDelta: { type: Number, default: 0, min: 0 },
-          },
-        ],
-        default: [],
-      },
-      flavours: {
-        type: [
-          {
-            name:       { type: String, required: true, trim: true },
-            priceDelta: { type: Number, default: 0, min: 0 },
-          },
-        ],
-        default: [],
-      },
-      twoTierPriceDelta: { type: Number, default: 0, min: 0 },
-      addons: {
-        type: [
-          {
-            name:  { type: String, required: true, trim: true },
-            price: { type: Number, required: true, min: 0 },
-          },
-        ],
-        default: [],
-      },
-      nameOnCakeEnabled: { type: Boolean, default: true },
-
-      // Every cake can be made with or without egg — this is the customer's
-      // per-order choice, distinct from the `isEggless` flag below (which
-      // marks a listing as egg-free only, e.g. "Eggless Special Cake").
-      egglessPriceDelta: { type: Number, default: 0, min: 0 },
-
-      // Per-section admin toggles — when false the customer can't pick that
-      // option for this cake (section hidden client-side, mismatching values
-      // rejected server-side). Flavours stay configured even when selection
-      // is disabled: the first flavour then applies as the fixed default,
-      // and a non-empty flavours list is what marks a service as a cake.
-      flavoursEnabled:       { type: Boolean, default: true },
-      weightsEnabled:        { type: Boolean, default: true },
-      tiersEnabled:          { type: Boolean, default: true },
-      addonsEnabled:         { type: Boolean, default: true },
-      referencePhotoEnabled: { type: Boolean, default: true },
-      egglessOptionEnabled:  { type: Boolean, default: true },
-    },
-
-    // Ingredients shown to the customer (e.g. cakes).
-    ingredients: {
-      type: [String],
-      default: [],
-    },
-
-    // Egg-free badge/filter shown to the customer (cakes).
-    isEggless: {
-      type: Boolean,
-      default: false,
-    },
-
     // Ordered photo gallery shown to the customer (Cloudinary URLs) — kept as
     // "media360" for backward compatibility, no longer a rotation-frame set.
-    // Shown in the MOBILE APP only (cakes are the exception: their Cake Setup
-    // gallery is shared with the web cake customizer).
+    // Shown in the MOBILE APP only.
     media360: {
       type: [String],
       default: [],
@@ -286,7 +217,7 @@ const serviceSchema = new mongoose.Schema(
     },
 
     // Minimum lead time in calendar days between booking and the scheduled
-    // date. 0 = same-day allowed; cakes use 1 (order at least a day ahead).
+    // date. 0 = same-day allowed.
     minLeadDays: {
       type: Number,
       default: 0,
@@ -315,10 +246,12 @@ const serviceSchema = new mongoose.Schema(
       default: 0,
     },
 
-    // Minimum partner skill tier required to perform this service (AC only).
-    // 1 = serviceman (cleaning/filter wash), 2 = technician (gas refill,
-    // repair, install/uninstall). Matches Partner.skillTier collected at
-    // signup — the assignment engine blocks partners below this tier.
+    // Minimum partner skill tier required to perform this service (AC and
+    // salon / self-care). AC: 1 = serviceman (cleaning/filter wash),
+    // 2 = technician (gas refill, repair, install/uninstall). Salon:
+    // 1 = any beautician, 2 = senior beautician (advanced treatments).
+    // Matches Partner.skillTier — the assignment engine blocks partners
+    // below this tier.
     skillTier: {
       type: Number,
       default: 1,
@@ -347,9 +280,24 @@ const serviceSchema = new mongoose.Schema(
       default: 0,
     },
 
+    // Average customer rating (null until the first one) and how many ratings
+    // it's based on — kept by services/rating.service.js.
+    rating: {
+      type: Number,
+      default: null,
+      min: 0,
+      max: 5,
+    },
+
+    totalReviews: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+
     /* =====================
-       WEB "HIGHLIGHTS"
-       Admin-curated services shown in the Highlights row on the web home page.
+       HOME "HIGHLIGHTS" (web + app)
+       Admin-curated services shown in the Highlights row on the web and app home pages.
        highlightOrder controls their order (lower = first).
     ===================== */
     isHighlighted: {

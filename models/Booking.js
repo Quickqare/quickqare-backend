@@ -121,11 +121,11 @@ const bookingSchema = new mongoose.Schema(
         category: String,
         subCategory: String,
 
-        // Per-order customization snapshot (cakes) — resolved and priced
-        // server-side at booking time; addon prices frozen here.
+        // Per-order customization snapshot from the discontinued cake orders.
+        // No longer written; kept so past cake bookings still display.
         options: {
           flavour: String,
-          weight: String, // e.g. "1 kg" — resolved against Service.customization.weights
+          weight: String, // e.g. "1 kg"
           tiers: Number, // 1 | 2
           eggless: { type: Boolean, default: false },
           addons: [
@@ -493,8 +493,8 @@ const bookingSchema = new mongoose.Schema(
     },
 
     // BEFORE_SERVICE (default): refund from cancellationTiersSnapshot, keyed
-    // on hours remaining until the service. SINCE_BOOKING (cakes): refund from
-    // sinceBookingTiersSnapshot, keyed on hours elapsed since booking creation.
+    // on hours remaining until the service. SINCE_BOOKING: legacy value on
+    // past cake bookings only — new bookings are always BEFORE_SERVICE.
     cancellationPolicyTypeSnapshot: {
       type: String,
       enum: ["BEFORE_SERVICE", "SINCE_BOOKING"],
@@ -574,14 +574,6 @@ const bookingSchema = new mongoose.Schema(
       default: null,
     },
 
-    // Set once the day-before "cake order due tomorrow" push has gone out to
-    // the assigned baker. Separate from preJobReminderSentAt, which fires only
-    // ~30 min before service — cake orders need an earlier heads-up.
-    cakeReminderSentAt: {
-      type: Date,
-      default: null,
-    },
-
     /* ======================
        POST-COMPLETION
     ====================== */
@@ -617,7 +609,7 @@ const bookingSchema = new mongoose.Schema(
 
     // When the current partner was attached (reset on every reassignment).
     // Anchors the ACK deadline for ADVANCE assignments (start >3h away, e.g.
-    // cake orders assigned at payment): the partner may legitimately be
+    // an evening payment for a morning slot): the partner may legitimately be
     // offline, so instead of the 2-minute socket timer they get
     // ADVANCE_ACK_WINDOW_MS from this timestamp to acknowledge — enforced by
     // the enforceAdvanceAckDeadlines cron, restart-safe by construction.
@@ -692,6 +684,9 @@ const bookingSchema = new mongoose.Schema(
             default: null,
           },
           notes: String,
+          // Which score-weight set ranked the candidates (AC / SALON /
+          // GENERAL) — the weight-shadow report replays exactly this set.
+          weightProfile: String,
           candidates: [
             {
               partnerId: {
@@ -710,6 +705,9 @@ const bookingSchema = new mongoose.Schema(
               distanceScore: Number,
               skillScore: Number,
               reliabilityScore: Number,
+              // Repeat-partner affinity points already included in `score`
+              // (+ customer rated them well, − poorly; salon only).
+              repeatBonus: Number,
               inPrimaryPincode: Boolean,
               autoAccept: Boolean,
             },

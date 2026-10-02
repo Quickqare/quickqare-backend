@@ -68,6 +68,7 @@ router.get("/", async (req, res) => {
       id: String(partner._id),
       name: partner.name,
       phone: partner.phone,
+      gender: partner.gender || "",
       serviceCategory: partner.serviceCategories?.[0] || "",
       skillTier: partner.skillTier || 1,
       pincode: partner.currentPincode || "",
@@ -164,9 +165,21 @@ router.get("/available", async (req, res) => {
     const bookingId = String(req.query.bookingId || "").trim();
 
     let excludePartnerId = null;
+    let genderRule = null;
     if (bookingId && mongoose.Types.ObjectId.isValid(bookingId)) {
-      const bk = await Booking.findById(bookingId).select("partner").lean();
+      const bk = await Booking.findById(bookingId)
+        .select("partner services serviceId serviceCategory")
+        .lean();
       excludePartnerId = bk?.partner;
+      // Offer only partners the booking's category partner-gender rule allows
+      // — /bookings/:id/reassign rejects anyone else.
+      if (bk) {
+        const { getPartnerGenderRule } = require("../../../services/scheduling_service");
+        genderRule = await getPartnerGenderRule(bk);
+      }
+    }
+    if (genderRule?.conflict) {
+      return success(res, [], { requestId: req.requestId });
     }
 
     const where = { approvalStatus: "APPROVED", isBlocked: false };
@@ -175,6 +188,9 @@ router.get("/available", async (req, res) => {
     }
     if (excludePartnerId) {
       where._id = { $ne: excludePartnerId };
+    }
+    if (genderRule?.required) {
+      where.gender = genderRule.required;
     }
 
     const partners = await Partner.find(where)
@@ -198,7 +214,7 @@ router.get("/:id/stats", async (req, res) => {
     }
 
     const partner = await Partner.findById(partnerId)
-      .select("name phone email rating activeJobs maxJobsLimit currentPincode serviceAreas serviceCategories skillTier isOnline approvalStatus isBlocked plan commissionPercent subscriptionActive createdAt location assignedHubId mehendiSpecializations selfieUrl selfieVerificationStatus selfieRejectionReason services")
+      .select("name phone email gender rating activeJobs maxJobsLimit currentPincode serviceAreas serviceCategories skillTier isOnline approvalStatus isBlocked plan commissionPercent subscriptionActive createdAt location assignedHubId mehendiSpecializations selfieUrl selfieVerificationStatus selfieRejectionReason services")
       .populate("assignedHubId", "name city state")
       .lean();
     if (!partner) {
@@ -474,6 +490,75 @@ router.patch("/:id/subscription", audit("admin.partners.subscription"), async (r
     return success(res, updated, { requestId: req.requestId });
   } catch (error) {
     return fail(res, 500, "PARTNER_SUBSCRIPTION_FAILED", "Unable to update partner subscription", error.message, {
+      requestId: req.requestId,
+    });
+  }
+});
+
+// Correct a partner's registered gender (e.g. a legacy signup from before
+// gender was required). Categories with a partnerGender rule only match
+// partners whose gender is set to that value.
+router.patch("/:id/gender", audit("admin.partners.gender"), async (req, res) => {
+  try {
+    const partnerId = asSingleString(req.params.id);
+    const gender = String(req.body.gender || "").trim().toUpperCase();
+    if (!partnerId || !mongoose.Types.ObjectId.isValid(partnerId)) {
+      return fail(res, 400, "INVALID_ID", "Invalid partner id", null, { requestId: req.requestId });
+    }
+    if (!["MALE", "FEMALE", "OTHER"].includes(gender)) {
+      return fail(res, 400, "VALIDATION_ERROR", "gender must be MALE, FEMALE or OTHER", null, {
+        requestId: req.requestId,
+      });
+    }
+
+    const updated = await Partner.findByIdAndUpdate(
+      partnerId,
+      { $set: { gender } },
+      { new: true }
+    ).lean();
+    if (!updated) {
+      return fail(res, 404, "NOT_FOUND", "Partner not found", null, { requestId: req.requestId });
+    }
+
+    return success(res, updated, { requestId: req.requestId });
+  } catch (error) {
+    return fail(res, 500, "PARTNER_GENDER_FAILED", "Unable to update partner gender", error.message, {
+      requestId: req.requestId,
+    });
+  }
+});
+
+// Set a partner's skill tier. AC: 1 = serviceman, 2 = technician (also set
+// by the partner at signup). Salon / self-care: 1 = beautician, 2 = senior
+// beautician — admin-set only, the partner app never asks. Services marked
+// tier 2 are only assigned to tier-2 partners.
+router.patch("/:id/skill-tier", audit("admin.partners.skillTier"), async (req, res) => {
+  try {
+    const partnerId = asSingleString(req.params.id);
+    const skillTier = Number(req.body.skillTier);
+    if (!partnerId || !mongoose.Types.ObjectId.isValid(partnerId)) {
+      return fail(res, 400, "INVALID_ID", "Invalid partner id", null, { requestId: req.requestId });
+    }
+    if (![1, 2].includes(skillTier)) {
+      return fail(res, 400, "VALIDATION_ERROR", "skillTier must be 1 or 2", null, {
+        requestId: req.requestId,
+      });
+    }
+
+    const updated = await Partner.findByIdAndUpdate(
+      partnerId,
+      { $set: { skillTier } },
+      { new: true }
+    )
+      .select("_id name skillTier serviceCategories")
+      .lean();
+    if (!updated) {
+      return fail(res, 404, "NOT_FOUND", "Partner not found", null, { requestId: req.requestId });
+    }
+
+    return success(res, updated, { requestId: req.requestId });
+  } catch (error) {
+    return fail(res, 500, "PARTNER_SKILL_TIER_FAILED", "Unable to update partner skill tier", error.message, {
       requestId: req.requestId,
     });
   }

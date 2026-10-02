@@ -1,63 +1,101 @@
 const PartnerWallet = require("../models/PartnerWallet");
 const WalletTransaction = require("../models/WalletTransaction");
 const Withdrawal = require("../models/Withdrawal");
-const Partner = require("../models/Partner");
-const { encryptBankDetails } = require("../utils/fieldCrypto");
+const PartnerPayoutAccount = require("../models/PartnerPayoutAccount");
+const { encryptField, encryptBankDetails } = require("../utils/fieldCrypto");
 
 const roundAmount = (value) => Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
 
-const normalizeWallet = (wallet) => {
-  if (!wallet) return wallet;
-
-  const legacyBalance = Number(wallet.balance || 0);
-  const withdrawableBalance = Number(
-    wallet.withdrawableBalance !== undefined ? wallet.withdrawableBalance : legacyBalance
+/* =====================================================
+   NORMALIZE WALLET (ATOMIC)
+   Rounds every bucket to paise and fills withdrawableBalance for legacy
+   balance-only wallets, in one pipeline update on the stored values. It used
+   to be findOne + save, which could write values from a stale read back over
+   a credit or release another request had just applied.
+===================================================== */
+const normalizeWallet = (partnerId) =>
+  PartnerWallet.findOneAndUpdate(
+    { partnerId },
+    [
+      {
+        $set: {
+          withdrawableBalance: {
+            $round: [{ $ifNull: ["$withdrawableBalance", { $ifNull: ["$balance", 0] }] }, 2],
+          },
+          pendingBalance: { $round: [{ $ifNull: ["$pendingBalance", 0] }, 2] },
+          totalEarnings: { $round: [{ $ifNull: ["$totalEarnings", 0] }, 2] },
+          totalWithdrawn: { $round: [{ $ifNull: ["$totalWithdrawn", 0] }, 2] },
+        },
+      },
+      // balance mirrors the withdrawable bucket.
+      { $set: { balance: "$withdrawableBalance" } },
+    ],
+    { new: true }
   );
-  const pendingBalance = Number(wallet.pendingBalance || 0);
-
-  wallet.withdrawableBalance = roundAmount(withdrawableBalance);
-  wallet.pendingBalance = roundAmount(pendingBalance);
-  wallet.balance = roundAmount(wallet.withdrawableBalance);
-  wallet.totalEarnings = roundAmount(wallet.totalEarnings || 0);
-  wallet.totalWithdrawn = roundAmount(wallet.totalWithdrawn || 0);
-  wallet.lastUpdated = new Date();
-
-  return wallet;
-};
 
 /* =====================================================
    RELEASE PENDING EARNINGS AFTER 48h HOLD
-   Called internally before wallet reads/withdrawals
+   Called internally before wallet reads/withdrawals.
+
+   Each matured credit is claimed on its own (a status-guarded pending →
+   success flip) before its amount moves, so overlapping wallet requests can
+   never release the same credit twice. The move itself is a single atomic
+   update — the old version summed the credits, did a read-modify-write on the
+   wallet and only then marked them released, so concurrent requests could
+   each add the same credits.
 ===================================================== */
 const releasePendingEarnings = async (partnerId) => {
   const cutoff = new Date(Date.now() - 48 * 60 * 60 * 1000);
 
-  const pendingTxns = await WalletTransaction.find({
+  const matured = await WalletTransaction.find({
     partnerId,
     type: "credit",
     status: "pending",
     createdAt: { $lte: cutoff },
-  }).lean();
+  })
+    .select("_id amount")
+    .lean();
 
-  if (!pendingTxns.length) return;
+  if (!matured.length) return;
+  if (!(await PartnerWallet.exists({ partnerId }))) return;
 
-  const totalToRelease = pendingTxns.reduce((sum, t) => sum + Number(t.amount || 0), 0);
-  if (totalToRelease <= 0) return;
+  for (const txn of matured) {
+    const claim = await WalletTransaction.updateOne(
+      { _id: txn._id, status: "pending" },
+      { $set: { status: "success" } }
+    );
+    if (claim.modifiedCount === 0) continue; // another request released it
 
-  const wallet = await PartnerWallet.findOne({ partnerId });
-  if (!wallet) return;
+    const amount = roundAmount(txn.amount);
+    let moved;
+    try {
+      moved = await PartnerWallet.updateOne({ partnerId }, [
+        {
+          $set: {
+            pendingBalance: {
+              $round: [{ $max: [0, { $subtract: [{ $ifNull: ["$pendingBalance", 0] }, amount] }] }, 2],
+            },
+            withdrawableBalance: {
+              $round: [{ $add: [{ $ifNull: ["$withdrawableBalance", 0] }, amount] }, 2],
+            },
+            lastUpdated: new Date(),
+          },
+        },
+        // balance mirrors the withdrawable bucket.
+        { $set: { balance: "$withdrawableBalance" } },
+      ]);
+    } catch (err) {
+      // Hand the credit back so a later request releases it.
+      await WalletTransaction.updateOne({ _id: txn._id }, { $set: { status: "pending" } });
+      throw err;
+    }
 
-  normalizeWallet(wallet);
-  wallet.pendingBalance = roundAmount(Math.max(0, wallet.pendingBalance - totalToRelease));
-  wallet.withdrawableBalance = roundAmount(wallet.withdrawableBalance + totalToRelease);
-  wallet.balance = roundAmount(wallet.withdrawableBalance);
-  wallet.lastUpdated = new Date();
-  await wallet.save();
-
-  await WalletTransaction.updateMany(
-    { _id: { $in: pendingTxns.map((t) => t._id) } },
-    { $set: { status: "success" } }
-  );
+    if (moved.matchedCount === 0) {
+      // Wallet vanished mid-release: leave the credit pending, as before.
+      await WalletTransaction.updateOne({ _id: txn._id }, { $set: { status: "pending" } });
+      return;
+    }
+  }
 };
 
 /* =====================================================
@@ -70,18 +108,30 @@ exports.getWallet = async (req, res) => {
 
     await releasePendingEarnings(partnerId);
 
-    let wallet = await PartnerWallet.findOne({ partnerId });
+    let wallet = await normalizeWallet(partnerId);
 
     if (!wallet) {
       wallet = await PartnerWallet.create({ partnerId, balance: 0, withdrawableBalance: 0, pendingBalance: 0, totalEarnings: 0, totalWithdrawn: 0 });
     }
 
-    normalizeWallet(wallet);
-    await wallet.save();
+    // The held amount of an open request has already left withdrawableBalance
+    // but has no ledger row until it's processed — surface it so the partner
+    // can see where the money is.
+    const pendingWithdrawal = await Withdrawal.findOne({ partnerId, status: "PENDING" })
+      .select("amount payoutMethod createdAt")
+      .lean();
 
     res.status(200).json({
       success: true,
       wallet,
+      pendingWithdrawal: pendingWithdrawal
+        ? {
+            id: pendingWithdrawal._id,
+            amount: pendingWithdrawal.amount,
+            payoutMethod: pendingWithdrawal.payoutMethod || "BANK",
+            createdAt: pendingWithdrawal.createdAt,
+          }
+        : null,
     });
   } catch (error) {
     console.error("Get wallet error:", error);
@@ -135,19 +185,16 @@ exports.requestWithdrawal = async (req, res) => {
     if (amount < 200) {
       return res.status(400).json({ success: false, message: "Minimum withdrawal amount is ₹200" });
     }
-    if (amount > 100_000) {
-      return res.status(400).json({ success: false, message: "Maximum withdrawal amount is ₹1,00,000 per request" });
+    if (amount > 10_000) {
+      return res.status(400).json({ success: false, message: "Maximum withdrawal amount is ₹10,000 per request" });
     }
 
     await releasePendingEarnings(partnerId);
 
-    const wallet = await PartnerWallet.findOne({ partnerId });
+    // Normalize first so withdrawableBalance is populated (migrates any legacy
+    // balance-only doc) before the atomic hold reads that field.
+    const wallet = await normalizeWallet(partnerId);
     if (!wallet) return res.status(404).json({ success: false, message: "Wallet not found" });
-
-    // Persist a normalized wallet so withdrawableBalance is populated (migrates
-    // any legacy balance-only doc) before the atomic hold reads that field.
-    normalizeWallet(wallet);
-    await wallet.save();
 
     // Block duplicate pending requests (product rule + cheap pre-check).
     const existing = await Withdrawal.findOne({ partnerId, status: "PENDING" });
@@ -158,12 +205,28 @@ exports.requestWithdrawal = async (req, res) => {
       });
     }
 
-    const partner = await Partner.findById(partnerId).select("bankDetails").lean();
-    const bankDetails = partner?.bankDetails || {};
-    if (!bankDetails.accountNumber || !bankDetails.ifsc) {
+    // Withdrawals only ever go to an admin-verified payout account.
+    const payoutAccount = await PartnerPayoutAccount.findOne({ partnerId }).lean();
+    if (!payoutAccount) {
       return res.status(400).json({
         success: false,
-        message: "Add your bank account details before withdrawing.",
+        message: "Add your bank account or UPI ID in Verification Center before withdrawing.",
+      });
+    }
+    if (payoutAccount.status !== "VERIFIED") {
+      return res.status(400).json({
+        success: false,
+        message:
+          payoutAccount.status === "REJECTED"
+            ? "Your payout account was rejected. Update it in Verification Center."
+            : "Your payout account is still being verified. You can withdraw once it's approved.",
+      });
+    }
+    if (payoutAccount.withdrawalsBlockedUntil && payoutAccount.withdrawalsBlockedUntil > new Date()) {
+      return res.status(400).json({
+        success: false,
+        message: "Your payout account was changed recently. For your security, withdrawals unlock 24 hours after the change.",
+        withdrawalsBlockedUntil: payoutAccount.withdrawalsBlockedUntil,
       });
     }
 
@@ -205,16 +268,23 @@ exports.requestWithdrawal = async (req, res) => {
         amount,
         status: "PENDING",
         balanceHeld: true,
-        // Encrypt the snapshot at rest. bankDetails comes from a .lean() Partner
-        // read above, so its account number is already ciphertext when the
-        // partner saved it encrypted; encryptBankDetails is idempotent and also
-        // covers any legacy plaintext row.
-        bankDetails: encryptBankDetails({
-          accountHolderName: bankDetails.accountHolderName || "",
-          accountNumber: bankDetails.accountNumber,
-          ifsc: bankDetails.ifsc,
-          bankName: bankDetails.bankName || "",
-        }),
+        // Snapshot the verified destination. The payout account's sensitive
+        // fields are already ciphertext; encryptField/encryptBankDetails are
+        // idempotent, and also cover a row written while no key was set.
+        payoutMethod: payoutAccount.method,
+        ...(payoutAccount.method === "UPI"
+          ? {
+              upiId: encryptField(payoutAccount.upiId),
+              bankDetails: { accountHolderName: payoutAccount.accountHolderName || "" },
+            }
+          : {
+              bankDetails: encryptBankDetails({
+                accountHolderName: payoutAccount.accountHolderName || "",
+                accountNumber: payoutAccount.accountNumber,
+                ifsc: payoutAccount.ifsc,
+                bankName: payoutAccount.bankName || "",
+              }),
+            }),
       });
     } catch (createErr) {
       // Creation failed after the hold — return the reserved funds so they

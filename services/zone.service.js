@@ -24,12 +24,30 @@ function normalizePincode(value) {
   return String(value || "").trim();
 }
 
+// Short aliases must match a whole word: "ac" is a substring of "facial",
+// "face", "bleach" and "back", so createBooking filed face waxing, facials and
+// bleach under acRepair and a zone with AC switched off rejected them (same
+// trap isACCategory guards against). Longer aliases stay substring matches so
+// plurals like "plumbers" or "cakes" keep resolving.
+const WHOLE_WORD_ALIAS_MAX_LENGTH = 3;
+
+function aliasMatches(normalized, alias) {
+  if (alias.length <= WHOLE_WORD_ALIAS_MAX_LENGTH) {
+    return ` ${normalized} `.includes(` ${alias} `);
+  }
+  return normalized.includes(alias);
+}
+
 function getZoneServiceKey(value = "") {
+  // A zone key maps to itself: createBooking resolves keys first and
+  // isZoneServiceEnabled resolves them again, so "acRepair" must round-trip.
+  if (Object.hasOwn(SERVICE_KEY_ALIASES, String(value))) return String(value);
+
   const normalized = normalizeText(value);
   if (!normalized) return null;
 
   for (const [key, aliases] of Object.entries(SERVICE_KEY_ALIASES)) {
-    if (aliases.some((alias) => normalized.includes(alias))) {
+    if (aliases.some((alias) => aliasMatches(normalized, alias))) {
       return key;
     }
   }

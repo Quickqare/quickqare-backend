@@ -15,7 +15,7 @@ exports.uploadImage = async (req, res) => {
   }
 };
 
-// Multi-image upload (e.g. cake photo galleries). Field name "images", max 12.
+// Multi-image upload (e.g. service photo galleries). Field name "images", max 12.
 exports.uploadImages = async (req, res) => {
   try {
     if (!Array.isArray(req.files) || req.files.length === 0) {

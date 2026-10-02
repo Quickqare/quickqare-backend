@@ -3,15 +3,12 @@ const Partner = require("../models/Partner");
 const Service = require("../models/service.model");
 const AdminSetting = require("../admin/models/AdminSetting");
 const LearnedStat = require("../models/LearnedStat");
+const Rating = require("../models/Rating");
 const {
   isZoneServiceEnabled,
   resolveZoneForPincode,
 } = require("./zone.service");
 const { deriveH3Cell, getH3Ring } = require("../utils/h3");
-const {
-  isCakeCategoryText,
-  CAKE_CATEGORY_REGEX,
-} = require("../utils/categoryDetection");
 const { getUseH3Flag } = require("./useH3Flag.service");
 
 /*
@@ -43,18 +40,18 @@ const TRAVEL_BUFFER_BASE_MINUTES = 10;    // parking, stairs, payment, wrap-up
 const AC_TRAVEL_BUFFER_BASE_MINUTES = 15; // + equipment carry
 const TRAVEL_BUFFER_MAX_MINUTES = 60;     // extended-pincode trips cap here
 
-// AC bookings: 360 min max per technician (physically heavier, more variable)
-const AC_MAX_CAPACITY_MINUTES = 360;
-
-// General / Mehendi: 420 min max (7 hours)
-const GENERAL_MAX_CAPACITY_MINUTES = 420;
-
 // Maximum on-site elapsed time PER PARTNER at a single visit. This caps each
 // task bin so team size is driven by how long the customer's event/visit can
 // realistically run — a 10-hour guest-mehendi party gets enough artists to
 // finish inside the event window, not one artist working 7 hours straight.
 const MEHENDI_VISIT_WINDOW_MINUTES = 240; // typical mehendi function: 3-4 h
 const AC_VISIT_WINDOW_MINUTES = 240;      // max time one tech spends at a home
+// Salon / self-care: one beautician does the whole cart up to this long; a
+// longer cart (full-body wax + facial + mani-pedi + hair spa, or two people
+// in one booking) is split across beauticians working in parallel instead
+// of one beautician on-site for 6+ hours — or no slot at all once the
+// summed duration overruns the workday.
+const SALON_VISIT_WINDOW_MINUTES = 240;
 
 // Units after the first of the same AC service line are faster — the tech is
 // already on-site with tools set up. Scheduling time only; pricing unchanged.
@@ -76,30 +73,9 @@ const FAIRNESS_LOOKBACK_HOURS = 12;
 // AC category detection slugs — extend this list as needed
 const AC_CATEGORY_SLUGS = ["ac", "air conditioner", "air-conditioner", "aircon"];
 
-// Cake/Celebration: a baker can hold at most this many cake orders per
-// scheduled calendar day. Enforced in findEligiblePartnersForBooking, which
-// also feeds slot listing and slot capacity — so full bakers automatically
-// stop appearing as available. This is the CODE DEFAULT; admin can override
-// it via AdminSetting.assignment.cakeMaxOrdersPerPartnerPerDay.
-const CAKE_MAX_ORDERS_PER_PARTNER_PER_DAY = 2;
-
-// Cached admin override for the cake daily cap (60s TTL, same pattern as the
-// useH3Zones flag). Falls back to the code default on any error.
-let _cakeCapCache = { value: CAKE_MAX_ORDERS_PER_PARTNER_PER_DAY, expiresAt: 0 };
-async function getCakeDailyCap() {
-  if (Date.now() < _cakeCapCache.expiresAt) return _cakeCapCache.value;
-  try {
-    const s = await AdminSetting.findOne().select("assignment").lean();
-    const v = Math.floor(Number(s?.assignment?.cakeMaxOrdersPerPartnerPerDay));
-    _cakeCapCache = {
-      value: Number.isFinite(v) && v >= 1 ? v : CAKE_MAX_ORDERS_PER_PARTNER_PER_DAY,
-      expiresAt: Date.now() + 60_000,
-    };
-  } catch {
-    _cakeCapCache.expiresAt = Date.now() + 10_000;
-  }
-  return _cakeCapCache.value;
-}
+// Category.partnerGender values that restrict who may deliver a category
+// ("ANY" adds no restriction). Compared against Partner.gender.
+const RESTRICTED_PARTNER_GENDERS = ["FEMALE", "MALE"];
 
 /*
 =====================================================
@@ -117,6 +93,35 @@ idle/earnings weights for reliability.
 */
 const AC_SCORE_WEIGHTS = { idle: 0.28, earnings: 0.17, distance: 0.1, skill: 0.3, reliability: 0.15 };
 const GENERAL_SCORE_WEIGHTS = { idle: 0.33, earnings: 0.22, distance: 0.2, skill: 0.1, reliability: 0.15 };
+// Salon / self-care: the beautician who actually lists the treatment beats a
+// category-level legacy match that happens to be idle or closer — skill moves
+// 0.10 → 0.25, taken from idle/earnings (rotation still carries 0.40).
+const SALON_SCORE_WEIGHTS = { idle: 0.25, earnings: 0.15, distance: 0.2, skill: 0.25, reliability: 0.15 };
+
+// Weight profile names, stored on each assignment audit entry so the
+// weight-shadow report replays exactly the set the live ranking used.
+const SCORE_WEIGHTS_BY_PROFILE = {
+  AC: AC_SCORE_WEIGHTS,
+  SALON: SALON_SCORE_WEIGHTS,
+  GENERAL: GENERAL_SCORE_WEIGHTS,
+};
+
+function getScoreWeightProfile({ isAC = false, isSalon = false } = {}) {
+  if (isAC) return "AC";
+  if (isSalon) return "SALON";
+  return "GENERAL";
+}
+
+// Repeat-partner affinity (salon / self-care). A customer's own latest rating
+// of a candidate, within the lookback, nudges that candidate's score: a
+// beautician they rated well is preferred again, one they rated poorly is
+// pushed down. Additive points on the 0-100 score — enough to win a close
+// ranking, not enough to override a clearly better (or only) candidate.
+const REPEAT_PARTNER_LOOKBACK_DAYS = 180;
+const REPEAT_PARTNER_GOOD_RATING = 4;  // >= this → bonus
+const REPEAT_PARTNER_POOR_RATING = 2;  // <= this → penalty
+const REPEAT_PARTNER_BONUS = 8;
+const REPEAT_PARTNER_PENALTY = 15;
 
 // Learned service duration is clamped to this band around the admin-entered
 // `duration`, so a single corrupt timestamp can never blow up team sizing or
@@ -153,7 +158,7 @@ const TRAVEL_BUFFER_GENERAL_MAX = 60;
 const TRAVEL_BUFFER_AC_MIN = 20;
 const TRAVEL_BUFFER_AC_MAX = 75;
 
-// Cached learned transit times (60s TTL, same pattern as the cake cap). Falls
+// Cached learned transit times (60s TTL, same pattern as the useH3Zones flag). Falls
 // back to the hardcoded DEFAULT_/AC_TRAVEL_BUFFER_MINUTES on any miss.
 let _travelBufferCache = { general: null, ac: null, expiresAt: 0 };
 async function getLearnedTravelBuffers() {
@@ -190,18 +195,6 @@ function cachedFlatTravelBuffer(isAC) {
   return Math.min(Math.max(Math.round(learned), lo), hi);
 }
 
-// Statuses that count toward the baker's daily cake cap. Pre-assignment
-// statuses are excluded (no partner attached yet); COMPLETED counts because a
-// cake delivered earlier the same day still consumed baking capacity.
-const CAKE_CAP_COUNT_STATUSES = [
-  "ASSIGNED",
-  "CONFIRMED",
-  "PARTNER_ACCEPTED",
-  "ON_THE_WAY",
-  "ARRIVED",
-  "IN_PROGRESS",
-  "COMPLETED",
-];
 
 // Statuses where a partner is committed to a booking and that booking's window
 // must block them from being assigned to overlapping work.
@@ -343,6 +336,43 @@ function isACCategory(categorySlug = "") {
 
 /*
 =====================================================
+DETECT SALON / SELF-CARE CATEGORY
+Name fallback for categories without categoryType
+"SALON" (Salon for Women, Hair Studio for Women,
+Makeup, Saree & Styling). Setting the type in admin
+makes a rename safe.
+=====================================================
+*/
+const SALON_CATEGORY_TERMS = ["salon", "hair studio", "makeup", "self care"];
+
+function isSalonCategoryText(value = "") {
+  const normalized = normalizeText(value);
+  if (!normalized) return false;
+  return SALON_CATEGORY_TERMS.some((term) => normalized.includes(term));
+}
+
+/**
+ * True when any cart line belongs to a salon / self-care category — by the
+ * admin-declared Category.categoryType first, else by category name. Shared
+ * by buildRequestContext and the duration calculator so team sizing and the
+ * booking's elapsed duration always agree. Callers exclude AC / mehendi
+ * carts, which have their own packers.
+ */
+function isSalonRequest(requestServices = [], serviceMap = new Map()) {
+  return (Array.isArray(requestServices) ? requestServices : []).some((line) => {
+    const ref = serviceMap.get(toObjectIdString(line?.serviceId));
+    if (ref?.category?.categoryType === "SALON") return true;
+    return [
+      line?.category,
+      ref?.category?.slug,
+      ref?.category?.name,
+      ref?.legacyCategory,
+    ].some((text) => isSalonCategoryText(text || ""));
+  });
+}
+
+/*
+=====================================================
 SERVICE MAP LOADER
 =====================================================
 */
@@ -352,7 +382,7 @@ async function loadServiceMap(serviceIds = []) {
 
   const services = await Service.find({ _id: { $in: ids } })
     .select("_id duration category subCategory legacyCategory name isActive skillTier packingRole")
-    .populate("category", "slug name categoryType")
+    .populate("category", "slug name categoryType partnerGender")
     .populate("subCategory", "name")
     .lean();
 
@@ -449,11 +479,16 @@ function packBalancedBins(tasks, capacityMinutes) {
  * Builds the team plan for a cart: how many partners, each partner's share
  * (bin) with its skill requirements, and the elapsed makespan.
  *
- * Bins: { minutes, tier (1|2 — AC), kind ("BRIDAL" | "GUEST") }.
- * Non-team categories (cake, plumbing, …) return a single-partner plan with
+ * Bins: { minutes, tier (1|2 — AC technician / salon senior beautician),
+ *        kind ("BRIDAL" | "GUEST") }.
+ * Non-team categories (plumbing, …) return a single-partner plan with
  * no bins — callers treat that as "one partner does the whole job".
  */
-function packTeamTasks(requestServices, serviceMap, { isAC = false, isMehendi = false } = {}) {
+function packTeamTasks(
+  requestServices,
+  serviceMap,
+  { isAC = false, isMehendi = false, isSalon = false } = {}
+) {
   const singlePartner = {
     requiredCount: 1,
     bins: [],
@@ -464,14 +499,28 @@ function packTeamTasks(requestServices, serviceMap, { isAC = false, isMehendi = 
   if (!Array.isArray(requestServices) || !requestServices.length) {
     return { ...singlePartner, taskBins: [0] };
   }
-  if (!isAC && !isMehendi) return singlePartner;
+  if (!isAC && !isMehendi && !isSalon) return singlePartner;
 
   const dedicatedBins = [];
   const handTasks = [];
   const addonFeetTasks = [];
   const independentTasks = [];
 
-  if (isAC) {
+  if (isSalon && !isAC && !isMehendi) {
+    // Each unit of each line is one task carrying its service's skill tier
+    // (2 = advanced treatment needing a senior beautician). A cart that fits
+    // the visit window packs into ONE bin — the usual single beautician, but
+    // now tier-gated; only a longer cart splits into a team.
+    for (const line of requestServices) {
+      const ref = serviceMap.get(toObjectIdString(line?.serviceId));
+      const duration = serviceDurationMinutes(ref, DEFAULT_SERVICE_DURATION_MINUTES);
+      const tier = Number(ref?.skillTier) === 2 ? 2 : 1;
+      const quantity = Math.max(Number(line?.quantity || 1), 1);
+      for (let q = 0; q < quantity; q += 1) {
+        independentTasks.push({ minutes: duration, tier });
+      }
+    }
+  } else if (isAC) {
     for (const line of requestServices) {
       const ref = serviceMap.get(toObjectIdString(line?.serviceId));
       const duration = serviceDurationMinutes(ref, 90);
@@ -531,7 +580,11 @@ function packTeamTasks(requestServices, serviceMap, { isAC = false, isMehendi = 
   }
   taskList.push(...handTasks, ...independentTasks);
 
-  const visitWindow = isAC ? AC_VISIT_WINDOW_MINUTES : MEHENDI_VISIT_WINDOW_MINUTES;
+  const visitWindow = isAC
+    ? AC_VISIT_WINDOW_MINUTES
+    : isMehendi
+    ? MEHENDI_VISIT_WINDOW_MINUTES
+    : SALON_VISIT_WINDOW_MINUTES;
   const guestBins = packBalancedBins(taskList, visitWindow).map((b) => ({
     minutes: b.minutes,
     tier: b.tier,
@@ -625,12 +678,12 @@ async function buildRequestContext({
     requestedCategories.some((c) => c.includes("mehendi")) ||
     normalizeText(booking?.serviceCategory || "").includes("mehendi");
 
-  // Determine if this is a Cake/Celebration booking — drives the per-baker
-  // daily order cap and the advance-only lead-time gate.
-  const isCake =
-    declaredTypes.has("CELEBRATION") ||
-    requestedCategories.some(isCakeCategoryText) ||
-    isCakeCategoryText(booking?.serviceCategory || "");
+  // Salon / self-care: skill-tier gate + visit-window team split. AC and
+  // mehendi keep their own packers, so a mixed cart never double-classifies.
+  const isSalon =
+    !isAC &&
+    !isMehendi &&
+    (declaredTypes.has("SALON") || isSalonRequest(requestServices, serviceMap));
 
   // Advance-only lead time (calendar days) — max across requested services.
   const minLeadDays = Math.max(
@@ -638,15 +691,28 @@ async function buildRequestContext({
     ...Array.from(serviceMap.values()).map((s) => Number(s?.minLeadDays) || 0)
   );
 
-  // For AC: derive the required skill tiers from the cart.
-  // 1 = serviceman (cleaning/filter wash), 2 = technician (gas, repair,
-  // install/uninstall). Max drives "does any task need a technician";
-  // min drives the hard eligibility gate — a tier-1 partner is still a valid
-  // TEAM MEMBER for a mixed cart (they take the cleaning bins) and is only
-  // blocked when every task requires a technician.
+  // Who may deliver the cart — Category.partnerGender, set by admin per
+  // category (e.g. "Salon for Women" → FEMALE). A cart spanning a women-only
+  // and a men-only category has no valid partner at all.
+  const genderRules = new Set(
+    Array.from(serviceMap.values())
+      .map((service) => service?.category?.partnerGender)
+      .filter((gender) => RESTRICTED_PARTNER_GENDERS.includes(gender))
+  );
+  const requiredPartnerGender = genderRules.size === 1 ? [...genderRules][0] : null;
+  const partnerGenderConflict = genderRules.size > 1;
+
+  // For AC / salon: derive the required skill tiers from the cart.
+  // AC: 1 = serviceman (cleaning/filter wash), 2 = technician (gas, repair,
+  // install/uninstall). Salon: 1 = beautician, 2 = senior beautician
+  // (advanced treatments the admin marks tier 2). Max drives "does any task
+  // need tier 2"; min drives the hard eligibility gate — a tier-1 partner is
+  // still a valid TEAM MEMBER for a mixed cart (they take the tier-1 bins)
+  // and is only blocked when every task requires tier 2.
+  const isSkillTiered = isAC || isSalon;
   let requiredSkillTier = null;
   let minRequiredSkillTier = null;
-  if (isAC) {
+  if (isSkillTiered) {
     const serviceTiers = Array.from(serviceMap.values())
       .map((s) => Number(s.skillTier || 1))
       .filter(Number.isFinite);
@@ -676,7 +742,7 @@ async function buildRequestContext({
 
   // Single packing model shared by team sizing, slot feasibility and the
   // elapsed-duration calculator.
-  const teamPack = packTeamTasks(requestServices, serviceMap, { isAC, isMehendi });
+  const teamPack = packTeamTasks(requestServices, serviceMap, { isAC, isMehendi, isSalon });
 
   return {
     requestServices,
@@ -686,8 +752,11 @@ async function buildRequestContext({
     serviceMap,
     isAC,
     isMehendi,
-    isCake,
+    isSalon,
+    isSkillTiered,
     minLeadDays,
+    requiredPartnerGender,
+    partnerGenderConflict,
     requiredSkillTier,
     minRequiredSkillTier,
     mehendiBridalSubCategories: [...new Set(mehendiBridalSubCategories)],
@@ -699,13 +768,19 @@ async function buildRequestContext({
 /*
 =====================================================
 DURATION CALCULATOR
-Team categories (AC / mehendi) use the packed
+Team categories (AC / mehendi / salon) use the packed
 makespan: partners work in parallel, so the booking's
 elapsed time is the longest single partner's share,
-not the sum of all durations. Other categories keep
-the summed duration (single partner does everything).
-AC bookings bypass the 240-min cap (multi-unit
-installs can run 300–360 min).
+not the sum of all durations. A salon cart inside the
+visit window is one bin, so its makespan IS the sum.
+Other categories keep the summed duration (single
+partner does everything).
+Never capped: this is how long the partners' calendars
+stay blocked, so a cap under-blocks them — the old
+240-min cap blocked a 335-min salon cart for 240 min
+and the beautician could be double-booked for the
+last 95. A job longer than the workday gets no slots
+instead (isInsideWorkday).
 =====================================================
 */
 function calculateDurationMinutesFromRequest(
@@ -717,21 +792,19 @@ function calculateDurationMinutesFromRequest(
     return DEFAULT_SERVICE_DURATION_MINUTES;
   }
 
-  const maxDuration = isAC ? AC_MAX_CAPACITY_MINUTES : 240;
-
   const isMehendi = requestServices.some((line) =>
     isMehendiLine(serviceMap.get(toObjectIdString(line?.serviceId)), line)
   );
-  if (isAC || isMehendi) {
+  const isSalon =
+    !isAC && !isMehendi && isSalonRequest(requestServices, serviceMap);
+  if (isAC || isMehendi || isSalon) {
     const { makespanMinutes } = packTeamTasks(requestServices, serviceMap, {
       isAC,
       isMehendi,
+      isSalon,
     });
     if (makespanMinutes > 0) {
-      return Math.min(
-        Math.max(makespanMinutes, DEFAULT_SERVICE_DURATION_MINUTES),
-        maxDuration
-      );
+      return Math.max(makespanMinutes, DEFAULT_SERVICE_DURATION_MINUTES);
     }
   }
 
@@ -742,7 +815,7 @@ function calculateDurationMinutesFromRequest(
     return sum + duration * quantity;
   }, 0);
 
-  return Math.min(Math.max(total, DEFAULT_SERVICE_DURATION_MINUTES), maxDuration);
+  return Math.max(total, DEFAULT_SERVICE_DURATION_MINUTES);
 }
 
 /**
@@ -763,6 +836,18 @@ async function calculateDurationForServices(requestServices, { isAC = false } = 
 async function computeTeamPackForBooking(booking) {
   const requestContext = await buildRequestContext({ booking });
   return requestContext.teamPack;
+}
+
+/**
+ * Admin entry point: the category partner-gender rule for a persisted
+ * booking — { required: "FEMALE" | "MALE" | null, conflict }. Manual
+ * assignment and the reassign candidate list apply the same rule the engine
+ * enforces in findEligiblePartnersForBooking.
+ */
+async function getPartnerGenderRule(booking) {
+  const { requiredPartnerGender, partnerGenderConflict } =
+    await buildRequestContext({ booking });
+  return { required: requiredPartnerGender, conflict: partnerGenderConflict };
 }
 
 /*
@@ -1091,15 +1176,17 @@ function getPartnerSkillMatchLevel(partner, requestContext) {
     requestedCategories,
     isAC,
     isMehendi,
+    isSkillTiered,
     minRequiredSkillTier,
     teamPack,
   } = requestContext;
 
-  // AC SKILL GATE: block a partner only when EVERY task in the cart requires
-  // a technician tier above theirs. A serviceman (tier 1) stays eligible for
-  // a mixed cart (gas refill + cleanings) as a team member — the team planner
-  // assigns the technician-tier bins to technicians only.
-  if (isAC && minRequiredSkillTier >= 2) {
+  // AC / SALON SKILL GATE: block a partner only when EVERY task in the cart
+  // requires a tier above theirs. A tier-1 partner stays eligible for a
+  // mixed cart (gas refill + cleanings, or an advanced facial + threading
+  // split across two beauticians) as a team member — the team planner
+  // assigns the tier-2 bins to tier-2 partners only.
+  if (isSkillTiered && minRequiredSkillTier >= 2) {
     const partnerTier = Number(partner.skillTier || 1);
     if (partnerTier < minRequiredSkillTier) return 0;
   }
@@ -1143,8 +1230,12 @@ function getPartnerSkillMatchLevel(partner, requestContext) {
       partnerServiceIds.has(id)
     ).length;
     if (matchingCount === requestedServiceIds.length) return 3;
-    if (matchingCount > 0) return 2.5;
-    return 0; // Defined skills but no match — hard block
+    // A partial match only helps on a team job (AC / mehendi), where the
+    // partner takes some of the bins. Every other job goes to ONE partner who
+    // does every line, so they must list every service — otherwise a
+    // waxing-only beautician could win a waxing + facial + pedicure cart.
+    if (matchingCount > 0 && (isAC || isMehendi)) return 2.5;
+    return 0; // Defined skills but no (full) match — hard block
   }
 
   // Legacy partners (broad category fallback)
@@ -1268,6 +1359,45 @@ function scoreReliability(partner) {
   return Math.max(0, base - cancelPenalty - noShowPenalty);
 }
 
+/** Score points for a customer's latest rating of a partner (0 = neutral). */
+function repeatPartnerAdjustment(rating) {
+  const r = Number(rating);
+  if (!Number.isFinite(r)) return 0;
+  if (r >= REPEAT_PARTNER_GOOD_RATING) return REPEAT_PARTNER_BONUS;
+  if (r <= REPEAT_PARTNER_POOR_RATING) return -REPEAT_PARTNER_PENALTY;
+  return 0;
+}
+
+/**
+ * Map<partnerIdString, points> from the customer's own ratings of these
+ * partners inside the lookback — latest rating per partner wins, so a
+ * beautician who improved (or slipped) is judged on the most recent visit.
+ * Never throws: affinity is a ranking nicety, not an eligibility gate.
+ */
+async function getRepeatPartnerAdjustments(customerId, partnerIds = []) {
+  const adjustments = new Map();
+  if (!customerId || !partnerIds.length) return adjustments;
+  try {
+    const since = new Date(Date.now() - REPEAT_PARTNER_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
+    const ratings = await Rating.find({
+      customerId,
+      partnerId: { $in: partnerIds },
+      createdAt: { $gte: since },
+    })
+      .sort({ createdAt: -1 })
+      .select("partnerId rating")
+      .lean();
+    for (const r of ratings) {
+      const key = String(r.partnerId);
+      if (adjustments.has(key)) continue; // newest first — keep the latest
+      adjustments.set(key, repeatPartnerAdjustment(r.rating));
+    }
+  } catch (err) {
+    console.warn(`[assignment] Repeat-partner lookup failed: ${err.message}`);
+  }
+  return adjustments;
+}
+
 function scoreSkillMatch(skillMatchLevel) {
   if (skillMatchLevel >= 3) return 100;
   if (skillMatchLevel >= 2.5) return 85;
@@ -1279,10 +1409,11 @@ function scoreSkillMatch(skillMatchLevel) {
 /*
 =====================================================
 PARTNER SCORE
-Weights differ for AC vs general/mehendi (see AC_SCORE_WEIGHTS /
-GENERAL_SCORE_WEIGHTS — the single source of truth, also replayed by the
-weight-shadow report):
+Weights differ for AC / salon / general+mehendi (see AC_SCORE_WEIGHTS /
+SALON_SCORE_WEIGHTS / GENERAL_SCORE_WEIGHTS — the single source of truth,
+also replayed by the weight-shadow report):
   AC:      skill 0.30 | idle 0.28 | earnings 0.17 | distance 0.10 | reliability 0.15
+  Salon:   skill 0.25 | idle 0.25 | earnings 0.15 | distance 0.20 | reliability 0.15
   General: skill 0.10 | idle 0.33 | earnings 0.22 | distance 0.20 | reliability 0.15
 
 Rationale: For AC, correct skill level matters more than proximity.
@@ -1298,6 +1429,7 @@ function calculatePartnerScore({
   partner,
   earningsToday = 1,
   isAC = false,
+  isSalon = false,
 }) {
   // For partners who have never been assigned, use hours elapsed since workday
   // start today as the idle baseline. Giving them a fixed 24-hour idle score
@@ -1319,7 +1451,7 @@ function calculatePartnerScore({
   const reliabilityScore = scoreReliability(partner);
 
   // Weights vary by category (shared with the weight-shadow report).
-  const weights = isAC ? AC_SCORE_WEIGHTS : GENERAL_SCORE_WEIGHTS;
+  const weights = SCORE_WEIGHTS_BY_PROFILE[getScoreWeightProfile({ isAC, isSalon })];
 
   const score =
     idleScore * weights.idle +
@@ -1358,7 +1490,8 @@ function sortRankedPartners(a, b) {
 =====================================================
 TEAM ASSIGNMENT PLANNER
 Matches ranked partners to the pack's bins so mixed
-teams work: technician-tier bins go to technicians,
+teams work: tier-2 bins go to technicians / senior
+beauticians,
 bridal bins to bridal-capable artists, and everyone
 else fills the remaining guest bins.
 =====================================================
@@ -1376,8 +1509,8 @@ function partnerFitsBin(entry, bin) {
  * Greedy fill, most-restrictive bins first (bridal, then higher tier, then
  * larger share), best-ranked capable partner each. Returns an ordered plan
  * [{ entry, bin }] — index 0 is the team lead (bridal artist / lead tech) —
- * or null when the pool can't fill every bin. An empty-bins pack (cake,
- * plumbing, …) plans a single partner for the whole job.
+ * or null when the pool can't fill every bin. An empty-bins pack (plumbing,
+ * …) plans a single partner for the whole job.
  */
 function planTeamAssignment(rankedPartners, teamPack) {
   const ranked = Array.isArray(rankedPartners) ? rankedPartners : [];
@@ -1413,93 +1546,6 @@ function planTeamAssignment(rankedPartners, teamPack) {
 
 /*
 =====================================================
-CAKE DAILY CAP COUNTING
-=====================================================
-*/
-/**
- * Counts each partner's cake orders (primary OR additional partner) whose
- * scheduledDate falls on the same calendar day. Returns Map<partnerIdString,
- * count>. Category terms come from CAKE_CATEGORY_REGEX so a booking gated as
- * "cake" always also COUNTS as one — the two must never diverge.
- */
-async function countCakeOrdersByPartnerForDay(
-  partnerIds = [],
-  scheduledDate,
-  excludeBookingId = null
-) {
-  if (!partnerIds.length || !scheduledDate) return new Map();
-  const { start, end } = getDayBounds(scheduledDate);
-
-  const counts = await Booking.aggregate([
-    {
-      $match: {
-        scheduledDate: { $gte: start, $lt: end },
-        status: { $in: CAKE_CAP_COUNT_STATUSES },
-        ...(excludeBookingId ? { _id: { $ne: excludeBookingId } } : {}),
-        $and: [
-          {
-            $or: [
-              { "services.category": CAKE_CATEGORY_REGEX },
-              { serviceCategory: CAKE_CATEGORY_REGEX },
-            ],
-          },
-          {
-            $or: [
-              { partner: { $in: partnerIds } },
-              { additionalPartners: { $in: partnerIds } },
-            ],
-          },
-        ],
-      },
-    },
-    {
-      $project: {
-        allPartners: {
-          $concatArrays: [
-            { $cond: [{ $ifNull: ["$partner", false] }, ["$partner"], []] },
-            { $ifNull: ["$additionalPartners", []] },
-          ],
-        },
-      },
-    },
-    { $unwind: "$allPartners" },
-    { $group: { _id: "$allPartners", count: { $sum: 1 } } },
-  ]);
-
-  return new Map(
-    counts.map((row) => [String(row._id), Number(row.count) || 0])
-  );
-}
-
-/**
- * Post-claim cap re-verification for the assignment engine. The eligibility
- * filter above runs SECONDS before the partner claim (scoring, team sizing,
- * window checks happen in between), so two concurrent cake bookings for the
- * same baker on the same day — at different times, which the busySlots claim
- * guard does not serialize — can both pass it. Re-counting AFTER the claim
- * shrinks that race window to the claim→save gap (milliseconds).
- *
- * Returns the partnerId strings (from `partnerIds`) that are AT or OVER the
- * daily cap; empty array when the booking isn't a cake order.
- */
-async function verifyCakeCapAfterClaim(booking, partnerIds = []) {
-  if (!booking?.scheduledDate || !partnerIds.length) return [];
-  const requestContext = await buildRequestContext({ booking });
-  if (!requestContext.isCake) return [];
-
-  const cap = await getCakeDailyCap();
-  const countByPartner = await countCakeOrdersByPartnerForDay(
-    partnerIds,
-    booking.scheduledDate,
-    booking?._id
-  );
-  return partnerIds
-    .map(String)
-    .filter((id) => (countByPartner.get(id) || 0) >= cap);
-}
-
-/*
-=====================================================
 ELIGIBLE PARTNER FINDER
 =====================================================
 */
@@ -1522,6 +1568,12 @@ async function findEligiblePartnersForBooking(booking, pincodes = [], opts = {})
     !requestContext.requestedServiceIds.length &&
     !requestContext.requestedCategories.length
   ) {
+    return [];
+  }
+  if (requestContext.partnerGenderConflict) {
+    console.warn(
+      `[assignment] Booking ${booking?._id}: cart mixes women-only and men-only categories — no partner can serve it`
+    );
     return [];
   }
 
@@ -1642,11 +1694,18 @@ async function findEligiblePartnersForBooking(booking, pincodes = [], opts = {})
     query.verificationStatus = "VERIFIED";
   }
 
-  // AC: pre-filter at DB level only when EVERY task needs a technician —
+  // AC / salon: pre-filter at DB level only when EVERY task needs tier 2 —
   // mixed carts keep tier-1 partners in the pool as team members (the team
-  // planner reserves the technician bins for technicians).
-  if (requestContext.isAC && requestContext.minRequiredSkillTier >= 2) {
+  // planner reserves the tier-2 bins for tier-2 partners).
+  if (requestContext.isSkillTiered && requestContext.minRequiredSkillTier >= 2) {
     query.skillTier = { $gte: requestContext.minRequiredSkillTier };
+  }
+
+  // Category partner-gender rule, e.g. "Salon for Women" → FEMALE. Applied
+  // here so assignment, slot listing and slot capacity all agree; a partner
+  // with no gender on file never matches a restricted category.
+  if (requestContext.requiredPartnerGender) {
+    query.gender = requestContext.requiredPartnerGender;
   }
 
   // Do not apply $near as a hard DB filter here.
@@ -1668,10 +1727,10 @@ async function findEligiblePartnersForBooking(booking, pincodes = [], opts = {})
   }
 
   // ── Partner self-declared days off ─────────────────────────────────────────
-  // A partner (e.g. a baker) can block whole calendar days via
-  // unavailableDates. Applies to any booking, not just cakes — filtered
-  // in-memory since the date is stored per-partner without a fixed
-  // time-of-day, so a Mongo range match per candidate isn't worth it here.
+  // A partner can block whole calendar days via unavailableDates. Applies to
+  // any booking — filtered in-memory since the date is stored per-partner
+  // without a fixed time-of-day, so a Mongo range match per candidate isn't
+  // worth it here.
   if (booking?.scheduledDate) {
     const scheduledKey = normalizeDateKey(booking.scheduledDate);
     const beforeCount = partners.length;
@@ -1682,31 +1741,6 @@ async function findEligiblePartnersForBooking(booking, pincodes = [], opts = {})
     if (!partners.length && beforeCount > 0) {
       console.warn(
         `[assignment] Booking ${booking?._id}: all ${beforeCount} candidate partners have blocked ${scheduledKey}`
-      );
-      return [];
-    }
-  }
-
-  // ── Cake daily cap ─────────────────────────────────────────────────────────
-  // A baker can hold at most getCakeDailyCap() cake orders per scheduled
-  // calendar day. Counted by scheduledDate (not booking creation time) so
-  // future-dated orders are capped correctly.
-  if (requestContext.isCake && booking?.scheduledDate) {
-    const cakeDailyCap = await getCakeDailyCap();
-    const countByPartner = await countCakeOrdersByPartnerForDay(
-      partners.map((p) => p._id),
-      booking.scheduledDate,
-      booking?._id
-    );
-
-    const before = partners.length;
-    partners = partners.filter(
-      (p) => (countByPartner.get(String(p._id)) || 0) < cakeDailyCap
-    );
-
-    if (!partners.length) {
-      console.warn(
-        `[assignment/CakeCap] Booking ${booking?._id}: all ${before} candidate bakers already have ${cakeDailyCap} cake orders on ${normalizeDateKey(booking.scheduledDate)}`
       );
       return [];
     }
@@ -1729,6 +1763,12 @@ async function findEligiblePartnersForBooking(booking, pincodes = [], opts = {})
     partners.map((p) => p._id),
     booking.scheduledDate
   );
+
+  // Repeat-partner affinity (salon only): the customer's own recent ratings
+  // of these candidates. Slot listing passes no user, so it's skipped there.
+  const repeatAdjustments = requestContext.isSalon && booking?.user
+    ? await getRepeatPartnerAdjustments(booking.user, partners.map((p) => p._id))
+    : new Map();
 
   let skillBlockCount = 0;
   let windowBlockCount = 0;
@@ -1788,7 +1828,9 @@ async function findEligiblePartnersForBooking(booking, pincodes = [], opts = {})
         partner,
         earningsToday,
         isAC: requestContext.isAC,
+        isSalon: requestContext.isSalon,
       });
+      const repeatBonus = repeatAdjustments.get(String(partner._id)) || 0;
 
       // Which bins this partner may staff — consumed by planTeamAssignment.
       const capabilities = getPartnerTeamCapabilities(partner, requestContext);
@@ -1797,7 +1839,9 @@ async function findEligiblePartnersForBooking(booking, pincodes = [], opts = {})
         partner,
         canBridal: capabilities.canBridal,
         canGuest: capabilities.canGuest,
-        score: scoreBreakdown.score,
+        score: Math.round((scoreBreakdown.score + repeatBonus) * 100) / 100,
+        repeatBonus,
+        weightProfile: getScoreWeightProfile(requestContext),
         skillMatchLevel,
         distanceMeters,
         availabilitySlackMinutes: calculateAvailabilitySlackMinutes(
@@ -1884,8 +1928,8 @@ async function getAvailableSlotsForRequest({
     services,
   });
 
-  // Advance-only orders (cakes): no slots at all for dates inside the lead
-  // window. Calendar-day compare — "1 day ahead" allows tomorrow at any hour.
+  // Advance-only services (minLeadDays > 0): no slots at all for dates inside
+  // the lead window. Calendar-day compare — "1 day ahead" allows tomorrow at any hour.
   if (requestContext.minLeadDays > 0) {
     const _now = new Date();
     const earliestAllowed = new Date(
@@ -2129,10 +2173,10 @@ async function getAvailableSlotsForRequest({
 module.exports = {
   // Constants (exported for use in assignmentEngine.js)
   AC_CATEGORY_SLUGS,
-  AC_MAX_CAPACITY_MINUTES,
   AC_TRAVEL_BUFFER_MINUTES,
   AC_VISIT_WINDOW_MINUTES,
   MEHENDI_VISIT_WINDOW_MINUTES,
+  SALON_VISIT_WINDOW_MINUTES,
   AC_ADDITIONAL_UNIT_FACTOR,
   BRIDAL_ARTISTS_PER_BRIDE,
   BLOCKING_BOOKING_STATUSES,
@@ -2145,6 +2189,14 @@ module.exports = {
   // Learned-parameter constants (used by the nightly learning crons)
   AC_SCORE_WEIGHTS,
   GENERAL_SCORE_WEIGHTS,
+  SALON_SCORE_WEIGHTS,
+  SCORE_WEIGHTS_BY_PROFILE,
+  REPEAT_PARTNER_BONUS,
+  REPEAT_PARTNER_PENALTY,
+  REPEAT_PARTNER_LOOKBACK_DAYS,
+  getScoreWeightProfile,
+  calculatePartnerScore,
+  repeatPartnerAdjustment,
   LEARNED_DURATION_MIN_FACTOR,
   LEARNED_DURATION_MAX_FACTOR,
   LEARNED_DURATION_MIN_SAMPLES,
@@ -2163,11 +2215,10 @@ module.exports = {
   getAvailableSlotsForRequest,
   getBookingWindow,
   getBlockingWindowsByPartner,
+  getPartnerGenderRule,
   syncPartnerOperationalState,
   isACCategory,
-  getCakeDailyCap,
-  countCakeOrdersByPartnerForDay,
-  verifyCakeCapAfterClaim,
+  isSalonCategoryText,
   // Team packing / planning
   packTeamTasks,
   computeTeamPackForBooking,

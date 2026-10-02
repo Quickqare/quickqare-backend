@@ -63,15 +63,6 @@ const adminSettingSchema = new mongoose.Schema(
     },
 
     /* =============================================
-       ASSIGNMENT BUSINESS KNOBS
-    ============================================= */
-    assignment: {
-      // Max cake/celebration orders one baker can hold per scheduled calendar
-      // day (counted by scheduledDate across active + completed statuses).
-      cakeMaxOrdersPerPartnerPerDay: { type: Number, default: 2, min: 1 },
-    },
-
-    /* =============================================
        MEHENDI HAND-PACKAGE PRICING
        Tiered line totals by number of hands: tierPrices[0] = 1 hand,
        tierPrices[1] = 2 hands, ...; beyond the last tier the total is
@@ -143,6 +134,7 @@ const adminSettingSchema = new mongoose.Schema(
       mehendi:     { type: String, enum: ["none", "bob", "bounce", "tada"], default: "bob" },
       electrician: { type: String, enum: ["none", "bob", "bounce", "tada"], default: "bob" },
       celebration: { type: String, enum: ["none", "bob", "bounce", "tada"], default: "bob" },
+      beauty:      { type: String, enum: ["none", "bob", "bounce", "tada"], default: "bob" },
       offers:      { type: String, enum: ["none", "bob", "bounce", "tada"], default: "bob" },
     },
 
@@ -176,6 +168,8 @@ const adminSettingSchema = new mongoose.Schema(
         electricianShimmer: { type: Boolean, default: true },
         celebration:        { type: String,  default: "" },
         celebrationShimmer: { type: Boolean, default: true },
+        // Quick-row "Beauty" icon (opens the bundled Women’s Salon page).
+        beauty:             { type: String,  default: "" },
         // Image used by the bundled Women’s Salon & Self-Care home tile.
         womenSalon:         { type: String,  default: "" },
       },

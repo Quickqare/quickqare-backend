@@ -49,14 +49,29 @@ const withdrawalSchema = new mongoose.Schema(
     },
 
     /* =====================
-       BANK DETAILS SNAPSHOT
-       (freeze at request time)
+       PAYOUT DESTINATION SNAPSHOT
+       (frozen at request time from the partner's VERIFIED payout account, so
+       a later account change can't redirect a request already in the queue)
+       Rows created before payout accounts existed have no payoutMethod and
+       always carry bankDetails.
     ===================== */
+    payoutMethod: {
+      type: String,
+      enum: ["BANK", "UPI", null],
+      default: null,
+    },
+
     bankDetails: {
       accountHolderName: String,
       accountNumber: String,
       ifsc: String,
       bankName: String,
+    },
+
+    // Encrypted (utils/fieldCrypto). Set only when payoutMethod is UPI.
+    upiId: {
+      type: String,
+      default: "",
     },
 
     /* =====================
