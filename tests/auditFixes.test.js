@@ -330,7 +330,7 @@ describe("partner password change needs proof beyond a bearer token", () => {
       token: partnerToken(partner, { ageSeconds: OLD }),
       body: { newPassword: "Hijack999" },
     });
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(428); // not 403, which the app reads as "account blocked"
     expect(res.body.code).toBe("REAUTH_REQUIRED");
 
     const fresh = await Partner.findById(partner._id).select("+password");

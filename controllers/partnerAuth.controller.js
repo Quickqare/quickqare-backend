@@ -631,9 +631,11 @@ async function confirmPartnerIdentity(req) {
     return { ok: true };
   }
 
+  // 428, not 403: partnerAuth answers 403 for a blocked account, and an app
+  // that signs out on 403 must not do so here. Clients branch on `code`.
   return {
     ok: false,
-    status: 403,
+    status: 428,
     code: "REAUTH_REQUIRED",
     message: "For your security, enter your current password or verify your phone with OTP to change your password.",
   };
