@@ -12,7 +12,7 @@ const audit = require("../../middleware/audit");
 const { PERMISSIONS } = require("../../constants/permissions");
 const { asSingleString, getPagination, escapeRegex } = require("../../utils/common");
 const { success, fail } = require("../../utils/response");
-const { getSensitiveFileUrl } = require("../../../utils/sensitiveFileUrl");
+const { getSensitiveFileUrl, signStartSelfies } = require("../../../utils/sensitiveFileUrl");
 const { trackApiCall } = require("../../../services/apiCallTracker.service");
 
 // Approving / unblocking a partner restores them fully: an auto-suspension
@@ -324,6 +324,11 @@ router.get("/:id", async (req, res) => {
     if (!partner) {
       return fail(res, 404, "NOT_FOUND", "Partner not found", null, { requestId: req.requestId });
     }
+
+    // Partner selfie + job-spot selfies are private uploads: hand out signed
+    // links (no-op unless R2_PRIVATE_UPLOADS is on), like GET /:id/stats does.
+    if (partner.selfieUrl) partner.selfieUrl = await getSensitiveFileUrl(partner.selfieUrl);
+    await signStartSelfies(recentBookings);
 
     return success(
       res,
