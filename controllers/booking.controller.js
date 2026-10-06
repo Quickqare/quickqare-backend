@@ -111,6 +111,7 @@ const roundAmount = (value) =>
 // Commission / partner-share maths lives in partnerSettlement.service so the
 // wallet credit here and the earnings shown in the partner app share one source.
 const { calculatePartnerSettlement } = require("../services/partnerSettlement.service");
+const { alertOps } = require("../services/opsAlert.service");
 
 /* =======================
    USER CREATES BOOKING
@@ -1430,9 +1431,14 @@ exports.uploadStartSelfie = async (req, res) => {
    code from their booking screen to the partner. No SMS involved.
    5 wrong codes lock the booking for START_CODE_LOCK_MINUTES (admin can
    reset sooner); routes add a per-partner rate limit (startCodeLimiter).
+   Only the first START_CODE_SELF_UNLOCKS lock(s) lift by themselves — after
+   that support must reset it — so unsupervised guessing is capped at
+   10 of the 9,000 codes per booking instead of 5 every 30 minutes. Every
+   lock is raised to ops (timeline + alert).
 ======================= */
 const MAX_START_CODE_ATTEMPTS = 5;
 const START_CODE_LOCK_MINUTES = 30;
+const START_CODE_SELF_UNLOCKS = 1;
 exports.startService = async (req, res) => {
   try {
     const { bookingId } = req.params;
@@ -1484,12 +1490,19 @@ exports.startService = async (req, res) => {
         });
       }
 
-      // A lock lifts by itself START_CODE_LOCK_MINUTES after it was set.
+      // A lock lifts by itself START_CODE_LOCK_MINUTES after it was set —
+      // but only the first START_CODE_SELF_UNLOCKS of them (bookings locked
+      // before startCodeLockCount existed count as their first lock).
       await Booking.updateOne(
         {
           _id: booking._id,
           startCodeAttempts: { $gte: MAX_START_CODE_ATTEMPTS },
           startCodeLockedAt: { $ne: null, $lte: new Date(Date.now() - START_CODE_LOCK_MINUTES * 60 * 1000) },
+          $or: [
+            { startCodeLockCount: { $lte: START_CODE_SELF_UNLOCKS } },
+            { startCodeLockCount: { $exists: false } },
+            { startCodeLockCount: null },
+          ],
         },
         { $set: { startCodeAttempts: 0, startCodeLockedAt: null } }
       );
@@ -1509,22 +1522,51 @@ exports.startService = async (req, res) => {
         { new: true }
       ).select("startCodeAttempts");
       if (!reserved) {
+        const supportOnly = Number(booking.startCodeLockCount || 0) > START_CODE_SELF_UNLOCKS;
         return res.status(429).json({
           code: "START_CODE_LOCKED",
-          message: `Too many wrong codes. Try again in ${START_CODE_LOCK_MINUTES} minutes, or ask support to reset it.`,
+          message: supportOnly
+            ? "Too many wrong codes. Ask support to reset the start code."
+            : `Too many wrong codes. Try again in ${START_CODE_LOCK_MINUTES} minutes, or ask support to reset it.`,
         });
       }
 
       if (submitted !== booking.serviceStartCode) {
         const used = Number(reserved.startCodeAttempts || 0);
+        let lockCount = null;
         if (used >= MAX_START_CODE_ATTEMPTS) {
-          await Booking.updateOne({ _id: booking._id }, { $set: { startCodeLockedAt: new Date() } });
+          // Stamp (and count) the lock once — the startCodeLockedAt: null guard
+          // keeps concurrent wrong attempts from counting it twice.
+          const locked = await Booking.findOneAndUpdate(
+            { _id: booking._id, startCodeLockedAt: null },
+            { $set: { startCodeLockedAt: new Date() }, $inc: { startCodeLockCount: 1 } },
+            { new: true }
+          ).select("startCodeLockCount");
+          if (locked) {
+            lockCount = Number(locked.startCodeLockCount || 0);
+            alertOps({
+              event: "start_code_locked",
+              timelineEvent: "START_CODE_LOCKED",
+              bookingIds: [booking._id],
+              subject: `Start code locked on booking ${booking._id}`,
+              lines: [
+                `Booking ${booking._id}: ${MAX_START_CODE_ATTEMPTS} wrong start codes from partner ${pid}.`,
+                lockCount > START_CODE_SELF_UNLOCKS
+                  ? `Lock #${lockCount} — stays locked until support resets it. Check with the customer before resetting.`
+                  : `Lock #${lockCount} — lifts by itself in ${START_CODE_LOCK_MINUTES} minutes.`,
+              ],
+              data: { bookingId: String(booking._id), partnerId: pid, lockCount },
+            }).catch(() => {});
+          }
         }
         const remaining = Math.max(MAX_START_CODE_ATTEMPTS - used, 0);
+        const supportOnly = lockCount !== null && lockCount > START_CODE_SELF_UNLOCKS;
         return res.status(400).json({
           code: "START_CODE_INVALID",
           message: remaining
             ? `Incorrect code. ${remaining} attempt${remaining === 1 ? "" : "s"} left.`
+            : supportOnly
+            ? "Incorrect code. Locked — ask support to reset the start code."
             : `Incorrect code. Locked for ${START_CODE_LOCK_MINUTES} minutes — or ask support to reset it.`,
         });
       }
@@ -1982,8 +2024,16 @@ exports.cancelBooking = async (req, res) => {
        actually transitions, so a lost race never penalises the partner for a
        cancellation that didn't happen.
     ===================== */
-    const hasCustomerFaultReport = (booking.partnerReports || []).some((r) =>
-      ARRIVED_CUSTOMER_FAULT_REPORTS.includes(r.issueType)
+    // Only a report THIS partner filed at the door during THIS arrival counts —
+    // not a teammate's, and not one from an earlier visit/reassignment.
+    const arrivedAtMs = booking.arrivedAt ? new Date(booking.arrivedAt).getTime() : null;
+    const hasCustomerFaultReport = (booking.partnerReports || []).some(
+      (r) =>
+        ARRIVED_CUSTOMER_FAULT_REPORTS.includes(r.issueType) &&
+        String(r.partner) === String(partner._id) &&
+        r.statusAtReport === "ARRIVED" &&
+        arrivedAtMs !== null &&
+        new Date(r.createdAt).getTime() >= arrivedAtMs
     );
     // The no-refund close needs proof the partner really waited at the door:
     // a location-verified arrival AND CUSTOMER_FAULT_MIN_WAIT_MINUTES since it
@@ -2066,6 +2116,32 @@ exports.cancelBooking = async (req, res) => {
       await releaseSlotCapacityByBookingId(booking._id, { releaseReason: "partner_arrived_cancel" });
       await syncPartnerOperationalState(partner._id);
       clearSlotCache(booking.pincode, booking.scheduledDate);
+
+      // The customer forfeits the whole payment on the partner's word: the
+      // arrival location comes from the partner's own device, so it can be
+      // faked. Every such close goes to ops (booking timeline + alert) so a
+      // disputed one can be checked and refunded from the admin panel.
+      alertOps({
+        event: "customer_fault_closed",
+        timelineEvent: "CUSTOMER_FAULT_CLOSED",
+        bookingIds: [booking._id],
+        subject: `Booking ${booking._id} closed as customer's fault — no refund`,
+        lines: [
+          `Partner ${partner._id} closed booking ${booking._id} at the door ("${reason}").`,
+          `Paid ₹${Number(booking.totalAmount || 0)}, refunded ₹0. Arrival check: ${
+            booking.arrivedDistanceMeters != null ? `${booking.arrivedDistanceMeters} m from the address` : "no distance"
+          }, arrived ${booking.arrivedAt ? new Date(booking.arrivedAt).toISOString() : "unknown"}.`,
+          "Review if the customer disputes it.",
+        ],
+        data: {
+          bookingId: String(booking._id),
+          partnerId: String(partner._id),
+          reason,
+          totalAmount: Number(booking.totalAmount || 0),
+          arrivedDistanceMeters: booking.arrivedDistanceMeters ?? null,
+          customerFaultReport: hasCustomerFaultReport,
+        },
+      }).catch(() => {});
 
       // Notify customer — booking closed, no refund
       if (global.io) {

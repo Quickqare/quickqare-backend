@@ -8,7 +8,7 @@ const payoutAccountController = require("../controllers/partnerPayoutAccount.con
 const guestAddonController = require("../controllers/guestAddon.controller");
 const upload = require("../config/multer");
 const r2Upload = require("../config/multerR2");
-const { startCodeLimiter } = require("../middlewares/rateLimiter");
+const { startCodeLimiter, partnerGeoLimiter } = require("../middlewares/rateLimiter");
 
 /* =====================================================
    PARTNER JOB LIFECYCLE ROUTES (PRODUCTION READY)
@@ -49,6 +49,7 @@ router.patch(
 router.get(
   "/available-services",
   partnerAuth,
+  partnerGeoLimiter,
   partnerController.getAvailableServicesForLocation
 );
 

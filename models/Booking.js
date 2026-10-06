@@ -424,6 +424,15 @@ const bookingSchema = new mongoose.Schema(
       default: null,
     },
 
+    // How many times this booking has been start-code locked. Only the first
+    // lock lifts by itself; later ones wait for support, so an assigned
+    // partner can't keep guessing 5 codes every 30 minutes for as long as the
+    // job lasts (startService, START_CODE_SELF_UNLOCKS).
+    startCodeLockCount: {
+      type: Number,
+      default: 0,
+    },
+
     /* ======================
        JOB-SPOT SELFIE (admin-gated via jobSelfieVerificationEnabled)
        Live selfie the partner uploads at the customer's location before

@@ -15,7 +15,10 @@ const {
 const {
   setUserAuthCookie,
   clearUserAuthCookie,
+  readCookie,
+  USER_TOKEN_COOKIE,
 } = require("../utils/authCookie");
+const { revokeIfValid, disconnectSocketsUsingToken } = require("../utils/tokenRevocation");
 const { toNationalPhone, INVALID_PHONE_MESSAGE } = require("../utils/phone");
 
 const USER_TOKEN_TTL = String(process.env.USER_JWT_TTL || "90d");
@@ -323,10 +326,32 @@ exports.getMe = async (req, res) => {
   return res.json({ success: true, user: req.user });
 };
 
-// POST /api/auth/logout — clears the web session cookie. No auth required: it can
-// only ever clear the caller's own cookie. Mobile logs out client-side by
-// dropping its stored Bearer token, so this is a no-op for it.
+// POST /api/auth/logout — ends the session. No auth required (an expired or
+// already-revoked session must still be able to clear its cookie). Every token
+// the caller presents — the web cookie and/or a mobile Bearer token — is
+// revoked server-side, so a copied token stops working at sign-out instead of
+// staying valid for the rest of its 90-day life.
 exports.logout = async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    const bearer =
+      authHeader && authHeader.startsWith("Bearer ") ? authHeader.split(" ")[1] : null;
+    let cookieToken = null;
+    try {
+      cookieToken = readCookie(req.headers.cookie, USER_TOKEN_COOKIE);
+    } catch {
+      // Malformed cookie header — nothing revocable in it; still clear below.
+    }
+    const tokens = [...new Set([bearer, cookieToken].filter(Boolean))];
+    await Promise.all(tokens.map(revokeIfValid));
+    tokens.forEach(disconnectSocketsUsingToken);
+  } catch (error) {
+    // Still clear the cookie; report the failure so the client can retry.
+    console.error("Logout revoke error:", error.message);
+    clearUserAuthCookie(res);
+    return res.status(500).json({ success: false, message: "Logout failed. Please try again." });
+  }
+
   clearUserAuthCookie(res);
   return res.json({ success: true });
 };

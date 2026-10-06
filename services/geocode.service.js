@@ -19,6 +19,7 @@ const GOOGLE_MAPS_SERVER_API_KEY =
 const { trackApiCall } = require("./apiCallTracker.service");
 
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours — pincodes rarely change
+const NEGATIVE_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // "no such pincode" answers
 const GEOCODE_REQUEST_TIMEOUT_MS = 5000; // give up on a slow/hung Google call after 5s
 const geocodeCache = new Map();
 
@@ -43,7 +44,7 @@ function coordCacheKey(lat, lng) {
 setInterval(() => {
   const now = Date.now();
   for (const [key, entry] of geocodeCache) {
-    if (now - entry.ts > CACHE_TTL_MS) geocodeCache.delete(key);
+    if (now - entry.ts > (entry.ttl || CACHE_TTL_MS)) geocodeCache.delete(key);
   }
 }, 6 * 60 * 60 * 1000);
 
@@ -196,16 +197,22 @@ pincode but no GPS. Same cost controls + graceful
 failure handling as reverseGeocode.
 =====================================================
 */
+// Every caller geocodes an Indian pincode. Anything else is refused before it
+// can reach Google: several callers are public endpoints, and an arbitrary
+// string per request both misses the cache and bills a Geocoding call.
+const PINCODE_ONLY_REGEX = /^\d{6}$/;
+
 async function forwardGeocode(query, source = "forward_geocode") {
   const q = String(query || "").trim();
   if (!q) return { ok: false, error: "EMPTY_QUERY" };
+  if (!PINCODE_ONLY_REGEX.test(q)) return { ok: false, error: "INVALID_PINCODE" };
   if (!GOOGLE_MAPS_SERVER_API_KEY) {
     return { ok: false, error: "GOOGLE_MAPS_KEY_MISSING" };
   }
 
   const cacheKey = `fwd:${q.toLowerCase()}`;
   const cached = geocodeCache.get(cacheKey);
-  if (cached && Date.now() - cached.ts < CACHE_TTL_MS) {
+  if (cached && Date.now() - cached.ts < (cached.ttl || CACHE_TTL_MS)) {
     trackApiCall(source, { cacheHit: true });
     return cached.result;
   }
@@ -239,16 +246,26 @@ async function forwardGeocode(query, source = "forward_geocode") {
     return { ok: false, error: "GOOGLE_BAD_RESPONSE" };
   }
 
+  // A 6-digit number that isn't a real pincode is still a billed lookup.
+  // Remember "no such place" for a while so repeating it doesn't bill again.
+  // Only definitive answers are cached — never outages, quota or auth errors.
+  const cacheNegative = (result) => {
+    geocodeCacheSet(cacheKey, { result, ts: Date.now(), ttl: NEGATIVE_CACHE_TTL_MS });
+    trackApiCall(source, { cacheHit: false });
+    return result;
+  };
+
   const googleStatus = String(data?.status || "");
   if (googleStatus && googleStatus !== "OK") {
-    return { ok: false, error: "GOOGLE_STATUS_NOT_OK", google: { status: googleStatus } };
+    const result = { ok: false, error: "GOOGLE_STATUS_NOT_OK", google: { status: googleStatus } };
+    return googleStatus === "ZERO_RESULTS" ? cacheNegative(result) : result;
   }
 
   const first = Array.isArray(data?.results) ? data.results[0] : null;
   const lat = Number(first?.geometry?.location?.lat);
   const lng = Number(first?.geometry?.location?.lng);
   if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
-    return { ok: false, error: "NO_COORDS" };
+    return cacheNegative({ ok: false, error: "NO_COORDS" });
   }
 
   const result = {

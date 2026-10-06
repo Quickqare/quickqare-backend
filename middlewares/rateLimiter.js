@@ -201,6 +201,56 @@ exports.mapsLimiter = rateLimit({
 });
 
 /* =====================================================
+   PUBLIC GEO DAILY LIMITER (GOOGLE MAPS COST CAP)
+   The per-minute limiters (maps 30/min, slots 60/min) still allow tens of
+   thousands of billed Google calls per IP per day — each distinct address or
+   pincode misses the cache. ONE shared daily budget per IP across every public
+   route that can reach Google (maps search/reverse, zone check, available
+   slots) bounds that, while staying far above what a real customer uses.
+   Tune with GEO_DAILY_MAX. Pair with a quota cap on the Google API key.
+===================================================== */
+exports.geoDailyLimiter = rateLimit({
+  windowMs: 24 * 60 * 60 * 1000, // 24 hours
+  max: Number(process.env.GEO_DAILY_MAX || 1000), // per IP, shared across routes
+
+  standardHeaders: true,
+  legacyHeaders: false,
+
+  keyGenerator: (req) => `geo-daily:${ipKeyGenerator(req.ip)}`,
+
+  handler: (req, res) => {
+    res.status(429).json({
+      success: false,
+      message: "Too many location lookups today. Please try again tomorrow.",
+    });
+  },
+});
+
+/* =====================================================
+   PARTNER GEO LIMITER (PER PARTNER)
+   GET /api/partner/available-services reverse-geocodes whatever lat/lng the
+   caller sends (billed per uncached ~11m cell). The app calls it on screen
+   open, so a small per-partner cap is invisible to real use.
+===================================================== */
+exports.partnerGeoLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 20,             // per partner
+
+  standardHeaders: true,
+  legacyHeaders: false,
+
+  keyGenerator: (req) =>
+    req.partner?._id ? `partner-geo:${req.partner._id}` : `partner-geo:${ipKeyGenerator(req.ip)}`,
+
+  handler: (req, res) => {
+    res.status(429).json({
+      success: false,
+      message: "Too many location lookups. Please slow down.",
+    });
+  },
+});
+
+/* =====================================================
    PARTNER LEAD LIMITER (REGISTER-AS-A-PROFESSIONAL FORM)
    POST /api/partner-leads is public (no auth — a prospect isn't a user
    yet) and just writes one document, so it needs its own ceiling rather
@@ -294,6 +344,35 @@ exports.startCodeLimiter = rateLimit({
 });
 
 /* =====================================================
+   PER-PARTNER PASSWORD-CHANGE LIMITER
+   POST /api/partner/auth/reset-password can be authorised with the current
+   password. Mounted after partnerAuth and keyed on the account, so a holder
+   of a stolen token can't grind that password from rotating IPs. Successful
+   changes don't count.
+===================================================== */
+exports.partnerPasswordChangeLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5,                   // failed attempts per partner
+
+  standardHeaders: true,
+  legacyHeaders: false,
+
+  skipSuccessfulRequests: true,
+
+  keyGenerator: (req) =>
+    req.partner?._id
+      ? `pw-change:${req.partner._id}`
+      : `pw-change:${ipKeyGenerator(req.ip)}`,
+
+  handler: (req, res) => {
+    res.status(429).json({
+      success: false,
+      message: "Too many attempts. Try again in 15 minutes.",
+    });
+  },
+});
+
+/* =====================================================
    PER-PHONE OTP VERIFY LIMITER
    authLimiter on /verify-otp is IP-keyed, so an attacker
    rotating IPs could grind a 4-digit OTP (10,000 possible
@@ -372,6 +451,50 @@ exports.adminLoginDailyLimiter = rateLimit({
   keyGenerator: (req) => adminEmailKey(req, "admin-login-daily"),
 
   handler: adminLoginLimited("Too many login attempts for this account today. Try again tomorrow."),
+});
+
+/* =====================================================
+   PER-IP OTP SEND LIMITERS (SMS COST CAP)
+   The per-phone limiters above only stop one number being flooded. They do
+   nothing against one client sending a single OTP to each of thousands of
+   DIFFERENT numbers — and authLimiter, the only IP-keyed limiter on the send
+   routes, skips successful requests, so every SMS that actually went out was
+   free. These count exactly the requests that sent an SMS (a 2xx answer;
+   rejected/invalid requests are skipped) per client IP, and are shared by the
+   customer and partner send routes so both apps draw on one budget.
+   Defaults leave room for several people behind one carrier NAT address;
+   tune with OTP_SEND_IP_HOURLY_MAX / OTP_SEND_IP_DAILY_MAX.
+===================================================== */
+const otpSendIpLimited = (message) => (req, res) => {
+  res.status(429).json({ success: false, message });
+};
+
+exports.otpSendIpHourlyLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: Number(process.env.OTP_SEND_IP_HOURLY_MAX || 15),
+
+  standardHeaders: true,
+  legacyHeaders: false,
+
+  skipFailedRequests: true, // only SMS that were actually sent count
+
+  keyGenerator: (req) => `otp-send-ip:${ipKeyGenerator(req.ip)}`,
+
+  handler: otpSendIpLimited("Too many OTP requests from this network. Please try again later."),
+});
+
+exports.otpSendIpDailyLimiter = rateLimit({
+  windowMs: 24 * 60 * 60 * 1000, // 24 hours
+  max: Number(process.env.OTP_SEND_IP_DAILY_MAX || 60),
+
+  standardHeaders: true,
+  legacyHeaders: false,
+
+  skipFailedRequests: true,
+
+  keyGenerator: (req) => `otp-send-ip-daily:${ipKeyGenerator(req.ip)}`,
+
+  handler: otpSendIpLimited("Too many OTP requests from this network today. Please try again tomorrow."),
 });
 
 // Secondary hourly cap — prevents someone retrying every 60s for hours.
