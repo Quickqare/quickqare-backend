@@ -20,9 +20,10 @@ const r2Upload = multer({
     bucket: process.env.R2_BUCKET_NAME,
     // Real JPEG/PNG/WebP only, typed from the file's bytes (utils/imageContentType).
     contentType: verifiedImageContentType,
-    // Keys are unique and never rewritten (a re-upload mints a new key), so
-    // clients may cache forever — saves R2 Class B reads on repeat views.
-    cacheControl: "public, max-age=31536000, immutable",
+    // Everything here is a personal photo (partner selfie / ID): never let a
+    // shared cache (Cloudflare edge, proxies) keep it — the files are served
+    // only through short-lived signed links (utils/sensitiveFileUrl).
+    cacheControl: "private, max-age=3600",
     key: (_req, file, cb) => {
       // Extension from the verified MIME type, not the client filename.
       const ext = extFromMime(file.mimetype);

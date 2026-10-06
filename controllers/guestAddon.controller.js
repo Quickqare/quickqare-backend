@@ -22,6 +22,7 @@ const Razorpay = require("razorpay");
 const Booking = require("../models/Booking");
 const Service = require("../models/service.model");
 const { calculatePricing, getPricingSettings } = require("../utils/pricing");
+const { notifyCustomerOfBookingStatus } = require("../services/pushNotification.service");
 
 // A single visit can't realistically have hundreds of guests — cap it so a
 // mistyped count can't create a huge charge.
@@ -134,6 +135,9 @@ exports.createGuestAddon = async (req, res) => {
       address: parent.address,
       houseDetails: parent.houseDetails,
       landmark: parent.landmark,
+      // Same visit, same person at the door.
+      receiverName: parent.receiverName,
+      receiverPhone: parent.receiverPhone,
       status: "PENDING_APPROVAL",
       payment: { status: "PENDING" },
     });
@@ -149,6 +153,13 @@ exports.createGuestAddon = async (req, res) => {
         totalAmount: pricing.totalAmount,
       });
     }
+    // …and by push, for a customer who isn't looking at the app: the artist is
+    // waiting on their answer. Points at the add-on booking, which is what the
+    // customer approves and pays.
+    notifyCustomerOfBookingStatus(parent.user, "GUEST_ADDON_REQUESTED", guestBooking._id, {
+      guests: qty,
+      parentBookingId: parent._id,
+    });
 
     // Explicit projection — never return the raw booking document to a partner
     // (it carries serviceStartCode and payment internals).

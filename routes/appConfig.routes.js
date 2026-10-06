@@ -1,6 +1,7 @@
 const express = require("express");
 const AdminSetting = require("../admin/models/AdminSetting");
 const ReferralSettings = require("../models/ReferralSettings");
+const { resolveEffectiveMehendiHandsPricing } = require("../utils/pricing");
 
 const router = express.Router();
 
@@ -51,6 +52,9 @@ router.get("/", async (_req, res) => {
         platformFeePercent:  Number(pricingSettings.platformFeePercent ?? 0),
         platformFeeFlatInr:  Number(pricingSettings.platformFeeFlatInr ?? 0),
       },
+      // Mehendi hand-package tables in force (code defaults + the admin's
+      // overrides), so the app prices a cart the way the server will charge it.
+      mehendiHandsPricing: resolveEffectiveMehendiHandsPricing(settings?.mehendiHandsPricing),
       referral: {
         isEnabled:             Boolean(referralSettings?.isEnabled ?? true),
         referrerRewardAmount:  Number(referralSettings?.referrerRewardAmount  ?? 50),
@@ -122,6 +126,7 @@ router.get("/", async (_req, res) => {
     return res.json({
       success: true,
       pricing: { taxPercent: 18, platformFeePercent: 0, platformFeeFlatInr: 0 },
+      mehendiHandsPricing: resolveEffectiveMehendiHandsPricing(null),
       referral: { isEnabled: true, referrerRewardAmount: 50, newUserDiscountAmount: 100 },
       emergency: { bookingsDisabled: false, paymentsFreezed: false, emergencyLockdown: false },
       razorpayKeyId: process.env.RAZORPAY_KEY_ID || "",

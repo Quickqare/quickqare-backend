@@ -3,6 +3,10 @@ const jwt = require("jsonwebtoken");
 const ACCESS_TTL_SECONDS = Number(process.env.ADMIN_ACCESS_TTL_SECONDS || 900);
 const REFRESH_TTL_SECONDS = Number(process.env.ADMIN_REFRESH_TTL_SECONDS || 60 * 60 * 24 * 7);
 const CHALLENGE_TTL_SECONDS = Number(process.env.ADMIN_2FA_CHALLENGE_TTL_SECONDS || 300);
+// Hard stop for one sign-in, however often it is refreshed. The refresh TTL
+// above slides forward on every use, so on its own a session (or a stolen
+// refresh token) could be kept alive forever. Default 30 days.
+const SESSION_MAX_SECONDS = Number(process.env.ADMIN_SESSION_MAX_SECONDS || 60 * 60 * 24 * 30);
 
 // Admin tokens MUST use dedicated secrets. We deliberately do NOT fall back to
 // the shared user/partner JWT_SECRET: sharing it would mean a leak of the much
@@ -77,6 +81,7 @@ module.exports = {
   ACCESS_TTL_SECONDS,
   REFRESH_TTL_SECONDS,
   CHALLENGE_TTL_SECONDS,
+  SESSION_MAX_SECONDS,
   getAccessSecret,
   getRefreshSecret,
   signAccessToken,

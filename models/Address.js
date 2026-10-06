@@ -10,7 +10,10 @@ const addressSchema = new mongoose.Schema(
     },
     label: {
       type: String,
-      enum: ["Home", "Work", "Other"],
+      // "Hotel" is offered by the app and accepted by the controller; without it
+      // here, saving a new Hotel address failed validation (and the app, which
+      // ignores that call's result, never said so).
+      enum: ["Home", "Work", "Hotel", "Other"],
       default: "Home",
     },
     address: {
@@ -47,6 +50,18 @@ const addressSchema = new mongoose.Schema(
       default: null,
     },
     landmark: {
+      type: String,
+      trim: true,
+      default: null,
+    },
+    // Who to ask for at this address ("Who will receive the service?" in the app):
+    // the customer, or someone else such as a parent. Both set, or both null.
+    receiverName: {
+      type: String,
+      trim: true,
+      default: null,
+    },
+    receiverPhone: {
       type: String,
       trim: true,
       default: null,

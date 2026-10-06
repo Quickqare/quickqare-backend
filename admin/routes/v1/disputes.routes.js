@@ -1,8 +1,8 @@
 const express = require("express");
 const mongoose = require("mongoose");
 const Dispute = require("../../models/Dispute");
-const Refund = require("../../models/Refund");
 const BookingTimeline = require("../../models/BookingTimeline");
+const { recordRefundOwed } = require("../../services/refund.service");
 const authenticateAdmin = require("../../middleware/authenticateAdmin");
 const authorize = require("../../middleware/authorize");
 const audit = require("../../middleware/audit");
@@ -77,41 +77,84 @@ router.post("/:id/resolve", audit("admin.disputes.resolve"), async (req, res) =>
       });
     }
 
-    const dispute = await Dispute.findById(disputeId);
-    if (!dispute) {
-      return fail(res, 404, "NOT_FOUND", "Dispute not found", null, { requestId: req.requestId });
-    }
-
-    dispute.status = "RESOLVED";
-    dispute.resolution = resolution;
-    dispute.resolvedByAdminId = req.adminUser.id;
-    dispute.resolvedAt = new Date();
-    dispute.events.push({
-      eventType: "RESOLVED",
-      payload: JSON.stringify({ resolution, notes, refundAmountInr }),
-      createdByAdminId: req.adminUser.id,
-      createdAt: new Date(),
-    });
-    await dispute.save();
-
-    let refund = null;
-    if (resolution === "REFUND" && refundAmountInr > 0) {
-      refund = await Refund.create({
-        bookingId: dispute.bookingId,
-        amountInr: refundAmountInr,
-        reason: notes || "Dispute resolution refund",
-        status: "REQUESTED",
-        requestedByAdminId: req.adminUser.id,
+    if (!Number.isFinite(refundAmountInr) || refundAmountInr < 0) {
+      return fail(res, 400, "VALIDATION_ERROR", "Refund amount must be zero or more", null, {
+        requestId: req.requestId,
       });
     }
 
+    // Claim first: only the request that takes the dispute out of an open
+    // state resolves it. Resolving used to be a plain save, so a second click
+    // (or a second admin) resolved it again and added another refund.
+    // `new: false` hands back the dispute as it was, in case the refund below
+    // is refused and the claim has to be undone.
+    const previous = await Dispute.findOneAndUpdate(
+      { _id: disputeId, status: { $ne: "RESOLVED" } },
+      {
+        $set: {
+          status: "RESOLVED",
+          resolution,
+          resolvedByAdminId: req.adminUser.id,
+          resolvedAt: new Date(),
+        },
+        $push: {
+          events: {
+            eventType: "RESOLVED",
+            payload: JSON.stringify({ resolution, notes, refundAmountInr }),
+            createdByAdminId: req.adminUser.id,
+            createdAt: new Date(),
+          },
+        },
+      },
+      { new: false }
+    ).lean();
+    if (!previous) {
+      const exists = await Dispute.exists({ _id: disputeId });
+      return exists
+        ? fail(res, 409, "ALREADY_RESOLVED", "This dispute is already resolved", null, { requestId: req.requestId })
+        : fail(res, 404, "NOT_FOUND", "Dispute not found", null, { requestId: req.requestId });
+    }
+
+    // The refund goes on the booking through the shared service: capped at
+    // what the customer paid, and listed in Payments → Customer Refunds. It
+    // used to be a loose Refund record that nothing ever showed to finance.
+    let refund = null;
+    if (resolution === "REFUND" && refundAmountInr > 0) {
+      const result = await recordRefundOwed({
+        bookingId: previous.bookingId,
+        amountInr: refundAmountInr,
+        reason: notes || "Dispute resolution refund",
+        adminId: req.adminUser.id,
+      });
+      if (result.error) {
+        // Nothing was resolved: put the dispute back exactly as it was.
+        await Dispute.updateOne(
+          { _id: disputeId },
+          {
+            $set: {
+              status: previous.status,
+              resolution: previous.resolution,
+              resolvedByAdminId: previous.resolvedByAdminId,
+              resolvedAt: previous.resolvedAt,
+            },
+            $pop: { events: 1 },
+          }
+        );
+        return fail(res, result.error.status, result.error.code, result.error.message, null, {
+          requestId: req.requestId,
+        });
+      }
+      refund = result.refund;
+    }
+
     await BookingTimeline.create({
-      bookingId: dispute.bookingId,
+      bookingId: previous.bookingId,
       eventType: "DISPUTE_RESOLVED",
       payload: JSON.stringify({ disputeId, resolution, refundId: refund?._id || null }),
       createdByAdminId: req.adminUser.id,
     });
 
+    const dispute = await Dispute.findById(disputeId).lean();
     return success(res, { dispute, refund }, { requestId: req.requestId });
   } catch (error) {
     return fail(res, 500, "DISPUTE_RESOLVE_FAILED", "Unable to resolve dispute", error.message, {

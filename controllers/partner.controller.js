@@ -1,5 +1,7 @@
+const mongoose = require("mongoose");
 const Booking = require("../models/Booking");
 const Partner = require("../models/Partner");
+const { markJobsSeen } = require("../services/partnerDuty.service");
 const PartnerPayoutAccount = require("../models/PartnerPayoutAccount");
 const Dispute = require("../admin/models/Dispute");
 const Service = require("../models/service.model");
@@ -8,6 +10,7 @@ const SubCategory = require("../models/SubCategory");
 const { reverseGeocode } = require("../services/geocode.service");
 const { syncPartnerOperationalState } = require("../services/scheduling_service");
 const { partnerEarningsFor } = require("../services/partnerSettlement.service");
+const { notifyCustomerOfBookingStatus } = require("../services/pushNotification.service");
 const {
   completeBooking,
   startService,
@@ -16,6 +19,7 @@ const {
 const { deriveH3Cell } = require("../utils/h3");
 const { fileToPublicUrl } = require("../utils/fileUrl");
 const { getSensitiveFileUrl } = require("../utils/sensitiveFileUrl");
+const { jobContact } = require("../utils/receiverContact");
 const {
   filterServicesByZone,
   filterServicesByHubs,
@@ -77,6 +81,10 @@ function toPartnerJobPayload(booking, partnerId, { isPartnerCancelled = false, e
   // history can't be used to contact customers outside the platform.
   const jobFinished = partnerStatus === "COMPLETED" || partnerStatus === "CANCELLED";
 
+  // "The customer" the partner sees and calls: whoever is at the address — the
+  // account holder, or the person they booked for.
+  const contact = jobContact(booking, booking?.user);
+
   const helpers = Array.isArray(booking?.helpers)
     ? booking.helpers.map((h) => ({
         partnerId: String(h?.partnerId || ""),
@@ -98,8 +106,8 @@ function toPartnerJobPayload(booking, partnerId, { isPartnerCancelled = false, e
     serviceName: String(firstServiceName),
     serviceCategory: booking?.serviceCategory || firstService?.category || "general",
     services,
-    customerName: booking?.user?.name || "Customer",
-    customerPhone: jobFinished ? "" : booking?.user?.phone || "",
+    customerName: contact.name,
+    customerPhone: jobFinished ? "" : contact.phone,
     address: String(booking?.address || "").trim(),
     houseDetails: booking?.houseDetails ? String(booking.houseDetails).trim() : null,
     landmark: booking?.landmark ? String(booking.landmark).trim() : null,
@@ -113,6 +121,14 @@ function toPartnerJobPayload(booking, partnerId, { isPartnerCancelled = false, e
     helpers,
     scheduledDate: booking?.scheduledDate || null,
     scheduledTime: booking?.scheduledTime || "",
+    // Exact start instant — the app orders jobs and picks the current one by it
+    // (scheduledDate is local midnight serialised as UTC, so its date part can
+    // read as the previous day).
+    scheduledStartAt: booking?.scheduledStartAt || null,
+    // At the door since (verified = GPS near the customer): the app shows when
+    // the "customer not reachable" close becomes available.
+    arrivedAt: booking?.arrivedAt || null,
+    arrivedLocationVerified: Boolean(booking?.arrivedLocationVerified),
     status: partnerStatus,
     autoAccepted: booking?.status === "CONFIRMED",
     createdAt: booking?.createdAt || new Date(),
@@ -795,6 +811,9 @@ exports.submitEstimate = async (req, res) => {
         submittedAt: booking.estimateSubmittedAt,
       });
     }
+    // …and by push: the socket only reaches a customer with the app open, and
+    // the technician is waiting on their answer.
+    notifyCustomerOfBookingStatus(booking.user, "ESTIMATE_SUBMITTED", booking._id);
 
     return res.json({
       success: true,
@@ -903,6 +922,36 @@ exports.getPartnerBookings = async (req, res) => {
       success: false,
       message: "Server error",
     });
+  }
+};
+
+/**
+ * =====================================================
+ * MARK JOBS SEEN (silent — no button)
+ * POST /api/partner/bookings/seen   Body: { bookingIds: [] }
+ * The app calls this when jobs have been on screen while it's in the
+ * foreground. Feeds the "job not seen yet" check 60 min before start and the
+ * PARTNER_SEEN entry in the admin booking timeline.
+ * =====================================================
+ */
+const MAX_SEEN_BATCH = 50;
+
+exports.markBookingsSeen = async (req, res) => {
+  try {
+    const raw = Array.isArray(req.body?.bookingIds) ? req.body.bookingIds : [];
+    const bookingIds = [...new Set(raw.map((id) => String(id)))]
+      .filter((id) => mongoose.Types.ObjectId.isValid(id))
+      .slice(0, MAX_SEEN_BATCH);
+
+    if (!bookingIds.length) {
+      return res.status(400).json({ success: false, message: "bookingIds is required" });
+    }
+
+    const marked = await markJobsSeen(req.partner._id, bookingIds);
+    return res.json({ success: true, marked });
+  } catch (err) {
+    console.error("markBookingsSeen error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
   }
 };
 

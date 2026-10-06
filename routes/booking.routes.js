@@ -20,7 +20,7 @@ const partnerAuth = require("../middlewares/partnerAuth");
 
 const validate = require("../middlewares/validate");
 const { createBookingValidator } = require("../middlewares/validators");
-const { bookingCreateLimiter, slotsLimiter } = require("../middlewares/rateLimiter");
+const { bookingCreateLimiter, slotsLimiter, startCodeLimiter } = require("../middlewares/rateLimiter");
 const upload = require("../config/multer");
 
 /* =========================
@@ -160,10 +160,11 @@ router.post(
   bookingController.uploadStartSelfie
 );
 
-// Partner starts service after arrival
+// Partner starts service after arrival (customer's start code; per-partner limit)
 router.patch(
   "/start/:bookingId",
   partnerAuth,
+  startCodeLimiter,
   bookingController.startService
 );
 

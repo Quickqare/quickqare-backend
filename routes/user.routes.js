@@ -4,6 +4,7 @@ const {
   updateProfile,
   getProfileEditHistory,
   updateFcmToken,
+  removeFcmToken,
   deleteAccount,
 } = require("../controllers/user.controller");
 const userAuth = require("../middlewares/userAuth");
@@ -27,6 +28,12 @@ router.get("/profile/history", userAuth, getProfileEditHistory);
  * PATCH /api/user/update-fcm
  */
 router.patch("/update-fcm", userAuth, updateFcmToken);
+
+/**
+ * Remove this device's FCM token (the customer logged out)
+ * DELETE /api/user/fcm-token
+ */
+router.delete("/fcm-token", userAuth, removeFcmToken);
 
 /**
  * Delete account (soft delete — anonymise PII, cancel active bookings)

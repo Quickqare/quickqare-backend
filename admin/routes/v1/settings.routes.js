@@ -11,7 +11,12 @@ const router = express.Router();
 
 const SOCIAL_LINK_KEYS = ["whatsapp", "instagram", "facebook", "twitter", "youtube"];
 
-router.use(authenticateAdmin, authorize(PERMISSIONS.SETTINGS_MANAGE));
+// Guard each route, never the whole router: this router is mounted at "/"
+// (routes/v1/index.js), so a path-less router.use() here runs for EVERY request
+// that reaches it. It used to answer 403 on all the routers mounted after it
+// (complaints, hubs, partner leads, referrals, …) for any admin who lacked
+// settings.manage — i.e. everyone except SuperAdmin.
+const manageSettings = [authenticateAdmin, authorize(PERMISSIONS.SETTINGS_MANAGE)];
 
 async function getOrCreateSettings() {
   const existing = await AdminSetting.findOne();
@@ -19,7 +24,7 @@ async function getOrCreateSettings() {
   return AdminSetting.create({});
 }
 
-router.get("/settings", async (req, res) => {
+router.get("/settings", manageSettings, async (req, res) => {
   try {
     const settings = await getOrCreateSettings();
     return success(res, settings, { requestId: req.requestId });
@@ -30,7 +35,7 @@ router.get("/settings", async (req, res) => {
   }
 });
 
-router.patch("/settings", audit("admin.settings.update"), async (req, res) => {
+router.patch("/settings", manageSettings, audit("admin.settings.update"), async (req, res) => {
   try {
     const settings = await getOrCreateSettings();
 
@@ -244,7 +249,7 @@ router.patch("/settings", audit("admin.settings.update"), async (req, res) => {
   }
 });
 
-router.patch("/emergency", audit("admin.emergency.update"), async (req, res) => {
+router.patch("/emergency", manageSettings, audit("admin.emergency.update"), async (req, res) => {
   try {
     const settings = await getOrCreateSettings();
     const allowed = ["bookingsDisabled", "paymentsFreezed", "payoutsFreezed", "emergencyLockdown"];

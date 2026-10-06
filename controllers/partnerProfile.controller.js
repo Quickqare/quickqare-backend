@@ -3,6 +3,8 @@ const Service = require("../models/service.model"); // ✅ FIXED IMPORT
 const Category = require("../models/Category");
 const { deriveH3Cell } = require("../utils/h3");
 const { reverseGeocode } = require("../services/geocode.service");
+const { computePartnerStanding } = require("../services/partnerDuty.service");
+const { partnerWithSignedSelfie } = require("../utils/sensitiveFileUrl");
 
 /* =============================
    UPDATE PARTNER SERVICES
@@ -206,7 +208,7 @@ exports.updatePartnerServices = async (req, res) => {
         ? `Your services were updated. Working in ${serviceCategoryName} needs a quick review by the QuickQare team — you'll get jobs again once it's approved.`
         : "Services updated successfully",
       reapprovalRequired: switchesCategory,
-      partner,
+      partner: await partnerWithSignedSelfie(partner),
     });
   } catch (error) {
     console.error("Update services error:", error);
@@ -236,7 +238,10 @@ exports.getPartnerProfile = async (req, res) => {
 
     res.json({
       success: true,
-      partner,
+      partner: await partnerWithSignedSelfie(partner),
+      // Cancellations this week / free early releases left / pause — shown on
+      // the app dashboard so partners know where they stand.
+      standing: computePartnerStanding(partner),
     });
   } catch (error) {
     console.error("getPartnerProfile error:", error);
@@ -283,7 +288,7 @@ exports.updatePartnerProfile = async (req, res) => {
     return res.json({
       success: true,
       message: "Profile updated successfully",
-      partner,
+      partner: await partnerWithSignedSelfie(partner),
     });
   } catch (error) {
     console.error("updatePartnerProfile error:", error);

@@ -5,6 +5,7 @@ const { resolveDefaultPolicy } = require("../../../services/policyDefaults.servi
 const authenticateAdmin = require("../../middleware/authenticateAdmin");
 const { PERMISSIONS } = require("../../constants/permissions");
 const authorize = require("../../middleware/authorize");
+const audit = require("../../middleware/audit");
 
 // GET /api/v1/admin/policies/:type
 router.get("/:type",
@@ -31,9 +32,12 @@ router.get("/:type",
 );
 
 // POST /api/v1/admin/policies/:type  — create or update
+// Audited: these are the legal texts customers and partners agree to, so the
+// log keeps who changed which one, and to what.
 router.post("/:type",
   authenticateAdmin,
   authorize(PERMISSIONS.SETTINGS_MANAGE),
+  audit("admin.policies.update"),
   async (req, res) => {
     try {
       const { content, title } = req.body;
@@ -45,7 +49,8 @@ router.post("/:type",
         {
           content: content || fallback?.content || "",
           title: title || fallback?.title || type,
-          lastUpdatedBy: req.admin?._id,
+          // Was req.admin?._id — a property that never exists, so this stayed empty.
+          lastUpdatedBy: req.adminUser.id,
         },
         { upsert: true, new: true, runValidators: true }
       );

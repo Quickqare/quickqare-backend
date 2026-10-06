@@ -8,6 +8,7 @@ const {
 } = require("../../../controllers/adminComplaint.controller");
 const authenticateAdmin = require("../../middleware/authenticateAdmin");
 const authorize = require("../../middleware/authorize");
+const audit = require("../../middleware/audit");
 const { PERMISSIONS } = require("../../constants/permissions");
 
 /**
@@ -37,6 +38,7 @@ router.get("/:id",
 router.patch("/:id/status",
   authenticateAdmin,
   authorize(PERMISSIONS.COMPLAINTS_UPDATE),
+  audit("admin.complaints.status"),
   updateComplaintStatus
 );
 
@@ -47,6 +49,7 @@ router.patch("/:id/status",
 router.patch("/:id/resolution",
   authenticateAdmin,
   authorize(PERMISSIONS.COMPLAINTS_UPDATE),
+  audit("admin.complaints.resolution"),
   addComplaintResolution
 );
 

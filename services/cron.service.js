@@ -49,9 +49,24 @@ const PAYOUT_RETRY_AFTER_MS = 5 * 60 * 1000; // 5 minutes
 const PAYOUT_MAX_RETRIES = 5;
 const SLOT_LOCK_CHECK_INTERVAL_MS = 5 * 60 * 1000; // every 5 minutes
 
-// QUEUED bookings are dispatched when they are this many hours before service.
-// 3 hours gives the partner enough notice while not assigning too far in advance.
+// QUEUED bookings (paid 24h+ ahead) are dispatched the evening before — from
+// EVENING_DISPATCH_HOUR every QUEUED booking for tomorrow is assigned, so the
+// partner sees it in the 20:00 "Tomorrow" summary — and, as a fallback, any
+// still-QUEUED booking once it is this many hours before service.
 const DISPATCH_HOURS_BEFORE = 3;
+
+const {
+  EVENING_DISPATCH_HOUR,
+  localMidnightPlusDays,
+} = require("../utils/partnerHours");
+const {
+  sendEveningSummaries,
+  sendMorningSummaries,
+  runDayOfChecks,
+  pauseInactivePartners,
+  resetUrgentAvailabilityAtNight,
+  liftExpiredSuspensions,
+} = require("./partnerDuty.service");
 
 // Reminder cron timing.
 const REMINDER_INTERVAL_MS = 5 * 60 * 1000; // every 5 minutes
@@ -72,17 +87,23 @@ AUTO-CANCEL STALE BOOKINGS
 Rules:
   PENDING_PAYMENT — lock expired AND booking is
     older than STALE_HOURS (payment never completed).
-  PENDING_ASSIGNMENT / QUEUED / SEARCHING /
+  PENDING_ASSIGNMENT / SEARCHING /
     NO_PARTNER_AVAILABLE — booking has not moved
     for STALE_HOURS (no partner could be found).
+  QUEUED — only once its start time has passed
+    without dispatch. QUEUED is the normal wait for
+    an advance booking (it isn't touched until the
+    evening-before dispatch), so "not updated for
+    48h" used to auto-cancel — and refund — every
+    booking paid 3+ days ahead before it was ever
+    assigned.
 =====================================================
 */
-async function cancelStaleBookings() {
+async function cancelStaleBookings(now = new Date()) {
   try {
     const Booking = require("../models/Booking");
     const { releaseSlotCapacityByBookingId } = require("./slotCapacity.service");
-    const cutoff = new Date(Date.now() - STALE_HOURS * 60 * 60 * 1000);
-    const now = new Date();
+    const cutoff = new Date(now.getTime() - STALE_HOURS * 60 * 60 * 1000);
 
     const stale = await Booking.find({
       $or: [
@@ -94,11 +115,17 @@ async function cancelStaleBookings() {
         },
         // Assignment-stuck bookings not updated in 48 h
         {
-          status: { $in: STALE_PENDING_STATUSES },
+          status: { $in: STALE_PENDING_STATUSES.filter((s) => s !== "QUEUED") },
           updatedAt: { $lt: cutoff },
         },
+        // A QUEUED booking whose start passed and still wasn't dispatched
+        {
+          status: "QUEUED",
+          updatedAt: { $lt: cutoff },
+          scheduledStartAt: { $lt: now },
+        },
       ],
-    }).select("_id status payment totalAmount");
+    }).select("_id status payment totalAmount user");
 
     if (!stale.length) return;
 
@@ -140,6 +167,24 @@ async function cancelStaleBookings() {
         ]
       );
       modified += r.modifiedCount || 0;
+
+      // Nothing else tells these customers — no socket event, and the app may be
+      // closed. Found by the exact cancel time stamped above, so a booking that
+      // moved on concurrently (and so wasn't cancelled here) isn't announced.
+      if (r.modifiedCount) {
+        const cancelledPaid = await Booking.find({
+          _id: { $in: paidIds },
+          status: "CANCELLED",
+          cancelledBy: "system",
+          cancelledAt: now,
+        })
+          .select("_id user refundAmount")
+          .lean();
+        const { notifyCustomerOfBookingStatus } = require("./pushNotification.service");
+        for (const b of cancelledPaid) {
+          notifyCustomerOfBookingStatus(b.user, "CANCELLED", b._id, { refundAmount: b.refundAmount });
+        }
+      }
     }
     if (unpaidIds.length) {
       const r = await Booking.updateMany(
@@ -167,21 +212,27 @@ async function cancelStaleBookings() {
 /*
 =====================================================
 DISPATCH QUEUED BOOKINGS
-Fires assignBooking for any QUEUED booking whose
-scheduled time is now within DISPATCH_HOURS_BEFORE
-hours. Uses requireOnline:false so partners don't
-need to be online at the moment of pre-assignment —
-they just need to be approved and available.
+Fires assignBooking for QUEUED bookings:
+  - from EVENING_DISPATCH_HOUR (19:00): every booking
+    for tomorrow — the partner learns their next-day
+    jobs the evening before (20:00 summary);
+  - any time: a booking within DISPATCH_HOURS_BEFORE
+    hours of its start (fallback) or already past it.
+Uses requireOnline:false so partners don't need to be
+online at the moment of pre-assignment — they just need
+to be approved and available.
 =====================================================
 */
-async function dispatchQueuedBookings() {
+async function dispatchQueuedBookings(now = new Date()) {
   try {
     const Booking = require("../models/Booking");
     const { assignBooking } = require("./assignmentEngine");
     const { buildDateTime } = require("./scheduling_service");
 
-    const now = new Date();
     const dispatchWindow = new Date(now.getTime() + DISPATCH_HOURS_BEFORE * 60 * 60 * 1000);
+    // From 19:00, everything starting before the day after tomorrow.
+    const eveningCutoff =
+      now.getHours() >= EVENING_DISPATCH_HOUR ? localMidnightPlusDays(now, 2) : null;
 
     // Find QUEUED bookings whose scheduled start is within the dispatch window.
     // We use scheduledStartAt when available, falling back to scheduledDate+scheduledTime.
@@ -199,6 +250,7 @@ async function dispatchQueuedBookings() {
       // QUEUED for 48h until the stale cron cancelled it, with no timely
       // customer notification or refund.
       if (start <= now) return true;
+      if (eveningCutoff && start < eveningCutoff) return true;
       return start <= dispatchWindow;
     });
 
@@ -606,19 +658,27 @@ to attend. Moves them to NEEDS_RESCHEDULING and
 gives the partner a cancellation strike.
 
 Triggers (hours past scheduledStartAt):
+  CONFIRMED        → 2h  (auto-accepted — the default
+                          for every partner; it stays
+                          CONFIRMED until "On the way")
   PARTNER_ACCEPTED → 2h
   ON_THE_WAY       → 3h
   ARRIVED          → 4h
 =====================================================
 */
-async function detectNoShowPartners() {
+async function detectNoShowPartners(now = new Date()) {
   try {
     const Booking = require("../models/Booking");
     const Partner = require("../models/Partner");
     const { notifyCustomerOfBookingStatus } = require("./pushNotification.service");
-    const now = new Date();
+    const { alertOps } = require("./opsAlert.service");
 
     const checks = [
+      {
+        status: "CONFIRMED",
+        cutoffHours: NO_SHOW_ACCEPTED_HOURS,
+        reason: RESCHEDULE_REASON.NO_SHOW,
+      },
       {
         status: "PARTNER_ACCEPTED",
         cutoffHours: NO_SHOW_ACCEPTED_HOURS,
@@ -692,6 +752,19 @@ async function detectNoShowPartners() {
             rescheduleReason: reason,
           });
         }
+
+        const noShowPartner = await Partner.findById(booking.partner).select("name phone").lean();
+        await alertOps({
+          event: "partner_no_show",
+          timelineEvent: "PARTNER_NO_SHOW",
+          bookingIds: [booking._id],
+          subject: `No-show: booking moved to rescheduling`,
+          lines: [
+            `${noShowPartner?.name || "Partner"} (${noShowPartner?.phone || "no phone"}) never progressed past ${status} — ${cutoffHours}h after the start time.`,
+            `Booking ${booking._id}: the customer was asked to pick a new time and the partner got a strike.`,
+          ],
+          data: { bookingId: String(booking._id), partnerId: String(booking.partner), wasStatus: status },
+        });
 
         console.log(`[no-show] Booking ${booking._id} (was ${status}) → NEEDS_RESCHEDULING. Partner ${booking.partner} struck.`);
       }
@@ -1118,6 +1191,13 @@ function initCronJobs() {
     { name: "sendHelperInviteReminders", fn: sendHelperInviteReminders, interval: REMINDER_INTERVAL_MS },
     { name: "retryPendingPayouts", fn: retryPendingPayouts, interval: PAYOUT_RETRY_INTERVAL_MS },
     { name: "detectNoShowPartners", fn: detectNoShowPartners, interval: CHECK_INTERVAL_MS },
+    // Partner duty (partnerDuty.service): summaries, day-of checks, pauses.
+    { name: "sendEveningSummaries", fn: sendEveningSummaries, interval: REMINDER_INTERVAL_MS },
+    { name: "sendMorningSummaries", fn: sendMorningSummaries, interval: REMINDER_INTERVAL_MS },
+    { name: "runDayOfChecks", fn: runDayOfChecks, interval: REMINDER_INTERVAL_MS },
+    { name: "pauseInactivePartners", fn: pauseInactivePartners, interval: CHECK_INTERVAL_MS },
+    { name: "resetUrgentAvailabilityAtNight", fn: resetUrgentAvailabilityAtNight, interval: CHECK_INTERVAL_MS },
+    { name: "liftExpiredSuspensions", fn: liftExpiredSuspensions, interval: CHECK_INTERVAL_MS },
     { name: "purgeOldPartnerJobHistory", fn: purgeOldPartnerJobHistory, interval: HISTORY_CLEANUP_INTERVAL_MS },
     // Learning loop (fixes 3/4/5) — nightly, log-only for the shadow report.
     { name: "learnServiceDurations", fn: learnServiceDurations, interval: LEARNING_INTERVAL_MS },
@@ -1138,7 +1218,7 @@ function initCronJobs() {
       `[cron] Stale booking auto-cancel active (checks every 30 min, threshold ${STALE_HOURS}h)`
     );
     console.log(
-      `[cron] Queued booking dispatch active (fires ${DISPATCH_HOURS_BEFORE}h before service, checks every 30 min)`
+      `[cron] Queued booking dispatch active (tomorrow's bookings from ${EVENING_DISPATCH_HOUR}:00, else ${DISPATCH_HOURS_BEFORE}h before service; checks every 30 min)`
     );
     console.log(
       `[cron] Slot lock cleanup active (checks every 5 min, expires ${require("./slotCapacity.service").SLOT_LOCK_MINUTES} min locks)`
@@ -1151,6 +1231,7 @@ function initCronJobs() {
 
 module.exports = {
   initCronJobs,
+  cancelStaleBookings,
   dispatchQueuedBookings,
   cleanupExpiredSlotLocks,
   sendJobReminders,

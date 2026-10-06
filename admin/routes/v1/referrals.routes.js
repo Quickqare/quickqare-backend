@@ -6,6 +6,7 @@ const UserWallet = require("../../../models/UserWallet");
 const UserWalletTransaction = require("../../../models/UserWalletTransaction");
 const authenticateAdmin = require("../../middleware/authenticateAdmin");
 const authorize = require("../../middleware/authorize");
+const audit = require("../../middleware/audit");
 const { PERMISSIONS } = require("../../constants/permissions");
 
 // Every endpoint here exposes customer wallet balances, PII (name/phone), or
@@ -46,7 +47,7 @@ router.get("/referral-settings", authorize(PERMISSIONS.ANALYTICS_READ), async (r
 });
 
 // Update referral settings
-router.put("/referral-settings", authorize(PERMISSIONS.SETTINGS_MANAGE), async (req, res) => {
+router.put("/referral-settings", authorize(PERMISSIONS.SETTINGS_MANAGE), audit("admin.referrals.settings"), async (req, res) => {
   try {
     const updateData = pickReferralSettings(req.body);
     let settings = await ReferralSettings.findOne();

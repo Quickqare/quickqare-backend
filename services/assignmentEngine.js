@@ -19,8 +19,10 @@ const {
 } = require("./zone.service");
 const { escalateUnassignedBooking } = require("./escalation.service");
 const { sendJobAssignedPush } = require("./pushNotification.service");
+const { dutyStateReset } = require("./partnerDuty.service");
 const { calculatePartnerSettlement } = require("./partnerSettlement.service");
 const { getH3CellsForStage } = require("../utils/h3");
+const { jobContact } = require("../utils/receiverContact");
 // Shared cached AdminSetting.useH3Zones flag. Re-exported below because
 // several modules (booking/partner controllers, zone routes, slotCapacity)
 // historically import it from this engine.
@@ -565,6 +567,9 @@ async function assignBooking(bookingId, opts = {}) {
             assignedAt: new Date(),
             autoRefundIfUnassigned: false,
             ackReceivedAt: autoAccepted ? new Date() : null,
+            // Fresh partner(s): the seen signal and the day-of checks start
+            // over (also the 30-min reminder, if a previous partner had it).
+            ...dutyStateReset(),
           },
           $push: {
             assignmentAudit: {
@@ -684,6 +689,9 @@ async function assignBooking(bookingId, opts = {}) {
           ? Number(booking.location.coordinates[1])
           : null;
 
+        // Whoever is at the address: the account holder, or the person they booked for.
+        const contact = jobContact(booking, user);
+
         const assignmentPayload = {
           id: booking._id?.toString(),
           bookingId: booking._id?.toString(),
@@ -691,8 +699,8 @@ async function assignBooking(bookingId, opts = {}) {
           serviceName: firstServiceName,
           serviceCategory: booking.serviceCategory || "general",
           isACJob: acBooking,
-          customerName: user?.name || "Customer",
-          customerPhone: user?.phone || "",
+          customerName: contact.name,
+          customerPhone: contact.phone,
           address: booking.address?.trim() || "",
           houseDetails: booking.houseDetails?.trim() || null,
           landmark: booking.landmark?.trim() || null,
@@ -704,6 +712,7 @@ async function assignBooking(bookingId, opts = {}) {
           price: Number(booking.totalAmount || 0),
           scheduledDate: booking.scheduledDate,
           scheduledTime: booking.scheduledTime,
+          scheduledStartAt: booking.scheduledStartAt || null,
           status: finalStatus,
           autoAccepted,
           // AC-specific fields for partner app
@@ -892,10 +901,12 @@ const MAX_REASSIGN_ATTEMPTS = 5;
 async function reassignBooking(bookingId, partnerId, options = {}) {
   // `options.skipPartnerPenalty` lets a caller (e.g. cancelBooking HTTP) tell us
   // they've already incremented weeklyCancelCount themselves so we don't double-count.
-  // Legacy callers passing a string (e.g. "TIMEOUT") still work — only an object
-  // with the flag set true is honoured.
+  // "TIMEOUT" (handleAckTimeout: the partner simply didn't respond in time) is
+  // never a strike — a missed job alert isn't a cancellation. The partner is
+  // still added to rejectedPartners so the job moves on to someone else.
   const skipPartnerPenalty =
-    options && typeof options === "object" && options.skipPartnerPenalty === true;
+    options === "TIMEOUT" ||
+    (options && typeof options === "object" && options.skipPartnerPenalty === true);
 
   try {
     const booking = await Booking.findById(bookingId);
@@ -994,7 +1005,7 @@ async function reassignBooking(bookingId, partnerId, options = {}) {
     const released = await Booking.findOneAndUpdate(
       { _id: bookingId, status: { $nin: ["COMPLETED", "CANCELLED", "NEEDS_RESCHEDULING"] } },
       {
-        $set: { partner: null, additionalPartners: [], status: "SEARCHING" },
+        $set: { partner: null, additionalPartners: [], status: "SEARCHING", ...dutyStateReset() },
         $push: pushOps,
       },
       { new: true }

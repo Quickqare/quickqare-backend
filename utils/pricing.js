@@ -133,10 +133,34 @@ function getMehendiHandsPrice(pricingRuleKey, hands = 1) {
   return resolveMehendiHandsPriceFromTable(table, hands);
 }
 
+// The table in force for one rule: the admin's override when it has at least
+// one positive tier price, otherwise the code default — so a blank or half-filled
+// admin form can never zero out live pricing. The charge (below) and what the
+// customer app is shown (resolveEffectiveMehendiHandsPricing) both go through
+// this, so the price on screen and the price charged cannot drift apart.
+function effectiveMehendiHandsTable(pricingRuleKey, override) {
+  const hasUsableOverride =
+    Array.isArray(override?.tierPrices) &&
+    override.tierPrices.some((p) => Number(p) > 0);
+  return hasUsableOverride ? override : DEFAULT_MEHENDI_HANDS_PRICING[pricingRuleKey];
+}
+
+// Every rule's table in force, as plain numbers, for GET /api/app-config.
+// `overrides` is AdminSetting.mehendiHandsPricing (or null for the defaults).
+function resolveEffectiveMehendiHandsPricing(overrides) {
+  const tables = {};
+  for (const key of MEHENDI_PRICING_RULE_KEYS) {
+    const table = effectiveMehendiHandsTable(key, overrides?.[key]);
+    tables[key] = {
+      tierPrices: Array.isArray(table?.tierPrices) ? table.tierPrices.map(Number) : [],
+      overflowPerHand: Number(table?.overflowPerHand) || 0,
+    };
+  }
+  return tables;
+}
+
 // Admin-overridable variant. Reads AdminSetting.mehendiHandsPricing with a
-// 60s cache (same pattern as the useH3Zones flag); any rule whose override
-// has no positive tier prices falls back to the code defaults, so a blank or
-// half-filled admin form can never zero out live pricing.
+// 60s cache (same pattern as the useH3Zones flag).
 let _mehendiPricingCache = { value: null, expiresAt: 0 };
 async function getMehendiHandsPriceWithSettings(pricingRuleKey, hands = 1) {
   if (!DEFAULT_MEHENDI_HANDS_PRICING[pricingRuleKey]) return null;
@@ -156,13 +180,10 @@ async function getMehendiHandsPriceWithSettings(pricingRuleKey, hands = 1) {
     }
   }
 
-  const override = _mehendiPricingCache.value?.[pricingRuleKey];
-  const hasUsableOverride =
-    Array.isArray(override?.tierPrices) &&
-    override.tierPrices.some((p) => Number(p) > 0);
-  const table = hasUsableOverride
-    ? override
-    : DEFAULT_MEHENDI_HANDS_PRICING[pricingRuleKey];
+  const table = effectiveMehendiHandsTable(
+    pricingRuleKey,
+    _mehendiPricingCache.value?.[pricingRuleKey]
+  );
   return resolveMehendiHandsPriceFromTable(table, hands);
 }
 
@@ -288,3 +309,4 @@ exports.MEHENDI_PRICING_RULE_KEYS = MEHENDI_PRICING_RULE_KEYS;
 exports.getMehendiPricingRuleKey = getMehendiPricingRuleKey;
 exports.getMehendiHandsPrice = getMehendiHandsPrice;
 exports.getMehendiHandsPriceWithSettings = getMehendiHandsPriceWithSettings;
+exports.resolveEffectiveMehendiHandsPricing = resolveEffectiveMehendiHandsPricing;

@@ -33,6 +33,15 @@ const PARTNER_DAILY_CANCEL_LIMIT = 1;
 const PARTNER_WEEKLY_CANCEL_LIMIT = 5;
 const SUSPENSION_DAYS = 7;
 
+// Giving a job back early is free: a cancel FREE_RELEASE_MIN_HOURS+ before the
+// start costs no strike (the job is easy to reassign that far ahead), up to
+// FREE_RELEASES_PER_WEEK per rolling week. Later cancels and no-shows still
+// count. This nudges partners to release a job they can't do instead of not
+// showing up.
+const FREE_RELEASE_MIN_HOURS = 12;
+const FREE_RELEASES_PER_WEEK = 2;
+const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+
 /* Local (server-timezone) YYYY-MM-DD — the daily cancel counter previously
    keyed on toISOString() (UTC), which resets at 05:30 IST instead of local
    midnight. Every strike path now shares this one key. */
@@ -72,9 +81,13 @@ function checkStrikeAllowance(partner, now = new Date()) {
  * customer-trust impact); the daily counter always advances by 1 since it
  * counts cancel EVENTS per calendar day, not weight.
  *
- * Auto-suspension at the weekly limit sets all three flags every path needs:
- * isBlocked (auth gate), isAvailable=false (assignment gate), and
- * suspendedUntil now+7d (auto-expiring exclusion in partner eligibility).
+ * Auto-suspension at the weekly limit pauses NEW jobs only: isAvailable=false
+ * (assignment gate) and suspendedUntil now+7d (exclusion in partner
+ * eligibility). It deliberately does NOT set isBlocked — that is the admin's
+ * hard block and locks the partner out of the app entirely, so they could
+ * neither finish jobs they still hold nor withdraw earnings, and nothing ever
+ * lifted it. liftExpiredSuspensions (partnerDuty) ends the suspension once
+ * suspendedUntil passes.
  */
 async function recordPartnerStrike(partnerId, { strikes = 1, now = new Date() } = {}) {
   const dayKey = localDayKey(now);
@@ -116,7 +129,6 @@ async function recordPartnerStrike(partnerId, { strikes = 1, now = new Date() } 
       },
       {
         $set: {
-          isBlocked: { $cond: [overLimitCond, true, "$isBlocked"] },
           isAvailable: { $cond: [overLimitCond, false, "$isAvailable"] },
           suspendedUntil: { $cond: [overLimitCond, suspendedUntil, "$suspendedUntil"] },
         },
@@ -127,11 +139,72 @@ async function recordPartnerStrike(partnerId, { strikes = 1, now = new Date() } 
 
   if (updated && updated.weeklyCancelCount >= PARTNER_WEEKLY_CANCEL_LIMIT) {
     console.warn(
-      `[AUTO-SUSPEND] Partner ${partnerId} suspended for ${SUSPENSION_DAYS} days after ${updated.weeklyCancelCount} weekly strikes`
+      `[AUTO-SUSPEND] Partner ${partnerId} — new jobs paused for ${SUSPENSION_DAYS} days after ${updated.weeklyCancelCount} weekly strikes`
     );
+    try {
+      const { notifyPartner } = require("./pushNotification.service");
+      const until = suspendedUntil.toLocaleDateString("en-IN", { day: "numeric", month: "short" });
+      notifyPartner(partnerId, {
+        type: "ACCOUNT_SUSPENDED",
+        title: `New jobs paused until ${until}`,
+        body: `You reached ${PARTNER_WEEKLY_CANCEL_LIMIT} cancellations this week. You can still finish your current jobs and withdraw your earnings.`,
+      });
+    } catch (_) {
+      /* push is best-effort */
+    }
   }
 
   return updated;
+}
+
+/**
+ * Free early releases still available to the partner this rolling week.
+ * The window starts at their first free release; a lapsed window counts as 0.
+ */
+function freeReleasesLeft(partner, now = new Date()) {
+  const weekStart = partner?.freeReleaseWeekStart ? new Date(partner.freeReleaseWeekStart) : null;
+  const used =
+    weekStart && now.getTime() - weekStart.getTime() < WEEK_MS
+      ? Number(partner.freeReleaseCount || 0)
+      : 0;
+  return Math.max(FREE_RELEASES_PER_WEEK - used, 0);
+}
+
+/**
+ * True when cancelling this booking now is a free early release: the partner
+ * hasn't set off yet, the start is FREE_RELEASE_MIN_HOURS+ away, and they have
+ * free releases left this week.
+ */
+function isFreeEarlyRelease(partner, booking, now = new Date()) {
+  if (!["ASSIGNED", "CONFIRMED", "PARTNER_ACCEPTED"].includes(booking?.status)) return false;
+  const start = booking?.scheduledStartAt ? new Date(booking.scheduledStartAt) : null;
+  if (!start || Number.isNaN(start.getTime())) return false;
+  const hoursToStart = (start.getTime() - now.getTime()) / (60 * 60 * 1000);
+  return hoursToStart >= FREE_RELEASE_MIN_HOURS && freeReleasesLeft(partner, now) > 0;
+}
+
+/** Count one free early release (atomic; opens a new weekly window if lapsed). */
+async function recordFreeRelease(partnerId, now = new Date()) {
+  const windowLapsedCond = {
+    $or: [
+      { $eq: [{ $ifNull: ["$freeReleaseWeekStart", null] }, null] },
+      { $gte: [{ $subtract: [now, "$freeReleaseWeekStart"] }, WEEK_MS] },
+    ],
+  };
+  return Partner.findOneAndUpdate(
+    { _id: partnerId },
+    [
+      {
+        $set: {
+          freeReleaseCount: {
+            $cond: [windowLapsedCond, 1, { $add: [{ $ifNull: ["$freeReleaseCount", 0] }, 1] }],
+          },
+          freeReleaseWeekStart: { $cond: [windowLapsedCond, now, "$freeReleaseWeekStart"] },
+        },
+      },
+    ],
+    { new: true }
+  );
 }
 
 /**
@@ -306,9 +379,15 @@ async function removeTeamMemberFromBooking(bookingId, partnerId, reason = "") {
 module.exports = {
   PARTNER_DAILY_CANCEL_LIMIT,
   PARTNER_WEEKLY_CANCEL_LIMIT,
+  SUSPENSION_DAYS,
+  FREE_RELEASE_MIN_HOURS,
+  FREE_RELEASES_PER_WEEK,
   localDayKey,
   checkStrikeAllowance,
   recordPartnerStrike,
+  freeReleasesLeft,
+  isFreeEarlyRelease,
+  recordFreeRelease,
   acceptJobCore,
   removeTeamMemberFromBooking,
 };

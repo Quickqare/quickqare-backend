@@ -27,6 +27,8 @@ const hubsRoutes = require("./hubs.routes");
 const notificationsRoutes = require("./notifications.routes");
 const partnerLeadsRoutes = require("./partnerLeads.routes");
 const learningRoutes = require("./learning.routes");
+const adminsRoutes = require("./admins.routes");
+const activityRoutes = require("./activity.routes");
 const { success } = require("../../utils/response");
 
 const router = express.Router();
@@ -64,5 +66,7 @@ router.use("/hubs", hubsRoutes);
 router.use("/notifications", notificationsRoutes);
 router.use("/partner-leads", partnerLeadsRoutes);
 router.use("/learning", learningRoutes);
+router.use("/admins", adminsRoutes);
+router.use("/activity", activityRoutes);
 
 module.exports = router;

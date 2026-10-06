@@ -3,6 +3,7 @@ const Booking = require("../models/Booking");
 const TechnicianHelper = require("../models/TechnicianHelper");
 const { sendPushNotification } = require("../services/pushNotification.service");
 const { isACCategory } = require("../services/scheduling_service");
+const { jobContact } = require("../utils/receiverContact");
 
 // skillTier 2 also marks senior salon beauticians, so an AC technician is
 // tier 2 AND not registered solely for non-AC categories. Legacy partners
@@ -441,21 +442,25 @@ exports.listHelperJobs = async (req, res) => {
       .limit(50)
       .lean();
 
-    const jobs = bookings.map((b) => ({
-      bookingId: String(b._id),
-      bookingNumber: b.bookingNumber || "",
-      status: b.status,
-      serviceCategory: b.serviceCategory || "",
-      scheduledDate: b.scheduledDate,
-      scheduledTime: b.scheduledTime || "",
-      address: b.address || "",
-      pincode: b.pincode || "",
-      customerName: b.user?.name || "Customer",
-      // Withheld once the job is done — same rule as the partner job list.
-      customerPhone: b.status === "COMPLETED" ? "" : b.user?.phone || "",
-      technicianName: b.partner?.name || "",
-      technicianPhone: b.partner?.phone || "",
-    }));
+    const jobs = bookings.map((b) => {
+      // Whoever is at the address: the account holder, or the person they booked for.
+      const contact = jobContact(b, b.user);
+      return {
+        bookingId: String(b._id),
+        bookingNumber: b.bookingNumber || "",
+        status: b.status,
+        serviceCategory: b.serviceCategory || "",
+        scheduledDate: b.scheduledDate,
+        scheduledTime: b.scheduledTime || "",
+        address: b.address || "",
+        pincode: b.pincode || "",
+        customerName: contact.name,
+        // Withheld once the job is done — same rule as the partner job list.
+        customerPhone: b.status === "COMPLETED" ? "" : contact.phone,
+        technicianName: b.partner?.name || "",
+        technicianPhone: b.partner?.phone || "",
+      };
+    });
 
     return res.json({ success: true, count: jobs.length, jobs });
   } catch (err) {

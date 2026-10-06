@@ -26,9 +26,24 @@ const newRequestId = () => crypto.randomUUID();
 // DB CPU (ReDoS). Callers still control anchoring / $options.
 const escapeRegex = (value) => String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
+// Admin password rule, shared by "add admin", "reset password" and "change my
+// password". Returns the problem as a message, or null when the password is
+// fine. bcrypt ignores everything past 72 bytes, so longer input is refused
+// rather than silently truncated.
+const adminPasswordProblem = (password) => {
+  if (typeof password !== "string" || password.length < 10) {
+    return "Password must be at least 10 characters";
+  }
+  if (Buffer.byteLength(password, "utf8") > 72) {
+    return "Password is too long (72 bytes at most)";
+  }
+  return null;
+};
+
 module.exports = {
   asSingleString,
   getPagination,
   newRequestId,
   escapeRegex,
+  adminPasswordProblem,
 };

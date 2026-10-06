@@ -70,4 +70,15 @@ async function getSensitiveFileUrl(url) {
   }
 }
 
-module.exports = { getSensitiveFileUrl };
+/**
+ * A partner record (mongoose doc or plain object) as a plain object with its
+ * selfie link signed — for responses that hand a partner their own profile.
+ */
+async function partnerWithSignedSelfie(partner) {
+  if (!partner) return partner;
+  const plain = typeof partner.toObject === "function" ? partner.toObject() : { ...partner };
+  if (plain.selfieUrl) plain.selfieUrl = await getSensitiveFileUrl(plain.selfieUrl);
+  return plain;
+}
+
+module.exports = { getSensitiveFileUrl, partnerWithSignedSelfie };

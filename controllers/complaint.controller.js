@@ -3,13 +3,14 @@ const ComplaintTimeline = require("../models/ComplaintTimeline");
 const Booking = require("../models/Booking");
 const User = require("../models/User");
 const { emitComplaintStatusUpdate } = require("../socket/emitters");
+const { fileToPublicUrl } = require("../utils/fileUrl");
 
 /**
  * Create a new complaint
  */
 const createComplaint = async (req, res) => {
   try {
-    const { orderId, issueType, description, images } = req.body;
+    const { orderId, issueType, description } = req.body;
     const userId = req.user.id;
 
     // Validate required fields
@@ -53,7 +54,12 @@ const createComplaint = async (req, res) => {
       userId,
       issueType,
       description,
-      images: images || [],
+      // The photos are the files uploaded with the form (complaint.routes.js →
+      // upload.array("images")). This used to take `images` from the request
+      // body instead: free text a client could set to anything, while the
+      // files that were actually uploaded were dropped — so the admin panel
+      // never had a photo to show.
+      images: (req.files || []).map((file) => fileToPublicUrl(req, file)),
     });
 
     await complaint.save();

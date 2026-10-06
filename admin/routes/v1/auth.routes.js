@@ -7,14 +7,19 @@ const AdminSession = require("../../models/AdminSession");
 const AuditLog = require("../../models/AuditLog");
 const authenticateAdmin = require("../../middleware/authenticateAdmin");
 const audit = require("../../middleware/audit");
-const { authLimiter } = require("../../../middlewares/rateLimiter");
+const {
+  authLimiter,
+  adminLoginLimiter,
+  adminLoginDailyLimiter,
+} = require("../../../middlewares/rateLimiter");
 const { getPermissionsForRole } = require("../../constants/permissions");
-const { asSingleString } = require("../../utils/common");
+const { asSingleString, adminPasswordProblem } = require("../../utils/common");
 const { sendAdminTwoFaCode } = require("../../services/email.service");
 const { success, fail } = require("../../utils/response");
 const {
   CHALLENGE_TTL_SECONDS,
   REFRESH_TTL_SECONDS,
+  SESSION_MAX_SECONDS,
   getAccessSecret,
   getRefreshSecret,
   signAccessToken,
@@ -28,6 +33,42 @@ const IS_PRODUCTION = String(process.env.NODE_ENV || "").toLowerCase() === "prod
 
 // Max wrong 2FA codes allowed per challenge before it is locked (forces re-login).
 const MAX_2FA_ATTEMPTS = 5;
+
+// The auth outcomes that mean "it worked"; every other one is a failure in the
+// activity log's Result column and filter.
+const AUTH_OK = new Set(["password_ok_2fa_sent", "success"]);
+
+// A session ends SESSION_MAX_SECONDS after it was started, whatever happens.
+const sessionEndsAt = (session) => new Date(session.createdAt).getTime() + SESSION_MAX_SECONDS * 1000;
+// Refreshing slides the expiry forward, but never past that end.
+const nextRefreshExpiry = (session) =>
+  new Date(Math.min(Date.now() + REFRESH_TTL_SECONDS * 1000, sessionEndsAt(session)));
+
+const revokeSession = (sessionId) =>
+  AdminSession.updateOne({ _id: sessionId }, { $set: { isRevoked: true, revokedAt: new Date() } });
+
+// How the current refresh token is remembered on the session.
+//
+// bcrypt reads only the first 72 bytes of its input, and every refresh token
+// (a JWT) begins with the same 72: the header plus `{"type":"refresh","sub":"…`.
+// So a bcrypt hash of one refresh token matches ALL of them, and rotating the
+// token never invalidated the old one. A coordinated session (see /refresh)
+// stores a SHA-256 of the whole token instead — the right tool for a long,
+// signed value. Sessions from older panel builds keep bcrypt and behave exactly
+// as before: there, two open tabs share one token and depend on that.
+const SHA256_PREFIX = "sha256:";
+const refreshTokenDigest = (token) =>
+  SHA256_PREFIX + crypto.createHash("sha256").update(token).digest("hex");
+
+const hashRefreshToken = (token, coordinated) =>
+  coordinated ? refreshTokenDigest(token) : bcrypt.hash(token, 10);
+
+const refreshTokenMatches = (token, stored) => {
+  if (!String(stored || "").startsWith(SHA256_PREFIX)) return bcrypt.compare(token, stored || "");
+  const expected = Buffer.from(stored);
+  const actual = Buffer.from(refreshTokenDigest(token));
+  return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+};
 
 // Audit pre-auth attempts (login / 2FA) directly. The generic audit() middleware
 // no-ops here because it runs before authentication (no req.adminUser yet), and
@@ -44,13 +85,14 @@ async function logAuthEvent(req, action, outcome, extra = {}) {
       ipAddress: req.ip || "",
       userAgent: asSingleString(req.headers["user-agent"]) || "",
       metadata: JSON.stringify({ outcome, email: extra.email || null }),
+      outcome: AUTH_OK.has(outcome) ? "success" : "failed",
     });
   } catch (error) {
     console.error("[admin:auth-audit] failed", error.message);
   }
 }
 
-router.post("/login", authLimiter, async (req, res) => {
+router.post("/login", authLimiter, adminLoginLimiter, adminLoginDailyLimiter, async (req, res) => {
   try {
     const email = String(req.body.email || "").trim().toLowerCase();
     const password = String(req.body.password || "");
@@ -151,36 +193,47 @@ router.post("/verify-2fa", authLimiter, async (req, res) => {
       });
     }
 
-    const session = await AdminSession.findById(challengePayload.sid).select("+twoFaCodeHash");
-    if (!session || session.isRevoked || !session.challengeExpiresAt || session.challengeExpiresAt < new Date()) {
-      return fail(res, 401, "CHALLENGE_EXPIRED", "2FA challenge expired", null, {
-        requestId: req.requestId,
-      });
-    }
+    // Reserve one attempt atomically BEFORE comparing the code, so the 6-digit
+    // code can't be brute-forced within the challenge window. The counter used
+    // to be read here and saved after the compare, which let any number of
+    // parallel requests pass the cap together and all get their code checked.
+    const session = await AdminSession.findOneAndUpdate(
+      {
+        _id: challengePayload.sid,
+        isRevoked: false,
+        challengeExpiresAt: { $gt: new Date() },
+        twoFaAttempts: { $lt: MAX_2FA_ATTEMPTS },
+      },
+      { $inc: { twoFaAttempts: 1 } },
+      { new: true }
+    ).select("+twoFaCodeHash");
 
-    // Lock the challenge once too many wrong codes have been tried, so the
-    // 6-digit code can't be brute-forced within the challenge window. The admin
-    // must start a fresh login (rate-limited) to get a new code.
-    if ((session.twoFaAttempts || 0) >= MAX_2FA_ATTEMPTS) {
-      session.isRevoked = true;
-      session.revokedAt = new Date();
-      await session.save();
-      await logAuthEvent(req, "admin.auth.verify-2fa", "locked_too_many_attempts", {
-        adminUserId: String(challengePayload.sub),
-      });
-      return fail(res, 429, "TOO_MANY_2FA_ATTEMPTS", "Too many incorrect codes. Please log in again.", null, {
+    if (!session) {
+      // Either the attempts are used up, or the challenge is gone, expired or
+      // already completed. The admin must start a fresh login (rate-limited).
+      const current = await AdminSession.findById(challengePayload.sid).lean();
+      if (current?.challengeExpiresAt && (current.twoFaAttempts || 0) >= MAX_2FA_ATTEMPTS) {
+        await logAuthEvent(req, "admin.auth.verify-2fa", "locked_too_many_attempts", {
+          adminUserId: String(challengePayload.sub),
+        });
+        return fail(res, 429, "TOO_MANY_2FA_ATTEMPTS", "Too many incorrect codes. Please log in again.", null, {
+          requestId: req.requestId,
+        });
+      }
+      return fail(res, 401, "CHALLENGE_EXPIRED", "2FA challenge expired", null, {
         requestId: req.requestId,
       });
     }
 
     const validCode = await bcrypt.compare(code, session.twoFaCodeHash || "");
     if (!validCode) {
-      session.twoFaAttempts = (session.twoFaAttempts || 0) + 1;
+      // That was the last allowed attempt — lock the challenge for good.
       if (session.twoFaAttempts >= MAX_2FA_ATTEMPTS) {
-        session.isRevoked = true;
-        session.revokedAt = new Date();
+        await AdminSession.updateOne(
+          { _id: session._id },
+          { $set: { isRevoked: true, revokedAt: new Date() } }
+        );
       }
-      await session.save();
       await logAuthEvent(req, "admin.auth.verify-2fa", "invalid_code", {
         adminUserId: String(challengePayload.sub),
       });
@@ -206,10 +259,11 @@ router.post("/verify-2fa", authLimiter, async (req, res) => {
       role: admin.role,
       sessionId: String(session._id),
     });
-    const refreshTokenHash = await bcrypt.hash(refreshToken, 10);
-
-    session.refreshTokenHash = refreshTokenHash;
-    session.refreshExpiresAt = new Date(Date.now() + REFRESH_TTL_SECONDS * 1000);
+    // Sent by admin panel builds that keep every tab on one refresh token —
+    // see the reuse check in /refresh.
+    session.refreshCoordinated = req.body.refreshCoordinated === true;
+    session.refreshTokenHash = await hashRefreshToken(refreshToken, session.refreshCoordinated);
+    session.refreshExpiresAt = nextRefreshExpiry(session);
     session.twoFaCodeHash = null;
     session.challengeExpiresAt = null;
     session.twoFaAttempts = 0;
@@ -267,8 +321,30 @@ router.post("/refresh", authLimiter, async (req, res) => {
       });
     }
 
-    const matches = await bcrypt.compare(refreshToken, session.refreshTokenHash || "");
+    if (Date.now() >= sessionEndsAt(session)) {
+      await revokeSession(session._id);
+      return fail(res, 401, "SESSION_EXPIRED", "Your session has ended. Please sign in again.", null, {
+        requestId: req.requestId,
+      });
+    }
+
+    const matches = await refreshTokenMatches(refreshToken, session.refreshTokenHash);
     if (!matches) {
+      // A correctly signed token for this session that is no longer the current
+      // one: it was rotated away, and someone is replaying it. When the admin
+      // panel keeps all its tabs on one token that can only be a copy made
+      // elsewhere, so the whole session is ended — the thief and the admin both
+      // sign in again, and only the admin can. (A session from an older panel
+      // build never gets here: its bcrypt hash matches any of its tokens.)
+      if (session.refreshCoordinated) {
+        await revokeSession(session._id);
+        await logAuthEvent(req, "admin.auth.refresh", "refresh_token_reuse", {
+          adminUserId: String(session.adminUserId),
+        });
+        return fail(res, 401, "REFRESH_REUSED", "This session was ended for security. Please sign in again.", null, {
+          requestId: req.requestId,
+        });
+      }
       return fail(res, 401, "REFRESH_MISMATCH", "Refresh token mismatch", null, {
         requestId: req.requestId,
       });
@@ -291,8 +367,8 @@ router.post("/refresh", authLimiter, async (req, res) => {
       role: admin.role,
       sessionId: String(session._id),
     });
-    session.refreshTokenHash = await bcrypt.hash(nextRefreshToken, 10);
-    session.refreshExpiresAt = new Date(Date.now() + REFRESH_TTL_SECONDS * 1000);
+    session.refreshTokenHash = await hashRefreshToken(nextRefreshToken, session.refreshCoordinated);
+    session.refreshExpiresAt = nextRefreshExpiry(session);
     await session.save();
 
     return success(
@@ -330,6 +406,61 @@ router.post("/logout", authenticateAdmin, audit("admin.auth.logout"), async (req
     return success(res, { revokedAll: false }, { requestId: req.requestId });
   } catch (error) {
     return fail(res, 400, "LOGOUT_FAILED", "Unable to logout session", error.message, {
+      requestId: req.requestId,
+    });
+  }
+});
+
+// Change your own password. The current password is required even though the
+// caller is signed in, so a borrowed session can't lock the real admin out.
+// Every OTHER session of this admin is ended; the one making the call stays.
+// Audited via logAuthEvent, never audit(): that would store the request body.
+router.post("/change-password", authLimiter, authenticateAdmin, async (req, res) => {
+  try {
+    const currentPassword = String(req.body.currentPassword || "");
+    const newPassword = String(req.body.newPassword || "");
+
+    const problem = adminPasswordProblem(newPassword);
+    if (!currentPassword || problem) {
+      return fail(res, 400, "VALIDATION_ERROR", problem || "Current password is required", null, {
+        requestId: req.requestId,
+      });
+    }
+    if (currentPassword === newPassword) {
+      return fail(res, 400, "VALIDATION_ERROR", "New password must be different from the current one", null, {
+        requestId: req.requestId,
+      });
+    }
+
+    const admin = await AdminUser.findById(req.adminUser.id).select("+passwordHash");
+    // 400, not 401: the admin client treats a 401 as an expired token and
+    // would refresh + retry instead of showing this message.
+    if (!admin || !(await admin.verifyPassword(currentPassword))) {
+      await logAuthEvent(req, "admin.auth.change-password", "invalid_current_password", {
+        email: req.adminUser.email,
+        adminUserId: req.adminUser.id,
+      });
+      return fail(res, 400, "INVALID_CURRENT_PASSWORD", "Current password is incorrect", null, {
+        requestId: req.requestId,
+      });
+    }
+
+    admin.passwordHash = await AdminUser.hashPassword(newPassword);
+    await admin.save();
+
+    await AdminSession.updateMany(
+      { adminUserId: admin._id, isRevoked: false, _id: { $ne: req.adminUser.sessionId } },
+      { $set: { isRevoked: true, revokedAt: new Date() } }
+    );
+
+    await logAuthEvent(req, "admin.auth.change-password", "success", {
+      email: admin.email,
+      adminUserId: String(admin._id),
+    });
+
+    return success(res, { changed: true }, { requestId: req.requestId });
+  } catch (error) {
+    return fail(res, 500, "CHANGE_PASSWORD_FAILED", "Unable to change password", error.message, {
       requestId: req.requestId,
     });
   }

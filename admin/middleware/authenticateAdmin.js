@@ -65,6 +65,7 @@ module.exports = async function authenticateAdmin(req, res, next) {
       email: admin.email,
       role: admin.role,
       permissions: getPermissionsForRole(admin.role),
+      sessionId: String(session._id),
     };
 
     return next();

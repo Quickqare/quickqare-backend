@@ -76,17 +76,33 @@ exports.getPendingRating = async (req, res) => {
     const userId = req.user.id;
     const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
 
+    // Only what the rating prompt shows and posts back. The whole booking carries
+    // the assignment audit (candidate partners, scores), the partners' private
+    // on-site reports, the job-spot selfie and the start code — none of which a
+    // customer's phone should receive, and this endpoint used to send them all.
+    // (Other customer-facing booking reads strip these; see
+    // sanitizeBookingForCustomer. A whitelist can't leak a field added later.)
     const recentBookings = await Booking.find({
       $or: [{ userId }, { user: userId }],
       status: "COMPLETED",
       updatedAt: { $gte: twentyFourHoursAgo },
-    }).sort({ updatedAt: -1 });
+    })
+      .select("services.name services.serviceId serviceCategory scheduledDate scheduledTime")
+      .sort({ updatedAt: -1 })
+      .lean();
 
-    for (let booking of recentBookings) {
-      const hasRated = await Rating.findOne({ bookingId: booking._id });
-      if (!hasRated) {
-        return res.json({ success: true, pending: true, booking });
-      }
+    if (!recentBookings.length) {
+      return res.json({ success: true, pending: false });
+    }
+
+    const rated = await Rating.find({ bookingId: { $in: recentBookings.map((b) => b._id) } })
+      .select("bookingId")
+      .lean();
+    const ratedIds = new Set(rated.map((r) => String(r.bookingId)));
+
+    const booking = recentBookings.find((b) => !ratedIds.has(String(b._id)));
+    if (booking) {
+      return res.json({ success: true, pending: true, booking });
     }
 
     res.json({ success: true, pending: false });

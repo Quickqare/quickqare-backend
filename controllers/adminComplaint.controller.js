@@ -4,6 +4,7 @@ const Booking = require("../models/Booking");
 const User = require("../models/User");
 const { emitComplaintStatusUpdate } = require("../socket/emitters");
 const { sendPushNotification } = require("../services/pushNotification.service");
+const { recordRefundOwed } = require("../admin/services/refund.service");
 
 /**
  * Get all complaints for admin
@@ -227,9 +228,50 @@ const addComplaintResolution = async (req, res) => {
 
     const previousStatus = complaint.status;
 
+    // A refund promised with a resolution is real money. It is recorded once,
+    // on the booking, capped at what the customer paid, and then waits in
+    // Payments → Customer Refunds for finance to pay. It used to be a number on
+    // the complaint and nothing else — the customer was told, nobody was paid.
+    const refund =
+      refundAmount === undefined || refundAmount === null || refundAmount === "" ? 0 : Number(refundAmount);
+    if (!Number.isFinite(refund) || refund < 0) {
+      return res.status(400).json({ success: false, message: "Refund amount must be zero or more" });
+    }
+    const alreadyPromised = Number(complaint.refundAmount || 0);
+    if (refund > 0 && alreadyPromised > 0 && refund !== alreadyPromised) {
+      return res.status(400).json({
+        success: false,
+        message: `A refund of ₹${alreadyPromised} is already recorded for this complaint`,
+      });
+    }
+    if (refund > 0 && alreadyPromised === 0) {
+      // Take the complaint's refund slot first, so a double click or two
+      // admins can't record the same refund twice.
+      const claimed = await Complaint.findOneAndUpdate(
+        { _id: id, refundAmount: { $in: [0, null] } },
+        { $set: { refundAmount: refund } }
+      );
+      if (!claimed) {
+        return res.status(409).json({
+          success: false,
+          message: "A refund was just recorded for this complaint. Reload and check it",
+        });
+      }
+      const recorded = await recordRefundOwed({
+        bookingId: complaint.orderId,
+        amountInr: refund,
+        reason: `Complaint: ${String(resolution || complaint.resolution || "resolved").trim().slice(0, 200)}`,
+        adminId,
+      });
+      if (recorded.error) {
+        await Complaint.updateOne({ _id: id }, { $set: { refundAmount: 0 } });
+        return res.status(recorded.error.status).json({ success: false, message: recorded.error.message });
+      }
+      complaint.refundAmount = refund;
+    }
+
     // Update resolution details and mark as RESOLVED
     if (resolution) complaint.resolution = resolution;
-    if (refundAmount !== undefined) complaint.refundAmount = refundAmount;
     if (reServiceScheduled !== undefined) complaint.reServiceScheduled = reServiceScheduled;
     if (adminNotes) complaint.adminNotes = adminNotes;
     complaint.status = "RESOLVED";

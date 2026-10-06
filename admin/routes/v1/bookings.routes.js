@@ -11,10 +11,46 @@ const Refund = require("../../models/Refund");
 const { PERMISSIONS } = require("../../constants/permissions");
 const { asSingleString, getPagination, escapeRegex } = require("../../utils/common");
 const { success, fail } = require("../../utils/response");
+const { dutyStateReset } = require("../../../services/partnerDuty.service");
+const { getSensitiveFileUrl } = require("../../../utils/sensitiveFileUrl");
+const { REFUND_ALL_PAID, recordRefundOwed, settleRefund } = require("../../services/refund.service");
 
 const router = express.Router();
 
-router.use(authenticateAdmin, authorize(PERMISSIONS.BOOKINGS_ASSIGN));
+router.use(authenticateAdmin);
+
+// Refunds are a finance action, gated by payments.refund alone. They are
+// registered ahead of the bookings.assign gate below: behind it, FinanceAdmin
+// (payments.refund but not bookings.assign) was refused before the refund
+// permission was ever checked. Handlers are further down this file.
+router.post("/:id/refund", authorize(PERMISSIONS.PAYMENTS_REFUND), audit("admin.bookings.refund"), requestRefund);
+router.post(
+  "/:id/refund/:refundId/complete",
+  authorize(PERMISSIONS.PAYMENTS_REFUND),
+  audit("admin.bookings.refund_complete"),
+  completeRefund
+);
+
+router.use(authorize(PERMISSIONS.BOOKINGS_ASSIGN));
+
+// Update for an admin cancel. An admin cancel is never the customer's doing,
+// so by default everything they paid is recorded as a refund owed (on top of
+// anything refunded earlier) — it then shows up in Payments → Customer Refunds
+// instead of depending on someone remembering it. A pipeline update, so the
+// amount comes from the booking's own payment fields in the same atomic write.
+// `reason` is admin-typed text: $literal stops a leading "$" being read as a
+// field path.
+const adminCancelUpdate = (reason, withRefund) => [
+  {
+    $set: {
+      status: "CANCELLED",
+      cancelledBy: "admin",
+      cancelledAt: new Date(),
+      cancelReason: { $literal: reason },
+      ...(withRefund ? REFUND_ALL_PAID : {}),
+    },
+  },
+];
 
 // Booking statuses from which an admin may (re)assign a partner. Excludes
 // terminal states (COMPLETED / CANCELLED) and PENDING_PAYMENT so a manual
@@ -97,6 +133,7 @@ async function notifyPartnerOfAssignment(booking, partner) {
       location: booking.location || undefined,
       scheduledDate: booking.scheduledDate || undefined,
       scheduledTime: booking.scheduledTime || undefined,
+      scheduledStartAt: booking.scheduledStartAt || undefined,
       amount: earning,
       price: earning,
       status: "ASSIGNED",
@@ -160,6 +197,13 @@ router.get("/", async (req, res) => {
       Booking.countDocuments(where),
     ]);
 
+    // Partner photos are private uploads — short-lived signed links only.
+    await Promise.all(
+      rows.map(async (row) => {
+        if (row.partner?.selfieUrl) row.partner.selfieUrl = await getSensitiveFileUrl(row.partner.selfieUrl);
+      })
+    );
+
     return success(res, rows, { requestId: req.requestId, pagination: { page, pageSize, total } });
   } catch (error) {
     return fail(res, 500, "BOOKINGS_LIST_FAILED", "Unable to fetch bookings", error.message, {
@@ -191,6 +235,14 @@ router.get("/:id", async (req, res) => {
 
     if (!booking) {
       return fail(res, 404, "NOT_FOUND", "Booking not found", null, { requestId: req.requestId });
+    }
+
+    // Partner selfie + at-door job selfie are private uploads — signed links.
+    if (booking.partner?.selfieUrl) {
+      booking.partner.selfieUrl = await getSensitiveFileUrl(booking.partner.selfieUrl);
+    }
+    if (booking.startSelfieUrl) {
+      booking.startSelfieUrl = await getSensitiveFileUrl(booking.startSelfieUrl);
     }
 
     return success(
@@ -284,6 +336,8 @@ router.post("/:id/assign", audit("admin.bookings.assign"), async (req, res) => {
           ackReceivedAt: null,
           additionalPartners: [],
           teamAllocations: [],
+          // New partner: seen signal + day-of checks start over.
+          ...dutyStateReset(),
         },
         $push: {
           assignmentAudit: {
@@ -427,6 +481,8 @@ router.post("/:id/reassign", audit("admin.bookings.reassign"), async (req, res) 
           ackReceivedAt: null,
           additionalPartners: [],
           teamAllocations: [],
+          // New partner: seen signal + day-of checks start over.
+          ...dutyStateReset(),
         },
         ...(oldPartnerId ? { $addToSet: { rejectedPartners: oldPartnerId } } : {}),
         $push: {
@@ -527,17 +583,11 @@ router.post("/:id/cancel", audit("admin.bookings.cancel"), async (req, res) => {
     // Guard against re-transitioning a terminal booking — a COMPLETED job must not be
     // flipped to CANCELLED (it corrupts reporting and implies a refund on delivered work).
     // cancelledBy/cancelledAt/cancelReason are recorded so the cancel is attributable —
-    // previously this route set the status only.
+    // previously this route set the status only. Body `refund: false` skips
+    // recording the refund owed (e.g. the customer was at fault).
     const booking = await Booking.findOneAndUpdate(
       { _id: bookingId, status: { $nin: ["CANCELLED", "COMPLETED"] } },
-      {
-        $set: {
-          status: "CANCELLED",
-          cancelledBy: "admin",
-          cancelledAt: new Date(),
-          cancelReason: reason,
-        },
-      },
+      adminCancelUpdate(reason, req.body.refund !== false),
       { new: true }
     ).lean();
     if (!booking) {
@@ -575,7 +625,18 @@ router.post("/:id/cancel", audit("admin.bookings.cancel"), async (req, res) => {
         status: "CANCELLED",
         cancelledBy: "admin",
         cancelReason: reason,
+        refundAmount: booking.refundAmount || 0,
       });
+    }
+    // The socket only reaches an open app; push the rest. Only for a booking the
+    // customer paid for — an unpaid one is hidden from their list.
+    if (booking.payment?.status === "PAID") {
+      try {
+        const { notifyCustomerOfBookingStatus } = require("../../../services/pushNotification.service");
+        notifyCustomerOfBookingStatus(booking.user, "CANCELLED", booking._id, {
+          refundAmount: booking.refundAmount,
+        });
+      } catch { /* non-fatal */ }
     }
     for (const pid of [booking.partner, ...(booking.additionalPartners || [])].filter(Boolean)) {
       await notifyPartnerOfRemoval(pid, bookingId, reason);
@@ -584,7 +645,12 @@ router.post("/:id/cancel", audit("admin.bookings.cancel"), async (req, res) => {
     await BookingTimeline.create({
       bookingId,
       eventType: "CANCELLED",
-      payload: JSON.stringify({ reason, adminId: req.adminUser.id }),
+      payload: JSON.stringify({
+        reason,
+        adminId: req.adminUser.id,
+        refundAmount: booking.refundAmount || 0,
+        refundStatus: booking.refundStatus,
+      }),
       createdByAdminId: req.adminUser.id,
     });
 
@@ -626,16 +692,11 @@ router.post("/:id/force-cancel", audit("admin.bookings.force_cancel"), async (re
 
     const assignedPartnerId = booking.partner;
 
-    // Atomically flip to CANCELLED so concurrent requests are safe
+    // Atomically flip to CANCELLED so concurrent requests are safe. Body
+    // `refund: false` skips recording the refund owed.
     const updated = await Booking.findOneAndUpdate(
       { _id: bookingId, status: { $nin: ["CANCELLED", "COMPLETED"] } },
-      {
-        $set: {
-          status: "CANCELLED",
-          cancelledBy: "admin",
-          cancelReason: reason,
-        },
-      },
+      adminCancelUpdate(reason, req.body.refund !== false),
       { new: true }
     );
 
@@ -675,7 +736,16 @@ router.post("/:id/force-cancel", audit("admin.bookings.force_cancel"), async (re
         bookingId: updated._id.toString(),
         status: "CANCELLED",
         cancelReason: reason,
+        refundAmount: updated.refundAmount || 0,
       });
+    }
+    if (updated.payment?.status === "PAID") {
+      try {
+        const { notifyCustomerOfBookingStatus } = require("../../../services/pushNotification.service");
+        notifyCustomerOfBookingStatus(updated.user, "CANCELLED", updated._id, {
+          refundAmount: updated.refundAmount,
+        });
+      } catch { /* non-fatal */ }
     }
     for (const pid of teamPartnerIds) {
       await notifyPartnerOfRemoval(pid, bookingId, reason);
@@ -684,124 +754,150 @@ router.post("/:id/force-cancel", audit("admin.bookings.force_cancel"), async (re
     await BookingTimeline.create({
       bookingId,
       eventType: "FORCE_CANCELLED",
-      payload: JSON.stringify({ reason, adminId: req.adminUser.id, adminEmail: req.adminUser.email }),
+      payload: JSON.stringify({
+        reason,
+        adminId: req.adminUser.id,
+        adminEmail: req.adminUser.email,
+        refundAmount: updated.refundAmount || 0,
+        refundStatus: updated.refundStatus,
+      }),
       createdByAdminId: req.adminUser.id,
     });
 
-    return success(res, { bookingId: updated._id, status: "CANCELLED" }, { requestId: req.requestId });
+    return success(
+      res,
+      {
+        bookingId: updated._id,
+        status: "CANCELLED",
+        refundAmount: updated.refundAmount || 0,
+        refundedAmount: updated.refundedAmount || 0,
+        refundStatus: updated.refundStatus,
+      },
+      { requestId: req.requestId }
+    );
   } catch (error) {
     return fail(res, 500, "BOOKING_FORCE_CANCEL_FAILED", "Unable to force-cancel booking", error.message, { requestId: req.requestId });
   }
 });
 
-router.post(
-  "/:id/refund",
-  authorize(PERMISSIONS.PAYMENTS_REFUND),
-  audit("admin.bookings.refund"),
-  async (req, res) => {
-    try {
-      const bookingId = asSingleString(req.params.id);
-      const amountInr = Number(req.body.amountInr);
-      const reason = String(req.body.reason || "");
+// POST /:id/refund — route registered at the top of this file (payments.refund).
+// The amount is added to what the booking owes its customer, never past what
+// they actually paid (admin/services/refund.service.js).
+async function requestRefund(req, res) {
+  try {
+    const bookingId = asSingleString(req.params.id);
+    const amountInr = Number(req.body.amountInr);
+    const reason = String(req.body.reason || "").trim();
 
-      if (!bookingId || !mongoose.Types.ObjectId.isValid(bookingId)) {
-        return fail(res, 400, "INVALID_ID", "Invalid booking id", null, { requestId: req.requestId });
-      }
-      if (!Number.isFinite(amountInr) || amountInr < 1 || reason.length < 3) {
-        return fail(res, 400, "VALIDATION_ERROR", "amountInr and reason are required", null, {
-          requestId: req.requestId,
-        });
-      }
-
-      const booking = await Booking.findById(bookingId).lean();
-      if (!booking) {
-        return fail(res, 404, "NOT_FOUND", "Booking not found", null, { requestId: req.requestId });
-      }
-
-      const refund = await Refund.create({
-        bookingId,
-        amountInr,
-        reason,
-        status: "REQUESTED",
-        requestedByAdminId: req.adminUser.id,
-      });
-
-      // Keep the booking's own refund flags in sync with this admin refund so the two
-      // systems aren't disjoint (previously the booking's refundStatus was never touched
-      // by the admin refund flow, leaving "is the money back?" with no source of truth).
-      await Booking.findByIdAndUpdate(bookingId, {
-        $set: {
-          refundStatus: "PENDING",
-          ...(Number(booking.refundAmount) > 0 ? {} : { refundAmount: amountInr }),
-        },
-      });
-
-      await BookingTimeline.create({
-        bookingId,
-        eventType: "REFUND_REQUESTED",
-        payload: JSON.stringify({ refundId: refund._id, amountInr }),
-        createdByAdminId: req.adminUser.id,
-      });
-
-      return success(res, refund, { requestId: req.requestId });
-    } catch (error) {
-      return fail(res, 500, "BOOKING_REFUND_FAILED", "Unable to request refund", error.message, {
+    if (!bookingId || !mongoose.Types.ObjectId.isValid(bookingId)) {
+      return fail(res, 400, "INVALID_ID", "Invalid booking id", null, { requestId: req.requestId });
+    }
+    if (!Number.isFinite(amountInr) || amountInr < 1 || reason.length < 3) {
+      return fail(res, 400, "VALIDATION_ERROR", "amountInr and reason are required", null, {
         requestId: req.requestId,
       });
     }
+
+    const result = await recordRefundOwed({ bookingId, amountInr, reason, adminId: req.adminUser.id });
+    if (result.error) {
+      return fail(res, result.error.status, result.error.code, result.error.message, null, {
+        requestId: req.requestId,
+      });
+    }
+
+    return success(res, result.refund, { requestId: req.requestId });
+  } catch (error) {
+    return fail(res, 500, "BOOKING_REFUND_FAILED", "Unable to request refund", error.message, {
+      requestId: req.requestId,
+    });
   }
-);
+}
 
 // POST /:id/refund/:refundId/complete — mark a requested refund as actually paid out.
 // This is the previously-missing reconciliation step: it transitions the Refund doc
 // REQUESTED → COMPLETED AND syncs the booking's refundStatus → PROCESSED, so the two
 // systems agree on whether the customer's money was returned.
-router.post(
-  "/:id/refund/:refundId/complete",
-  authorize(PERMISSIONS.PAYMENTS_REFUND),
-  audit("admin.bookings.refund_complete"),
-  async (req, res) => {
-    try {
-      const bookingId = asSingleString(req.params.id);
-      const refundId = asSingleString(req.params.refundId);
-      if (!bookingId || !mongoose.Types.ObjectId.isValid(bookingId) ||
-          !refundId || !mongoose.Types.ObjectId.isValid(refundId)) {
-        return fail(res, 400, "INVALID_ID", "Invalid id", null, { requestId: req.requestId });
-      }
+// Route registered at the top of this file (payments.refund). The admin panel
+// settles refunds per booking (Payments → Customer Refunds); this settles the
+// same way, starting from one refund record.
+async function completeRefund(req, res) {
+  try {
+    const bookingId = asSingleString(req.params.id);
+    const refundId = asSingleString(req.params.refundId);
+    if (!bookingId || !mongoose.Types.ObjectId.isValid(bookingId) ||
+        !refundId || !mongoose.Types.ObjectId.isValid(refundId)) {
+      return fail(res, 400, "INVALID_ID", "Invalid id", null, { requestId: req.requestId });
+    }
 
-      // Idempotent: only a still-REQUESTED refund can be completed.
-      const refund = await Refund.findOneAndUpdate(
-        { _id: refundId, bookingId, status: "REQUESTED" },
-        { $set: { status: "COMPLETED", processedAt: new Date() } },
-        { new: true }
-      );
-      if (!refund) {
-        const exists = await Refund.exists({ _id: refundId, bookingId });
-        if (!exists) return fail(res, 404, "NOT_FOUND", "Refund not found", null, { requestId: req.requestId });
-        return fail(res, 409, "ALREADY_PROCESSED", "Refund already processed", null, { requestId: req.requestId });
-      }
+    // Idempotent: only a still-REQUESTED refund can be completed.
+    const refund = await Refund.findOneAndUpdate(
+      { _id: refundId, bookingId, status: "REQUESTED" },
+      { $set: { status: "COMPLETED", processedAt: new Date() } },
+      { new: true }
+    );
+    if (!refund) {
+      const exists = await Refund.exists({ _id: refundId, bookingId });
+      if (!exists) return fail(res, 404, "NOT_FOUND", "Refund not found", null, { requestId: req.requestId });
+      return fail(res, 409, "ALREADY_PROCESSED", "Refund already processed", null, { requestId: req.requestId });
+    }
 
-      await Booking.findByIdAndUpdate(bookingId, {
-        $set: { refundStatus: "PROCESSED", refundProcessedAt: new Date() },
-      });
-
+    // Settles whatever the booking still owes and writes the timeline entry.
+    // Null = the booking has nothing pending (a refund record from before
+    // refunds were tracked on the booking) — only this record is closed.
+    const settled = await settleRefund({ bookingId, adminId: req.adminUser.id });
+    if (!settled) {
       await BookingTimeline.create({
         bookingId,
         eventType: "REFUND_COMPLETED",
         payload: JSON.stringify({ refundId: refund._id, amountInr: refund.amountInr }),
         createdByAdminId: req.adminUser.id,
       });
-
-      return success(res, refund, { requestId: req.requestId });
-    } catch (error) {
-      return fail(res, 500, "REFUND_COMPLETE_FAILED", "Unable to complete refund", error.message, {
-        requestId: req.requestId,
-      });
     }
+
+    return success(res, refund, { requestId: req.requestId });
+  } catch (error) {
+    return fail(res, 500, "REFUND_COMPLETE_FAILED", "Unable to complete refund", error.message, {
+      requestId: req.requestId,
+    });
   }
-);
+}
 
 // POST /:id/request-reschedule — admin manually flags a booking for rescheduling
+// POST /:id/reset-start-code — support unlocks a booking after 5 wrong start
+// codes (it would also unlock by itself 30 minutes after the lock).
+router.post("/:id/reset-start-code", audit("admin.bookings.reset_start_code"), async (req, res) => {
+  try {
+    const bookingId = asSingleString(req.params.id);
+    if (!bookingId || !mongoose.Types.ObjectId.isValid(bookingId)) {
+      return fail(res, 400, "INVALID_ID", "Invalid booking id", null, { requestId: req.requestId });
+    }
+
+    const updated = await Booking.findOneAndUpdate(
+      { _id: bookingId },
+      { $set: { startCodeAttempts: 0, startCodeLockedAt: null } },
+      { new: true }
+    )
+      .select("_id status startCodeAttempts startCodeLockedAt")
+      .lean();
+    if (!updated) {
+      return fail(res, 404, "NOT_FOUND", "Booking not found", null, { requestId: req.requestId });
+    }
+
+    await BookingTimeline.create({
+      bookingId,
+      eventType: "START_CODE_RESET",
+      payload: JSON.stringify({ adminId: req.adminUser?.id }),
+      createdByAdminId: req.adminUser?.id,
+    });
+
+    return success(res, updated, { requestId: req.requestId });
+  } catch (error) {
+    return fail(res, 500, "START_CODE_RESET_FAILED", "Unable to reset the start code", error.message, {
+      requestId: req.requestId,
+    });
+  }
+});
+
 router.post("/:id/request-reschedule", audit("admin.bookings.request_reschedule"), async (req, res) => {
   try {
     const bookingId = asSingleString(req.params.id);

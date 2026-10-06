@@ -55,9 +55,16 @@ function buildStorage() {
     // Real JPEG/PNG/WebP only, typed from the file's bytes (utils/imageContentType).
     contentType: verifiedImageContentType,
     // Keys are unique and never rewritten (a re-upload mints a new key), so
-    // browsers + Cloudflare edge may cache forever — repeat views never hit
-    // the bucket (saves R2 Class B reads).
-    cacheControl: "public, max-age=31536000, immutable",
+    // browsers + Cloudflare edge may cache public media forever — repeat views
+    // never hit the bucket (saves R2 Class B reads). Job-spot selfies (photos
+    // of a partner at a customer's door) are private: no shared caching.
+    cacheControl: (req, file, cb) =>
+      cb(
+        null,
+        !req.uploadFolder && file.fieldname === "selfie"
+          ? "private, max-age=3600"
+          : "public, max-age=31536000, immutable"
+      ),
     key: (req, file, cb) => {
       // Extension from the verified MIME type, not the client filename.
       const ext = extFromMime(file.mimetype);

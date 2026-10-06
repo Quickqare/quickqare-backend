@@ -1,6 +1,7 @@
 const User = require("../models/User");
 const Booking = require("../models/Booking");
 const Complaint = require("../models/Complaint");
+const { releaseSlotCapacityByBookingId } = require("../services/slotCapacity.service");
 
 /**
  * Update user profile (name, gender, and optionally email)
@@ -131,16 +132,47 @@ const updateFcmToken = async (req, res) => {
     const { fcmToken } = req.body;
     const userId = req.user.id;
 
-    if (!fcmToken) {
+    if (typeof fcmToken !== "string" || !fcmToken.trim()) {
       return res.status(400).json({ success: false, message: "FCM token is required" });
     }
+    const token = fcmToken.trim();
 
-    await User.findByIdAndUpdate(userId, { fcmToken });
+    // A device token belongs to ONE account at a time. If someone else was signed
+    // in on this phone and didn't sign out cleanly (an app build that never told
+    // us, or no network at the time), their record still holds it and their
+    // booking pushes would keep arriving on this phone — now that someone else is
+    // using it. Move the token here, as the partner endpoint does.
+    await User.updateMany({ fcmToken: token, _id: { $ne: userId } }, { $set: { fcmToken: "" } });
+    await User.findByIdAndUpdate(userId, { fcmToken: token });
 
     res.json({ success: true, message: "FCM token updated successfully" });
   } catch (error) {
     console.error("Update FCM token error:", error);
     res.status(500).json({ success: false, message: "Failed to update FCM token" });
+  }
+};
+
+/**
+ * Remove this device's FCM token — the customer logged out of the app.
+ * DELETE /api/user/fcm-token   body: { fcmToken }
+ *
+ * Clears it only if it is still the token on file: the customer may have signed
+ * in on another phone since, and that phone's token must keep working.
+ */
+const removeFcmToken = async (req, res) => {
+  try {
+    const { fcmToken } = req.body || {};
+
+    if (typeof fcmToken !== "string" || !fcmToken.trim()) {
+      return res.status(400).json({ success: false, message: "FCM token is required" });
+    }
+
+    await User.updateOne({ _id: req.user.id, fcmToken: fcmToken.trim() }, { $set: { fcmToken: "" } });
+
+    res.json({ success: true, message: "FCM token removed" });
+  } catch (error) {
+    console.error("Remove FCM token error:", error);
+    res.status(500).json({ success: false, message: "Failed to remove FCM token" });
   }
 };
 
@@ -162,9 +194,14 @@ const deleteAccount = async (req, res) => {
       return res.status(400).json({ success: false, message: "Account already deleted" });
     }
 
-    // Block if active/upcoming bookings exist
+    // Block if active/upcoming bookings exist. PENDING_PAYMENT is deliberately
+    // not in this list: a checkout the customer started and never paid for is not
+    // "an upcoming booking". It is hidden from their bookings (they can't see it,
+    // let alone cancel it) and lingers up to 48 h until the stale-booking cron
+    // removes it — which used to block deleting the account for that long. Those
+    // are cancelled below instead. (A guest add-on still waiting for payment IS
+    // visible to the customer, who can pay or decline it, so it still blocks.)
     const activeBookingStatuses = [
-      "PENDING_PAYMENT",
       "PENDING_ASSIGNMENT",
       "QUEUED",
       "SEARCHING",
@@ -177,16 +214,23 @@ const deleteAccount = async (req, res) => {
       "ARRIVED",
       "IN_PROGRESS",
     ];
-    const activeBooking = await Booking.findOne({
-      user: userId,
-      status: { $in: activeBookingStatuses },
-    }).lean();
-    if (activeBooking) {
-      return res.status(400).json({
+    const findActiveBooking = () =>
+      Booking.findOne({
+        user: userId,
+        $or: [
+          { status: { $in: activeBookingStatuses } },
+          { status: "PENDING_PAYMENT", origin: "partner_onspot" },
+        ],
+      }).lean();
+    const refuseActiveBooking = () =>
+      res.status(400).json({
         success: false,
         code: "ACTIVE_BOOKING",
         message: "You have an active or upcoming booking. Please cancel or wait for it to complete before deleting your account.",
       });
+
+    if (await findActiveBooking()) {
+      return refuseActiveBooking();
     }
 
     // Block if open complaints/disputes exist
@@ -200,6 +244,42 @@ const deleteAccount = async (req, res) => {
         code: "OPEN_COMPLAINT",
         message: "You have an open complaint that is being reviewed. Please wait for it to be resolved before deleting your account.",
       });
+    }
+
+    // Close the checkouts they abandoned (done only now, once nothing else can
+    // refuse the deletion) and give back the slots they were holding. Guarded on
+    // still being unpaid: a payment that lands in this instant keeps its booking.
+    const abandoned = await Booking.find({
+      user: userId,
+      status: "PENDING_PAYMENT",
+      origin: { $ne: "partner_onspot" },
+      "payment.status": { $ne: "PAID" },
+    })
+      .select("_id")
+      .lean();
+
+    for (const { _id } of abandoned) {
+      const cancelled = await Booking.findOneAndUpdate(
+        { _id, status: "PENDING_PAYMENT", "payment.status": { $ne: "PAID" } },
+        {
+          $set: {
+            status: "CANCELLED",
+            "payment.status": "FAILED",
+            cancelledBy: "user",
+            cancelledAt: new Date(),
+            cancelReason: "Account deleted",
+          },
+        }
+      );
+      if (cancelled) {
+        await releaseSlotCapacityByBookingId(_id, { releaseReason: "account_deleted" });
+      }
+    }
+
+    // One of those may have been paid in the instant we were cancelling it: it is
+    // now a real booking, so the account can't be deleted after all.
+    if (abandoned.length && (await findActiveBooking())) {
+      return refuseActiveBooking();
     }
 
     // Anonymise PII so the phone number is freed for re-registration
@@ -226,5 +306,6 @@ module.exports = {
   updateProfile,
   getProfileEditHistory,
   updateFcmToken,
+  removeFcmToken,
   deleteAccount,
 };

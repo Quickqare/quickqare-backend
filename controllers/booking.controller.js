@@ -9,6 +9,8 @@ const { getAvailableSlots } = require("../services/slotAvailability_service");
 const { assignBooking, reassignBooking } = require("../services/assignmentEngine");
 const { deriveH3Cell } = require("../utils/h3");
 const { fileToPublicUrl } = require("../utils/fileUrl");
+const { getSensitiveFileUrl } = require("../utils/sensitiveFileUrl");
+const { parseReceiverContact, bookingReceiverFields } = require("../utils/receiverContact");
 const { forwardGeocode } = require("../services/geocode.service");
 const {
   getZoneServiceKeysFromValues,
@@ -158,11 +160,21 @@ exports.createBooking = async (req, res) => {
       address,
       houseDetails,
       landmark,
+      receiverName,
+      receiverPhone,
       couponCode,
     } = req.body;
 
     if (!pincode) {
       return res.status(400).json({ success: false, message: "pincode is required" });
+    }
+
+    // Who the professional should ask for and call at the door, when the customer
+    // booked for someone else. Checked up front: a bad number is the customer's to
+    // fix, and shouldn't surface after a slot has been held for them.
+    const receiverContact = parseReceiverContact(receiverName, receiverPhone);
+    if (receiverContact.error) {
+      return res.status(400).json({ success: false, message: receiverContact.error });
     }
 
     if (!scheduledDate || !scheduledTime) {
@@ -714,6 +726,7 @@ exports.createBooking = async (req, res) => {
       address: String(address || "").trim(),
       houseDetails: houseDetails ? String(houseDetails).trim() : null,
       landmark: landmark ? String(landmark).trim() : null,
+      ...bookingReceiverFields(receiverContact, req.user),
       couponCode: appliedCoupon ? appliedCoupon.code : null,
       couponId: appliedCoupon ? appliedCoupon._id : null,
       couponDiscountAmount: discountAmount,
@@ -900,11 +913,43 @@ exports.markOnTheWay = async (req, res) => {
       });
     }
 
+    // The app sends where the partner is as they set off — fresher than the
+    // last background ping. Store it (the customer's live map starts there).
+    const startLat = Number(req.body?.latitude);
+    const startLng = Number(req.body?.longitude);
+    const hasStartCoords =
+      Number.isFinite(startLat) && Number.isFinite(startLng) &&
+      Math.abs(startLat) <= 90 && Math.abs(startLng) <= 180 && !(startLat === 0 && startLng === 0);
+    if (hasStartCoords) {
+      const now = new Date();
+      await Partner.updateOne(
+        { _id: partnerId },
+        {
+          $set: {
+            location: { type: "Point", coordinates: [startLng, startLat] },
+            lastLocationAt: now,
+            lastOnlineAt: now,
+          },
+        }
+      );
+      if (global.io) {
+        global.io.to(`user_${booking.user}`).emit("partner_location_update", {
+          bookingId: booking._id.toString(),
+          partnerId: pid,
+          latitude: startLat,
+          longitude: startLng,
+          updatedAt: now,
+        });
+      }
+    }
+
     // ETA — naive haversine + 3 min/km (Indian traffic baseline)
     let etaMinutes = null;
     let estimatedArrivalAt = null;
     try {
-      const partnerCoords = booking.partner?.location?.coordinates;
+      const partnerCoords = hasStartCoords
+        ? [startLng, startLat]
+        : booking.partner?.location?.coordinates;
       const customerCoords = booking.location?.coordinates;
       if (
         Array.isArray(partnerCoords) &&
@@ -975,8 +1020,52 @@ exports.markOnTheWay = async (req, res) => {
 };
 
 /* =======================
+   ARRIVAL PROOF
+======================= */
+// How close "Arrived" must be to the customer's pinned location.
+const ARRIVED_MAX_DISTANCE_METERS = Number(process.env.ARRIVED_MAX_DISTANCE_METERS || 300);
+// A stored location ping older than this doesn't count as "where they are now".
+const ARRIVAL_LOCATION_FRESH_MS = 10 * 60 * 1000;
+// Reported GPS accuracy is credited up to this much (indoor fixes drift).
+const ARRIVAL_ACCURACY_SLACK_METERS = 100;
+
+const validLatLng = (lat, lng) =>
+  Number.isFinite(lat) && Number.isFinite(lng) &&
+  Math.abs(lat) <= 90 && Math.abs(lng) <= 180 && !(lat === 0 && lng === 0);
+
+/**
+ * Where the partner is vs the customer's pin.
+ * Returns { verified, tooFar, distanceMeters } — distanceMeters is NaN when
+ * there was nothing to compare (no fresh location, or the booking has no pin).
+ */
+function assessArrivalLocation(booking, partner, body = {}, now = Date.now()) {
+  const [bLng, bLat] = (booking?.location?.coordinates || []).map(Number);
+  if (!validLatLng(bLat, bLng)) return { verified: false, tooFar: false, distanceMeters: NaN };
+
+  let lat = Number(body?.latitude);
+  let lng = Number(body?.longitude);
+  let accuracy = Number(body?.accuracy);
+  if (!validLatLng(lat, lng)) {
+    const [pLng, pLat] = (partner?.location?.coordinates || []).map(Number);
+    const pingAge = partner?.lastLocationAt ? now - new Date(partner.lastLocationAt).getTime() : Infinity;
+    if (!validLatLng(pLat, pLng) || pingAge > ARRIVAL_LOCATION_FRESH_MS) {
+      return { verified: false, tooFar: false, distanceMeters: NaN };
+    }
+    lat = pLat;
+    lng = pLng;
+    accuracy = NaN;
+  }
+
+  const distanceMeters = haversineMeters(lat, lng, bLat, bLng);
+  const slack = Number.isFinite(accuracy) ? Math.min(Math.max(accuracy, 0), ARRIVAL_ACCURACY_SLACK_METERS) : 0;
+  const tooFar = distanceMeters - slack > ARRIVED_MAX_DISTANCE_METERS;
+  return { verified: !tooFar, tooFar, distanceMeters };
+}
+
+/* =======================
    PARTNER ARRIVED
-   Optional intermediate state — useful for SLA tracking.
+   Optional intermediate state — useful for SLA tracking. Requires being
+   near the customer (assessArrivalLocation).
 ======================= */
 exports.markArrived = async (req, res) => {
   try {
@@ -1006,10 +1095,37 @@ exports.markArrived = async (req, res) => {
       });
     }
 
+    // Proof of arrival: the partner must be near the customer. Uses the GPS
+    // the app sends with the tap, else their last location ping if it's
+    // fresh. Too far → refused. No usable location → allowed but unverified,
+    // and an unverified arrival can't close the booking as the customer's
+    // fault (no-refund cancel — see cancelBooking).
+    const arrival = assessArrivalLocation(booking, req.partner, req.body);
+    if (arrival.tooFar) {
+      const away =
+        arrival.distanceMeters >= 1000
+          ? `${(arrival.distanceMeters / 1000).toFixed(1)} km`
+          : `${Math.round(arrival.distanceMeters)} m`;
+      return res.status(400).json({
+        code: "NOT_AT_CUSTOMER",
+        message: `You're about ${away} from the customer's address. Tap "Arrived" when you reach their door.`,
+        distanceMeters: Math.round(arrival.distanceMeters),
+      });
+    }
+
     const arrivedAt = new Date();
     const updated = await Booking.findOneAndUpdate(
       { _id: bookingId, status: "ON_THE_WAY" },
-      { $set: { status: "ARRIVED", arrivedAt } },
+      {
+        $set: {
+          status: "ARRIVED",
+          arrivedAt,
+          arrivedLocationVerified: arrival.verified,
+          arrivedDistanceMeters: Number.isFinite(arrival.distanceMeters)
+            ? Math.round(arrival.distanceMeters)
+            : null,
+        },
+      },
       { new: true }
     );
 
@@ -1089,6 +1205,20 @@ function gateBookingSelfies(booking) {
   if (booking.partner) gateSelfieForCustomer(booking.partner);
   if (Array.isArray(booking.additionalPartners)) {
     booking.additionalPartners.forEach(gateSelfieForCustomer);
+  }
+  return booking;
+}
+
+// Partner photos are private uploads: hand the customer a short-lived signed
+// link (R2_PRIVATE_UPLOADS) instead of the stored URL. Run after
+// gateBookingSelfies, which blanks unapproved ones.
+async function signBookingSelfies(booking) {
+  if (!booking) return booking;
+  const partners = [booking.partner, ...(booking.additionalPartners || [])].filter(
+    (p) => p && typeof p === "object"
+  );
+  for (const p of partners) {
+    if (p.selfieUrl) p.selfieUrl = await getSensitiveFileUrl(p.selfieUrl);
   }
   return booking;
 }
@@ -1298,7 +1428,11 @@ exports.uploadStartSelfie = async (req, res) => {
    PARTNER STARTS SERVICE
    Gated by the in-app service start code: the customer reads the 4-digit
    code from their booking screen to the partner. No SMS involved.
+   5 wrong codes lock the booking for START_CODE_LOCK_MINUTES (admin can
+   reset sooner); routes add a per-partner rate limit (startCodeLimiter).
 ======================= */
+const MAX_START_CODE_ATTEMPTS = 5;
+const START_CODE_LOCK_MINUTES = 30;
 exports.startService = async (req, res) => {
   try {
     const { bookingId } = req.params;
@@ -1342,14 +1476,6 @@ exports.startService = async (req, res) => {
     // Verify the start code. Bookings created before this feature have no
     // code stored — they start without one (legacy fallback).
     if (booking.serviceStartCode) {
-      const attempts = Number(booking.startCodeAttempts || 0);
-      if (attempts >= 5) {
-        return res.status(429).json({
-          code: "START_CODE_LOCKED",
-          message: "Too many wrong code attempts. Please contact support.",
-        });
-      }
-
       const submitted = String(req.body?.startCode || "").trim();
       if (!submitted) {
         return res.status(400).json({
@@ -1357,15 +1483,49 @@ exports.startService = async (req, res) => {
           message: "Ask the customer for the start code shown in their app.",
         });
       }
+
+      // A lock lifts by itself START_CODE_LOCK_MINUTES after it was set.
+      await Booking.updateOne(
+        {
+          _id: booking._id,
+          startCodeAttempts: { $gte: MAX_START_CODE_ATTEMPTS },
+          startCodeLockedAt: { $ne: null, $lte: new Date(Date.now() - START_CODE_LOCK_MINUTES * 60 * 1000) },
+        },
+        { $set: { startCodeAttempts: 0, startCodeLockedAt: null } }
+      );
+
+      // Reserve one attempt ATOMICALLY before comparing. The old read-then-$inc
+      // let a burst of parallel requests all read "attempts < 5" and try far
+      // more than 5 of the 10,000 codes before the lock engaged.
+      const reserved = await Booking.findOneAndUpdate(
+        {
+          _id: booking._id,
+          $or: [
+            { startCodeAttempts: { $lt: MAX_START_CODE_ATTEMPTS } },
+            { startCodeAttempts: null },
+          ],
+        },
+        { $inc: { startCodeAttempts: 1 } },
+        { new: true }
+      ).select("startCodeAttempts");
+      if (!reserved) {
+        return res.status(429).json({
+          code: "START_CODE_LOCKED",
+          message: `Too many wrong codes. Try again in ${START_CODE_LOCK_MINUTES} minutes, or ask support to reset it.`,
+        });
+      }
+
       if (submitted !== booking.serviceStartCode) {
-        await Booking.updateOne(
-          { _id: booking._id },
-          { $inc: { startCodeAttempts: 1 } }
-        );
-        const remaining = 4 - attempts;
+        const used = Number(reserved.startCodeAttempts || 0);
+        if (used >= MAX_START_CODE_ATTEMPTS) {
+          await Booking.updateOne({ _id: booking._id }, { $set: { startCodeLockedAt: new Date() } });
+        }
+        const remaining = Math.max(MAX_START_CODE_ATTEMPTS - used, 0);
         return res.status(400).json({
           code: "START_CODE_INVALID",
-          message: `Incorrect code. ${remaining} attempt${remaining === 1 ? "" : "s"} left.`,
+          message: remaining
+            ? `Incorrect code. ${remaining} attempt${remaining === 1 ? "" : "s"} left.`
+            : `Incorrect code. Locked for ${START_CODE_LOCK_MINUTES} minutes — or ask support to reset it.`,
         });
       }
     }
@@ -1377,6 +1537,8 @@ exports.startService = async (req, res) => {
         $set: {
           status: "IN_PROGRESS",
           inProgressAt: new Date(),
+          startCodeAttempts: 0,
+          startCodeLockedAt: null,
         }
       },
       { new: true }
@@ -1683,10 +1845,21 @@ exports.completeBooking = async (req, res) => {
 const {
   PARTNER_DAILY_CANCEL_LIMIT,
   PARTNER_WEEKLY_CANCEL_LIMIT,
+  FREE_RELEASE_MIN_HOURS,
   checkStrikeAllowance,
   recordPartnerStrike,
+  isFreeEarlyRelease,
+  recordFreeRelease,
+  freeReleasesLeft,
   removeTeamMemberFromBooking,
 } = require("../services/partnerLifecycle.service");
+
+function freeReleaseMessage(partnerAfter, now) {
+  return (
+    `Job released with no strike — it was ${FREE_RELEASE_MIN_HOURS}+ hours before the start. ` +
+    `Free releases left this week: ${freeReleasesLeft(partnerAfter, now)}.`
+  );
+}
 
 const PARTNER_CANCEL_REASONS = [
   "Emergency / personal issue",
@@ -1702,6 +1875,9 @@ const PARTNER_CANCEL_REASONS = [
 // reachable" cancel reason, or a previously filed customer-fault on-site
 // report (which is what the report-issue flow tells partners to do first).
 const CUSTOMER_FAULT_CANCEL_REASONS = ["Customer not reachable"];
+// Minimum wait at the door (after a verified "Arrived") before a partner may
+// close the booking as the customer's fault.
+const CUSTOMER_FAULT_MIN_WAIT_MINUTES = 15;
 const ARRIVED_CUSTOMER_FAULT_REPORTS = [
   ...CUSTOMER_FAULT_ISSUE_TYPES,
   "CUSTOMER_NOT_REACHABLE",
@@ -1735,6 +1911,11 @@ exports.cancelBooking = async (req, res) => {
 
     const now = new Date();
 
+    // Free early release: giving the job back FREE_RELEASE_MIN_HOURS+ before
+    // its start (before setting off) costs no strike and skips the daily/weekly
+    // limits — capped per week (partnerLifecycle.isFreeEarlyRelease).
+    const freeRelease = isFreeEarlyRelease(partner, booking, now);
+
     /* =====================
        ADDITIONAL TEAM MEMBER → REMOVE ONLY THEM
        One member's exit must not release the whole team: previously this path
@@ -1744,16 +1925,18 @@ exports.cancelBooking = async (req, res) => {
        arrange a replacement. The primary and the rest of the team keep the job.
     ===================== */
     if (!isPrimary) {
-      const { dailyExceeded, weeklyExceeded } = checkStrikeAllowance(partner, now);
-      if (dailyExceeded) {
-        return res.status(400).json({
-          message: `You can only cancel ${PARTNER_DAILY_CANCEL_LIMIT} job per day. Try again tomorrow.`,
-        });
-      }
-      if (weeklyExceeded) {
-        return res.status(400).json({
-          message: `Weekly cancel limit reached (${PARTNER_WEEKLY_CANCEL_LIMIT} per week). Account suspended.`,
-        });
+      if (!freeRelease) {
+        const { dailyExceeded, weeklyExceeded } = checkStrikeAllowance(partner, now);
+        if (dailyExceeded) {
+          return res.status(400).json({
+            message: `You can only cancel ${PARTNER_DAILY_CANCEL_LIMIT} job per day. Try again tomorrow.`,
+          });
+        }
+        if (weeklyExceeded) {
+          return res.status(400).json({
+            message: `Weekly cancel limit reached (${PARTNER_WEEKLY_CANCEL_LIMIT} per week). New jobs are paused.`,
+          });
+        }
       }
 
       const removal = await removeTeamMemberFromBooking(booking._id, partner._id, reason);
@@ -1761,6 +1944,16 @@ exports.cancelBooking = async (req, res) => {
         return res.status(409).json({
           success: false,
           message: "Booking state changed during cancellation — please refresh",
+        });
+      }
+
+      if (freeRelease) {
+        const after = await recordFreeRelease(partner._id, now);
+        return res.json({
+          success: true,
+          freeRelease: true,
+          message: freeReleaseMessage(after, now),
+          weeklyCancelCount: partner.weeklyCancelCount,
         });
       }
 
@@ -1776,7 +1969,9 @@ exports.cancelBooking = async (req, res) => {
        PRIMARY PARTNER — CLASSIFY THE CANCEL
 
        Customer-fault at the door (ARRIVED + "Customer not reachable" reason, or
-       a previously filed customer-fault on-site report) closes the booking with
+       a previously filed customer-fault on-site report — and only after a
+       location-verified arrival plus CUSTOMER_FAULT_MIN_WAIT_MINUTES at the
+       door) closes the booking with
        no refund and charges the wallet penalty instead of a strike — it must
        NOT consume the daily quota or weekly suspension counter (no double
        penalty for a partner stuck at a refusing customer's door).
@@ -1790,14 +1985,30 @@ exports.cancelBooking = async (req, res) => {
     const hasCustomerFaultReport = (booking.partnerReports || []).some((r) =>
       ARRIVED_CUSTOMER_FAULT_REPORTS.includes(r.issueType)
     );
+    // The no-refund close needs proof the partner really waited at the door:
+    // a location-verified arrival AND CUSTOMER_FAULT_MIN_WAIT_MINUTES since it
+    // (the customer got a "your professional is at your door" push then).
+    // Before that, it's an ordinary partner cancel — reassigned, with a strike.
+    const waitedAtDoor =
+      booking.arrivedLocationVerified === true &&
+      booking.arrivedAt &&
+      now.getTime() - new Date(booking.arrivedAt).getTime() >= CUSTOMER_FAULT_MIN_WAIT_MINUTES * 60 * 1000;
     const isCustomerFaultArrivedCancel =
       booking.status === "ARRIVED" &&
-      (CUSTOMER_FAULT_CANCEL_REASONS.includes(reason) || hasCustomerFaultReport);
+      (CUSTOMER_FAULT_CANCEL_REASONS.includes(reason) || hasCustomerFaultReport) &&
+      waitedAtDoor;
 
     // Default no-op (customer-fault ARRIVED path); redefined for voluntary cancels.
     let commitCancelStrike = async () => {};
+    let partnerAfterFreeRelease = null;
 
-    if (!isCustomerFaultArrivedCancel) {
+    if (!isCustomerFaultArrivedCancel && freeRelease) {
+      // Free early release — counted, but no strike and no limit checks.
+      commitCancelStrike = async () => {
+        partnerAfterFreeRelease = await recordFreeRelease(partner._id, now);
+        await syncPartnerOperationalState(partner._id);
+      };
+    } else if (!isCustomerFaultArrivedCancel) {
       const { dailyExceeded, weeklyExceeded } = checkStrikeAllowance(partner, now);
       if (dailyExceeded) {
         return res.status(400).json({
@@ -1806,7 +2017,7 @@ exports.cancelBooking = async (req, res) => {
       }
       if (weeklyExceeded) {
         return res.status(400).json({
-          message: `Weekly cancel limit reached (${PARTNER_WEEKLY_CANCEL_LIMIT} per week). Account suspended.`,
+          message: `Weekly cancel limit reached (${PARTNER_WEEKLY_CANCEL_LIMIT} per week). New jobs are paused.`,
         });
       }
 
@@ -1865,6 +2076,10 @@ exports.cancelBooking = async (req, res) => {
           refundAmount: 0,
         });
       }
+      // …and by push, for a customer who isn't in the app.
+      notifyCustomerOfBookingStatus(cancelledBooking.user, "CANCELLED", cancelledBooking._id, {
+        refundAmount: 0,
+      });
 
       // Admin-configured penalty (₹). If set to 0, skip the wallet debit.
       const penaltyInr = await getArrivedCancelPenalty();
@@ -2000,7 +2215,10 @@ exports.cancelBooking = async (req, res) => {
 
     res.json({
       success: true,
-      message: "Booking cancelled and reassigned",
+      message: partnerAfterFreeRelease
+        ? freeReleaseMessage(partnerAfterFreeRelease, now)
+        : "Booking cancelled and reassigned",
+      freeRelease: Boolean(partnerAfterFreeRelease),
       weeklyCancelCount: partner.weeklyCancelCount,
     });
   } catch (error) {
@@ -2387,6 +2605,7 @@ exports.getMyBookings = async (req, res) => {
     ]);
 
     bookings.forEach(gateBookingSelfies);
+    await Promise.all(bookings.map(signBookingSelfies));
     bookings.forEach(hidePartnerPhonesAfterService);
     bookings.forEach(sanitizeBookingForCustomer);
 
@@ -2742,6 +2961,7 @@ exports.getBookingById = async (req, res) => {
     }
 
     gateBookingSelfies(booking);
+    await signBookingSelfies(booking);
     hidePartnerPhonesAfterService(booking);
 
     // Surface the latest unresolved "customer-fault" on-site report while the

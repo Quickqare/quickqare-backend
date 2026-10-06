@@ -45,6 +45,16 @@ const normalizeWallet = (partnerId) =>
    each add the same credits.
 ===================================================== */
 const releasePendingEarnings = async (partnerId) => {
+  await releaseMaturedCredits(partnerId);
+  // A penalty the partner couldn't pay at the time sits as an owed (pending)
+  // debit. Collect it now that earnings are withdrawable — before the balance
+  // is shown or a withdrawal is placed (both call this). Job earnings always
+  // land in the pending bucket, so they never triggered creditWallet's own
+  // settle and owed penalties were never actually recovered.
+  await settleOutstandingPenalties(partnerId);
+};
+
+const releaseMaturedCredits = async (partnerId) => {
   const cutoff = new Date(Date.now() - 48 * 60 * 60 * 1000);
 
   const matured = await WalletTransaction.find({

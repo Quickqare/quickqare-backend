@@ -8,6 +8,7 @@ const payoutAccountController = require("../controllers/partnerPayoutAccount.con
 const guestAddonController = require("../controllers/guestAddon.controller");
 const upload = require("../config/multer");
 const r2Upload = require("../config/multerR2");
+const { startCodeLimiter } = require("../middlewares/rateLimiter");
 
 /* =====================================================
    PARTNER JOB LIFECYCLE ROUTES (PRODUCTION READY)
@@ -55,6 +56,13 @@ router.get(
   "/bookings",
   partnerAuth,
   partnerController.getPartnerBookings
+);
+
+// Silent "seen" signal from the app (no button) — see markBookingsSeen.
+router.post(
+  "/bookings/seen",
+  partnerAuth,
+  partnerController.markBookingsSeen
 );
 
 /**
@@ -159,6 +167,7 @@ router.post(
 router.post(
   "/booking/start",
   partnerAuth,
+  startCodeLimiter,
   partnerController.markInProgress
 );
 

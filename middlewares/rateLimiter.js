@@ -270,6 +270,30 @@ exports.phoneLoginLimiter = rateLimit({
 });
 
 /* =====================================================
+   PER-PARTNER START-CODE LIMITER
+   Mounted after partnerAuth on the start-service routes. The booking itself
+   caps wrong codes at 5 (reserved atomically in startService); this keeps a
+   partner from hammering the endpoint across bookings or retries.
+===================================================== */
+exports.startCodeLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 10,             // per partner
+
+  standardHeaders: true,
+  legacyHeaders: false,
+
+  keyGenerator: (req) =>
+    req.partner?._id ? `start-code:${req.partner._id}` : `start-code:${ipKeyGenerator(req.ip)}`,
+
+  handler: (req, res) => {
+    res.status(429).json({
+      success: false,
+      message: "Too many attempts. Wait a minute and try again.",
+    });
+  },
+});
+
+/* =====================================================
    PER-PHONE OTP VERIFY LIMITER
    authLimiter on /verify-otp is IP-keyed, so an attacker
    rotating IPs could grind a 4-digit OTP (10,000 possible
@@ -299,6 +323,55 @@ exports.phoneOtpVerifyLimiter = rateLimit({
       message: "Too many failed OTP attempts for this number. Try again in 15 minutes.",
     });
   },
+});
+
+/* =====================================================
+   PER-EMAIL ADMIN LOGIN LIMITERS
+   authLimiter is IP-keyed, so an attacker rotating IPs could grind one admin's
+   password — or, once they have it, keep opening fresh 2FA challenges (each
+   one is 5 more guesses at the 6-digit code). These key on the target email
+   and count EVERY attempt, successful or not, so both are capped per account:
+   at most 10 logins per 15 minutes and 50 per day, i.e. ≤250 code guesses a day
+   out of a million. The daily cap is env-tunable: a team still sharing one
+   admin login adds up everyone's sign-ins on that single account.
+   Answers use the admin API's error shape so the login screen shows the message.
+===================================================== */
+const adminEmailKey = (req, prefix) => {
+  const email = String(req.body?.email || "").trim().toLowerCase().slice(0, 254);
+  return `${prefix}:${email || ipKeyGenerator(req.ip)}`;
+};
+
+const adminLoginLimited = (message) => (req, res) => {
+  res.status(429).json({
+    success: false,
+    data: null,
+    error: { code: "TOO_MANY_LOGIN_ATTEMPTS", message, details: null },
+    meta: {},
+  });
+};
+
+exports.adminLoginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10,                  // max 10 login attempts per admin email
+
+  standardHeaders: true,
+  legacyHeaders: false,
+
+  keyGenerator: (req) => adminEmailKey(req, "admin-login"),
+
+  handler: adminLoginLimited("Too many login attempts for this account. Try again in 15 minutes."),
+});
+
+exports.adminLoginDailyLimiter = rateLimit({
+  windowMs: 24 * 60 * 60 * 1000, // 24 hours
+  max: Number(process.env.ADMIN_LOGIN_DAILY_MAX || 50), // login attempts per admin email per day
+
+  standardHeaders: true,
+  legacyHeaders: false,
+
+  keyGenerator: (req) => adminEmailKey(req, "admin-login-daily"),
+
+  handler: adminLoginLimited("Too many login attempts for this account today. Try again tomorrow."),
 });
 
 // Secondary hourly cap — prevents someone retrying every 60s for hours.

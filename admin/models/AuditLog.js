@@ -17,6 +17,10 @@ const auditLogSchema = new mongoose.Schema(
     beforeState: { type: String, default: null },
     afterState: { type: String, default: null },
     metadata: { type: String, default: null },
+    // How the action went, filled in once the response is sent. null on
+    // entries written before this was recorded.
+    statusCode: { type: Number, default: null },
+    outcome: { type: String, enum: ["success", "failed", null], default: null },
   },
   { timestamps: true, versionKey: false }
 );

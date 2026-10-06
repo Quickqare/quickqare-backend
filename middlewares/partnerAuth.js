@@ -1,6 +1,10 @@
 const jwt = require("jsonwebtoken");
 const Partner = require("../models/Partner");
 
+// lastActiveAt is written at most this often per partner (any authenticated
+// request counts), so app activity costs ~one small write per few minutes.
+const ACTIVITY_WRITE_INTERVAL_MS = 5 * 60 * 1000;
+
 /* =====================================================
    PARTNER AUTH MIDDLEWARE (PRODUCTION SAFE)
 ===================================================== */
@@ -57,7 +61,7 @@ module.exports = async (req, res, next) => {
     /* =====================
        BLOCKED PARTNER CHECK
     ===================== */
-    if (partner.isBlocked) {
+    if (partner.isBlocked || partner.isDeleted) {
       return res.status(403).json({
         success: false,
         message: "Your account has been blocked",
@@ -77,6 +81,24 @@ module.exports = async (req, res, next) => {
         success: false,
         message: "Your password was changed. Please log in again.",
       });
+    }
+
+    /* =====================
+       APP ACTIVITY
+       Any use of the app counts as activity, and it also ends an inactivity
+       pause (partnerDuty.pauseInactivePartners / app-removed) — opening the
+       app again is all a paused partner has to do.
+    ===================== */
+    const lastActiveMs = partner.lastActiveAt ? new Date(partner.lastActiveAt).getTime() : 0;
+    if (partner.inactivePausedAt || Date.now() - lastActiveMs > ACTIVITY_WRITE_INTERVAL_MS) {
+      const activity = { lastActiveAt: new Date(), inactivePausedAt: null, inactivePauseReason: "" };
+      try {
+        await Partner.updateOne({ _id: partner._id }, { $set: activity });
+        partner.set(activity);
+      } catch (activityErr) {
+        // Bookkeeping only — never fail the request (or log the partner out) over it.
+        console.error("Partner activity write failed:", activityErr.message);
+      }
     }
 
     /* =====================

@@ -223,6 +223,48 @@ const partnerSchema = new mongoose.Schema(
 
     lastOnlineAt: Date,
 
+    // Last time the partner's app called the API (any authenticated request;
+    // partnerAuth writes it at most every few minutes). Drives the inactivity
+    // pause below.
+    lastActiveAt: {
+      type: Date,
+      default: null,
+    },
+
+    // Set when the partner has gone quiet: no app use for a few days
+    // (pauseInactivePartners cron) or Firebase reported the app removed (dead
+    // push token). While set they get no NEW jobs; their next app use clears it
+    // automatically (partnerAuth).
+    inactivePausedAt: {
+      type: Date,
+      default: null,
+    },
+
+    inactivePauseReason: {
+      type: String,
+      default: "",
+    },
+
+    // First time this partner's app reported a job as seen. Only partners on an
+    // app build that sends that signal get the "job not seen yet" check —
+    // older builds would otherwise look like they never see anything.
+    seenSignalAt: {
+      type: Date,
+      default: null,
+    },
+
+    // Local day keys (YYYY-MM-DD) of the last job summaries sent, so each one
+    // goes out at most once per day.
+    eveningSummaryFor: {
+      type: String,
+      default: "",
+    },
+
+    morningSummaryFor: {
+      type: String,
+      default: "",
+    },
+
     /* =====================
        FAIRNESS ENGINE
     ===================== */
@@ -279,8 +321,22 @@ const partnerSchema = new mongoose.Schema(
     },
 
     // Set when partner is auto-suspended (>= 5 weekly cancellations or admin action).
-    // Assignment engine excludes partners where suspendedUntil > now.
+    // Assignment engine excludes partners where suspendedUntil > now. A strike
+    // suspension only pauses NEW jobs (login, current jobs and withdrawals keep
+    // working) and liftExpiredSuspensions ends it once this date passes.
     suspendedUntil: {
+      type: Date,
+      default: null,
+    },
+
+    // Free early releases: giving a job back FREE_RELEASE_MIN_HOURS+ before its
+    // start costs no strike, up to FREE_RELEASES_PER_WEEK per rolling week.
+    freeReleaseCount: {
+      type: Number,
+      default: 0,
+    },
+
+    freeReleaseWeekStart: {
       type: Date,
       default: null,
     },

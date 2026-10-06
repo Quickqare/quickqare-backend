@@ -1653,6 +1653,9 @@ async function findEligiblePartnersForBooking(booking, pincodes = [], opts = {})
     // $not + $gt matches: null, missing field, or a past date — i.e. not currently suspended.
     // Avoids using $or here because the pincode block below also uses $or.
     suspendedUntil: { $not: { $gt: new Date() } },
+    // Paused for inactivity / app removed (partnerDuty.pauseInactivePartners);
+    // cleared automatically the next time they use the app.
+    inactivePausedAt: null,
     _id: { $nin: booking?.rejectedPartners || [] },
   };
 

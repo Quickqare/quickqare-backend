@@ -26,6 +26,13 @@ const PERMISSIONS = Object.freeze({
   // via SUPER_ADMIN's Object.values(PERMISSIONS) below — never added to any
   // other role's list, so OpsAdmin/FinanceAdmin/SupportAdmin can't invoke it.
   SYSTEM_RESET: "system.reset",
+  // SuperAdmin-only for the same reason: adding admins, changing roles and
+  // resetting passwords decides who holds every other permission.
+  ADMINS_MANAGE: "admins.manage",
+  // Reading the admin activity log: every admin's actions with their request
+  // bodies, plus sign-in attempts and IPs. SuperAdmin only. (audit.read is the
+  // GST report — a different "audit".)
+  ACTIVITY_READ: "activity.read",
 });
 
 const ROLE_PERMISSIONS = Object.freeze({

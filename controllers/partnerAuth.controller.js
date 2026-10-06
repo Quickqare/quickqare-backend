@@ -14,6 +14,8 @@ const {
 // Every partner lookup/create keys on the canonical number (utils/phone) — the
 // same one MSG91 verifies — so reformatting a phone can't open a second account.
 const { toNationalPhone, INVALID_PHONE_MESSAGE } = require("../utils/phone");
+const { isQuietHours } = require("../utils/partnerHours");
+const { partnerWithSignedSelfie } = require("../utils/sensitiveFileUrl");
 
 const PARTNER_TOKEN_TTL = String(process.env.PARTNER_JWT_TTL || "90d");
 const IS_PRODUCTION = String(process.env.NODE_ENV || "").toLowerCase() === "production";
@@ -231,7 +233,7 @@ exports.registerPartner = async (req, res) => {
       success: true,
       message: "Partner registered successfully",
       token,
-      partner: safePartner,
+      partner: await partnerWithSignedSelfie(safePartner),
     });
   } catch (error) {
     console.error("registerPartner error:", error);
@@ -277,8 +279,9 @@ exports.loginPartner = async (req, res) => {
       });
     }
 
-    // Keep partner discoverable for assignment right after login.
-    partner.isOnline = true;
+    // Login switches urgent jobs on — except at night (quiet hours), when the
+    // switch stays off until the partner turns it on in the morning.
+    partner.isOnline = !isQuietHours();
     partner.lastOnlineAt = new Date();
     await partner.save();
 
@@ -294,7 +297,7 @@ exports.loginPartner = async (req, res) => {
     res.json({
       success: true,
       token,
-      partner: safePartner,
+      partner: await partnerWithSignedSelfie(safePartner),
     });
   } catch (error) {
     console.error("loginPartner error:", error);
@@ -388,7 +391,9 @@ exports.verifyPartnerOtp = async (req, res) => {
       });
     }
 
-    partner.isOnline = true;
+    // Login switches urgent jobs on — except at night (quiet hours), when the
+    // switch stays off until the partner turns it on in the morning.
+    partner.isOnline = !isQuietHours();
     partner.lastOnlineAt = new Date();
     await partner.save();
 
@@ -404,7 +409,7 @@ exports.verifyPartnerOtp = async (req, res) => {
     return res.json({
       success: true,
       token,
-      partner: safePartner,
+      partner: await partnerWithSignedSelfie(safePartner),
     });
   } catch (error) {
     return res.status(error.statusCode || 500).json({
@@ -490,7 +495,9 @@ exports.exchangePartnerMsg91AccessToken = async (req, res) => {
       });
     }
 
-    partner.isOnline = true;
+    // Login switches urgent jobs on — except at night (quiet hours), when the
+    // switch stays off until the partner turns it on in the morning.
+    partner.isOnline = !isQuietHours();
     partner.lastOnlineAt = new Date();
     await partner.save();
 
@@ -506,7 +513,7 @@ exports.exchangePartnerMsg91AccessToken = async (req, res) => {
     return res.json({
       success: true,
       token,
-      partner: safePartner,
+      partner: await partnerWithSignedSelfie(safePartner),
     });
   } catch (error) {
     return res.status(error.statusCode || 500).json({
@@ -631,13 +638,21 @@ exports.setPartnerStatus = async (req, res) => {
       });
     }
 
-    req.partner.isOnline = isOnline;
+    // isOnline is the "Available for urgent jobs" switch (it only gates jobs
+    // starting within 30 minutes). Urgent jobs pause at night: during quiet
+    // hours it can't be switched on — the night reset would undo it anyway.
+    const quietHours = isQuietHours();
+    req.partner.isOnline = isOnline && !quietHours;
     await req.partner.save();
 
     res.json({
       success: true,
-      message: `Partner is now ${isOnline ? "ONLINE" : "OFFLINE"}`,
+      message:
+        isOnline && quietHours
+          ? "Urgent jobs are paused at night (10 PM–7 AM). Switch them on again in the morning."
+          : `Urgent jobs ${req.partner.isOnline ? "on" : "off"}`,
       isOnline: req.partner.isOnline,
+      quietHours,
     });
   } catch (error) {
     console.error("setPartnerStatus error:", error);

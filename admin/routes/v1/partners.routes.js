@@ -3,6 +3,8 @@ const mongoose = require("mongoose");
 const Partner = require("../../../models/Partner");
 const Booking = require("../../../models/Booking");
 const PartnerWallet = require("../../../models/PartnerWallet");
+const PartnerPayoutAccount = require("../../../models/PartnerPayoutAccount");
+const Withdrawal = require("../../../models/Withdrawal");
 const Hub = require("../../../models/Hub");
 const authenticateAdmin = require("../../middleware/authenticateAdmin");
 const authorize = require("../../middleware/authorize");
@@ -12,6 +14,17 @@ const { asSingleString, getPagination, escapeRegex } = require("../../utils/comm
 const { success, fail } = require("../../utils/response");
 const { getSensitiveFileUrl } = require("../../../utils/sensitiveFileUrl");
 const { trackApiCall } = require("../../../services/apiCallTracker.service");
+
+// Approving / unblocking a partner restores them fully: an auto-suspension
+// (5 weekly strikes) leaves isAvailable=false + suspendedUntil, which kept an
+// unblocked partner out of every assignment and slot. The admin's decision
+// also starts their cancel counters afresh.
+const RESTORE_AVAILABILITY = Object.freeze({
+  isAvailable: true,
+  suspendedUntil: null,
+  weeklyCancelCount: 0,
+  dailyCancelCount: 0,
+});
 
 const router = express.Router();
 
@@ -24,7 +37,9 @@ router.get("/", async (req, res) => {
     const status = String(asSingleString(req.query.status) || "").toUpperCase();
     const { page, pageSize, skip, limit } = getPagination(req);
 
-    const where = {};
+    // Deleted accounts (by the partner or by an admin) are anonymised shells
+    // kept only for their booking and wallet history — not listed.
+    const where = { isDeleted: { $ne: true } };
     if (status === "PENDING" || status === "APPROVED" || status === "REJECTED") {
       where.approvalStatus = status;
     }
@@ -234,7 +249,7 @@ router.get("/:id/stats", async (req, res) => {
         { $match: { partner: pid, status: "COMPLETED" } },
         { $group: { _id: null, total: { $sum: "$partnerSettlement.partnerEarningAmount" } } },
       ]),
-      PartnerWallet.findOne({ partnerId }).select("totalEarnings pendingEarnings").lean(),
+      PartnerWallet.findOne({ partnerId }).select("totalEarnings withdrawableBalance pendingBalance balance").lean(),
       Booking.find({ partner: pid, status: { $in: ACTIVE_STATUSES } })
         .select("bookingNumber status scheduledDate scheduledTime totalAmount pincode address services")
         .sort({ scheduledDate: 1 })
@@ -249,7 +264,13 @@ router.get("/:id/stats", async (req, res) => {
         pendingJobs,
         completedJobs,
         totalEarnings: earningsAgg[0]?.total || 0,
-        walletBalance: wallet?.pendingEarnings || 0,
+        // Everything the wallet holds for the partner: what they can withdraw
+        // now plus earnings not yet released. (This read `pendingEarnings`, a
+        // field the wallet never had, so it always showed 0.)
+        walletBalance:
+          Math.round(
+            (Number(wallet?.withdrawableBalance ?? wallet?.balance ?? 0) + Number(wallet?.pendingBalance || 0)) * 100
+          ) / 100,
         walletTotalEarnings: wallet?.totalEarnings || 0,
       },
       activeBookings,
@@ -387,6 +408,7 @@ router.patch("/:id/approval", audit("admin.partners.approval"), async (req, res)
           approvalStatus: status,
           verificationStatus: status === "APPROVED" ? "VERIFIED" : "REJECTED",
           isBlocked: false,
+          ...(status === "APPROVED" ? RESTORE_AVAILABILITY : {}),
         },
       },
       { new: true }
@@ -423,6 +445,7 @@ router.patch("/:id/status", audit("admin.partners.status"), async (req, res) => 
         $set: {
           approvalStatus: status === "BLOCKED" ? "APPROVED" : status,
           isBlocked: status === "BLOCKED",
+          ...(status !== "BLOCKED" ? RESTORE_AVAILABILITY : {}),
         },
       },
       { new: true }
@@ -601,105 +624,87 @@ router.patch("/:id/hub", audit("admin.partners.hub"), async (req, res) => {
   }
 });
 
+// Deleting a partner is a soft delete, the same shape as the partner's own
+// "delete my account" (controllers/partner.controller.js): PII is anonymised
+// and the phone number is freed for a fresh signup, while the record, its
+// bookings, wallet and withdrawal history all stay.
+//
+// It used to be a hard delete that also dropped the wallet (money that may
+// still be owed), with a `cascade=true` mode that wiped every booking, refund
+// and wallet row the partner ever touched — the records the GST report and
+// payouts are built on. That mode also told each customer their booking was
+// cancelled and then crashed before deleting anything.
 router.delete("/:id", audit("admin.partners.delete"), async (req, res) => {
   try {
     const partnerId = asSingleString(req.params.id);
-    const force   = req.query.force   === "true";
-    const cascade = req.query.cascade === "true"; // also wipe all booking history
+    const force = req.query.force === "true";
 
     if (!partnerId || !mongoose.Types.ObjectId.isValid(partnerId)) {
       return fail(res, 400, "INVALID_ID", "Invalid partner id", null, { requestId: req.requestId });
     }
+    // An admin panel build from before this change can still send it.
+    if (req.query.cascade === "true") {
+      return fail(
+        res,
+        400,
+        "CASCADE_NOT_SUPPORTED",
+        "Booking history can no longer be wiped. Delete the partner on its own — their bookings, refunds and wallet records are kept.",
+        null,
+        { requestId: req.requestId }
+      );
+    }
 
     const pid = new mongoose.Types.ObjectId(partnerId);
-    const [partner, activeBookingDocs] = await Promise.all([
+    const [partner, activeBookingDocs, wallet, pendingWithdrawals] = await Promise.all([
       Partner.findById(partnerId).lean(),
       Booking.find({
         $or: [{ partner: pid }, { additionalPartners: pid }],
         status: { $in: ACTIVE_STATUSES },
       }).select("_id user status").lean(),
+      PartnerWallet.findOne({ partnerId: pid }).lean(),
+      Withdrawal.countDocuments({ partnerId: pid, status: "PENDING" }),
     ]);
 
-    if (!partner) {
+    if (!partner || partner.isDeleted) {
       return fail(res, 404, "NOT_FOUND", "Partner not found", null, { requestId: req.requestId });
     }
 
-    // cascade implies force — no soft-block needed
-    if (activeBookingDocs.length > 0 && !force && !cascade) {
+    // Money first. A deleted partner can't sign in to withdraw, so anything
+    // still in the wallet — or a withdrawal waiting on us — would be stranded.
+    // (`balance` mirrors withdrawableBalance; a legacy wallet may only have it.)
+    const walletOwed =
+      Math.round(
+        (Math.max(Number(wallet?.withdrawableBalance || 0), Number(wallet?.balance || 0)) +
+          Number(wallet?.pendingBalance || 0)) *
+          100
+      ) / 100;
+    if (walletOwed > 0 || pendingWithdrawals > 0) {
+      const owed = [];
+      if (walletOwed > 0) owed.push(`₹${walletOwed} in their wallet`);
+      if (pendingWithdrawals > 0) owed.push(`${pendingWithdrawals} pending withdrawal request(s)`);
+      return fail(
+        res,
+        409,
+        "PARTNER_HAS_BALANCE",
+        `Cannot delete: this partner still has ${owed.join(" and ")}. Settle it first, or block the partner instead.`,
+        null,
+        { requestId: req.requestId, walletOwed, pendingWithdrawals }
+      );
+    }
+
+    if (activeBookingDocs.length > 0 && !force) {
       return fail(
         res,
         409,
         "PARTNER_HAS_ACTIVE_BOOKINGS",
-        `Cannot delete: partner has ${activeBookingDocs.length} active booking(s). Use force=true to unassign them and delete, or cascade=true to wipe their full history.`,
+        `Cannot delete: partner has ${activeBookingDocs.length} active booking(s). Use force=true to unassign them and delete.`,
         null,
         { requestId: req.requestId, activeBookings: activeBookingDocs.length }
       );
     }
 
-    // ── CASCADE: wipe every booking + related sub-documents for this partner ──
-    if (cascade) {
-      const allBookings = await Booking.find(
-        { $or: [{ partner: pid }, { additionalPartners: pid }] }
-      ).select("_id").lean();
-
-      const bookingIds = allBookings.map((b) => b._id);
-
-      if (bookingIds.length > 0) {
-        // Cancel any pending ACK timers first
-        try {
-          const { cancelAckTimeout } = require("../../../services/ackTimeout.service");
-          for (const b of allBookings) await cancelAckTimeout(b._id).catch(() => {});
-        } catch (_) { /* non-fatal */ }
-
-        // Notify affected customers their booking is gone
-        if (global.io) {
-          const bookingsWithUsers = await Booking.find(
-            { _id: { $in: bookingIds } }
-          ).select("_id user").lean();
-          for (const b of bookingsWithUsers) {
-            global.io.to(`user_${b.user}`).emit("booking_update", {
-              bookingId: b._id.toString(),
-              status: "CANCELLED",
-              cancelReason: "Partner account removed by admin",
-            });
-          }
-        }
-
-        // Pull complaint IDs so we can delete their timelines too
-        const Complaint       = require("../../../models/Complaint");
-        const complaints      = await Complaint.find({ bookingId: { $in: bookingIds } }).select("_id").lean();
-        const complaintIds    = complaints.map((c) => c._id);
-
-        const ComplaintTimeline = require("../../../models/ComplaintTimeline");
-        const Rating            = require("../../../models/Rating");
-        const UserWalletTx      = require("../../../models/UserWalletTransaction");
-        const WalletTx          = require("../../../models/WalletTransaction");
-        const SlotLock          = require("../../../models/SlotLock");
-        const SlotCapacity      = require("../../../models/SlotCapacity");
-        const Job               = require("../../../models/Job");
-
-        await Promise.all([
-          BookingTimeline.deleteMany({ bookingId: { $in: bookingIds } }),
-          BookingAssignment.deleteMany({
-            $or: [{ partnerId: pid }, { bookingId: { $in: bookingIds } }],
-          }),
-          Refund.deleteMany({ bookingId: { $in: bookingIds } }),
-          Rating.deleteMany({ bookingId: { $in: bookingIds } }),
-          Complaint.deleteMany({ bookingId: { $in: bookingIds } }),
-          complaintIds.length
-            ? ComplaintTimeline.deleteMany({ complaintId: { $in: complaintIds } })
-            : Promise.resolve(),
-          UserWalletTx.deleteMany({ bookingId: { $in: bookingIds } }),
-          WalletTx.deleteMany({ bookingId: { $in: bookingIds } }),
-          SlotLock.deleteMany({ bookingId: { $in: bookingIds } }),
-          SlotCapacity.deleteMany({ bookingId: { $in: bookingIds } }),
-          Job.deleteMany({ bookingId: { $in: bookingIds } }),
-        ]);
-
-        await Booking.deleteMany({ _id: { $in: bookingIds } });
-      }
-    } else if (force && activeBookingDocs.length > 0) {
-      // force only: unassign active bookings back to SEARCHING
+    if (activeBookingDocs.length > 0) {
+      // force: unassign active bookings back to SEARCHING
       const bookingIds = activeBookingDocs.map((b) => b._id);
       await Booking.updateMany(
         { _id: { $in: bookingIds } },
@@ -719,10 +724,26 @@ router.delete("/:id", audit("admin.partners.delete"), async (req, res) => {
       }
     }
 
-    await Promise.all([
-      Partner.deleteOne({ _id: pid }),
-      PartnerWallet.deleteMany({ partnerId: pid }),
-    ]);
+    // Payout details go with the account; the wallet and its history stay.
+    // updateOne, not save(): no re-validation of an old record, and no
+    // post-save hook re-creating a wallet.
+    await PartnerPayoutAccount.deleteOne({ partnerId: pid });
+    await Partner.updateOne(
+      { _id: pid },
+      {
+        $set: {
+          name: "Deleted Partner",
+          phone: `deleted_${partnerId}`,
+          email: "",
+          fcmToken: "",
+          isBlocked: true,
+          isOnline: false,
+          isDeleted: true,
+          deletedAt: new Date(),
+          deleteReason: "Removed by admin",
+        },
+      }
+    );
 
     if (global.io) {
       global.io.to(`partner_${partnerId}`).emit("partner_account_deleted", {
@@ -734,7 +755,7 @@ router.delete("/:id", audit("admin.partners.delete"), async (req, res) => {
       deleted: true,
       partnerId,
       phone: partner.phone,
-      unassignedBookings: force && !cascade ? activeBookingDocs.length : 0,
+      unassignedBookings: activeBookingDocs.length,
     }, { requestId: req.requestId });
   } catch (error) {
     return fail(res, 500, "PARTNER_DELETE_FAILED", "Unable to delete partner", error.message, {

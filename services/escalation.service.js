@@ -94,6 +94,15 @@ async function escalateUnassignedBooking(bookingId) {
         });
       }
 
+      // The socket only reaches a customer with the app open; the push reaches
+      // the rest. Only for a booking they actually paid for — an unpaid one is
+      // hidden from their list, so there is nothing for them to find.
+      if (isPaid) {
+        // Lazy require, like the capacity release above.
+        const { notifyCustomerOfBookingStatus } = require("./pushNotification.service");
+        notifyCustomerOfBookingStatus(booking.user, "CANCELLED", bookingId, { refundAmount });
+      }
+
       console.warn(
         `[escalation] Booking ${bookingId} auto-cancelled — no replacement after partner cancellation. ` +
         (refundAmount > 0 ? `Refund ₹${refundAmount} queued.` : "Unpaid booking — no refund.")

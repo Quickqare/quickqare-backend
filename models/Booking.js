@@ -291,6 +291,21 @@ const bookingSchema = new mongoose.Schema(
       trim: true,
     },
 
+    // Who the professional should ask for and call at the door, when that isn't
+    // the account holder (a parent's flat, a gift). Both set, or both null. The
+    // partner payloads show them as "the customer" (utils/receiverContact).
+    receiverName: {
+      type: String,
+      default: null,
+      trim: true,
+    },
+
+    receiverPhone: {
+      type: String,
+      default: null,
+      trim: true,
+    },
+
     /* ======================
        PAYMENT
     ====================== */
@@ -396,10 +411,17 @@ const bookingSchema = new mongoose.Schema(
       default: null,
     },
 
-    // Wrong-code attempts by the partner; locked after 5 (support unlocks).
+    // Wrong-code attempts by the partner; locked after 5. The lock lifts by
+    // itself START_CODE_LOCK_MINUTES after startCodeLockedAt, or support resets
+    // it (admin "Reset start code").
     startCodeAttempts: {
       type: Number,
       default: 0,
+    },
+
+    startCodeLockedAt: {
+      type: Date,
+      default: null,
     },
 
     /* ======================
@@ -536,6 +558,16 @@ const bookingSchema = new mongoose.Schema(
       default: "NONE",
     },
 
+    // How much of refundAmount has already gone back to the customer.
+    // refundAmount is the running total recorded for the booking, so while
+    // refundStatus is PENDING what is still owed is refundAmount − refundedAmount.
+    // The two only differ when a further refund is added to a booking that was
+    // already refunded once (admin/services/refund.service.js).
+    refundedAmount: {
+      type: Number,
+      default: 0,
+    },
+
     refundProcessedAt: {
       type: Date,
       default: null,
@@ -567,9 +599,50 @@ const bookingSchema = new mongoose.Schema(
       default: null,
     },
 
+    // "Arrived" proof: the partner's GPS at the tap was within
+    // ARRIVED_MAX_DISTANCE_METERS of the customer (false = no fresh location
+    // to check). Only a verified arrival can close the booking as the
+    // customer's fault (no refund).
+    arrivedLocationVerified: {
+      type: Boolean,
+      default: false,
+    },
+
+    arrivedDistanceMeters: {
+      type: Number,
+      default: null,
+    },
+
     // Set by the reminder cron once the pre-job reminder push has gone out,
     // so the partner / helpers / customer aren't reminded repeatedly.
     preJobReminderSentAt: {
+      type: Date,
+      default: null,
+    },
+
+    // Silent "seen" signal: assigned partners whose app has shown them this
+    // job (no tap needed). Reset on every (re)assignment.
+    partnerSeen: [
+      {
+        _id: false,
+        partnerId: { type: mongoose.Schema.Types.ObjectId, ref: "Partner" },
+        seenAt: { type: Date },
+      },
+    ],
+
+    // Day-of checks (runDayOfChecks) — each fires at most once per assignment:
+    // 60 min before start, job not seen yet → urgent alert + team alert.
+    unseenAlertSentAt: {
+      type: Date,
+      default: null,
+    },
+    // 15 min before start, not on the way → "time to leave" nudge.
+    leaveNudgeSentAt: {
+      type: Date,
+      default: null,
+    },
+    // 20 min after start, still not on the way → partner + team alert.
+    lateStartAlertSentAt: {
       type: Date,
       default: null,
     },

@@ -6,9 +6,11 @@ const { success } = require("../../utils/response");
 
 const router = express.Router();
 
-router.use(authenticateAdmin, authorize(PERMISSIONS.ROLES_READ));
+// Per-route guard: like settings.routes, this router is mounted at "/", where a
+// path-less router.use() would run for every later router's requests too.
+const readRoles = [authenticateAdmin, authorize(PERMISSIONS.ROLES_READ)];
 
-router.get("/roles", async (req, res) => {
+router.get("/roles", readRoles, async (req, res) => {
   return success(
     res,
     Object.values(ADMIN_ROLES).map((role) => ({ role, permissions: ROLE_PERMISSIONS[role] || [] })),
@@ -16,7 +18,7 @@ router.get("/roles", async (req, res) => {
   );
 });
 
-router.get("/permissions", async (req, res) => {
+router.get("/permissions", readRoles, async (req, res) => {
   return success(res, Object.values(PERMISSIONS), { requestId: req.requestId });
 });
 

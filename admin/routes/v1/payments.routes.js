@@ -10,6 +10,7 @@ const authorize = require("../../middleware/authorize");
 const audit = require("../../middleware/audit");
 const Refund = require("../../models/Refund");
 const PayoutBatch = require("../../models/PayoutBatch");
+const { settleRefund, round2 } = require("../../services/refund.service");
 const { PERMISSIONS } = require("../../constants/permissions");
 const { getPagination, asSingleString } = require("../../utils/common");
 const { success, fail } = require("../../utils/response");
@@ -79,6 +80,129 @@ router.get("/transactions", authorize(PERMISSIONS.PAYMENTS_REFUND), async (req, 
     });
   }
 });
+
+/* =====================================================
+   CUSTOMER REFUNDS OWED
+   GET /api/v1/admin/payments/refunds?status=PENDING
+   Every booking with a refund on record: customer cancellations, the stale
+   auto-cancel, a payment captured for a dead booking, an admin cancel, an
+   admin-requested refund. All of those only set refundStatus=PENDING — this
+   is the one place that lists them, so they get paid instead of forgotten.
+===================================================== */
+router.get("/refunds", authorize(PERMISSIONS.PAYMENTS_REFUND), async (req, res) => {
+  try {
+    const { page, pageSize, skip, limit } = getPagination(req);
+    const status = String(asSingleString(req.query.status) || "").toUpperCase();
+    const refundStatus = ["PENDING", "PROCESSED", "FAILED"].includes(status) ? status : "PENDING";
+    const filter = { refundStatus };
+
+    const [rows, total] = await Promise.all([
+      Booking.find(filter)
+        .select(
+          "user status totalAmount refundAmount refundedAmount refundStatus refundProcessedAt cancelledBy cancelledAt cancelReason " +
+            "payment.razorpay_payment_id payment.razorpay_refund_id " +
+            "estimatePayment.status estimatePayment.razorpay_payment_id"
+        )
+        .populate("user", "name phone")
+        // Still owed: longest-waiting first. Already paid back: newest first.
+        .sort(refundStatus === "PROCESSED" ? { refundProcessedAt: -1 } : { cancelledAt: 1, _id: 1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      Booking.countDocuments(filter),
+    ]);
+
+    // A refund an admin requested by hand carries its reason on the Refund doc.
+    const requested = await Refund.find({ bookingId: { $in: rows.map((row) => row._id) } })
+      .select("bookingId reason")
+      .sort({ createdAt: 1 })
+      .lean();
+    const requestedReason = new Map(requested.map((refund) => [String(refund.bookingId), refund.reason]));
+
+    const data = rows.map((row) => {
+      // While PENDING, what to pay now is the total on record minus what
+      // already went back (a further refund on a booking refunded once before).
+      const alreadyRefunded = row.refundStatus === "PENDING" ? Number(row.refundedAmount || 0) : 0;
+      const stillOwed = row.refundStatus === "PENDING";
+      return {
+        bookingId: row._id,
+        customer: row.user ? { name: row.user.name, phone: row.user.phone } : null,
+        bookingStatus: row.status,
+        totalAmount: row.totalAmount || 0,
+        refundAmount: Math.max(0, round2(Number(row.refundAmount || 0) - alreadyRefunded)),
+        alreadyRefunded,
+        refundStatus: row.refundStatus,
+        refundProcessedAt: row.refundProcessedAt || null,
+        reason: requestedReason.get(String(row._id)) || row.cancelReason || "",
+        cancelledBy: row.cancelledBy || null,
+        cancelledAt: row.cancelledAt || null,
+        // What to look up in the Razorpay dashboard to issue the refund.
+        paymentId: row.payment?.razorpay_payment_id || null,
+        estimatePaymentId:
+          row.estimatePayment?.status === "PAID" ? row.estimatePayment.razorpay_payment_id || null : null,
+        // Set while still PENDING with nothing paid back yet = the instant
+        // auto-refund went out but its status write was lost: check the
+        // dashboard before refunding again. With an earlier refund on record
+        // it is only that refund's id, not this one's.
+        refundReference: stillOwed && alreadyRefunded > 0 ? null : row.payment?.razorpay_refund_id || null,
+      };
+    });
+
+    return success(res, data, { requestId: req.requestId, pagination: { page, pageSize, total } });
+  } catch (error) {
+    return fail(res, 500, "REFUNDS_LIST_FAILED", "Unable to fetch refunds", error.message, {
+      requestId: req.requestId,
+    });
+  }
+});
+
+/* =====================================================
+   MARK A CUSTOMER REFUND AS PAID BACK
+   POST /api/v1/admin/payments/refunds/:id/complete   (:id = booking id)
+   Body: { referenceId } — the Razorpay refund id (rfnd_…) of the refund the
+   admin already issued. Claim-first, like withdrawals: only the request that
+   flips PENDING → PROCESSED wins, so a double click or two admins can't both
+   record it.
+===================================================== */
+router.post(
+  "/refunds/:id/complete",
+  authorize(PERMISSIONS.PAYMENTS_REFUND),
+  audit("admin.payments.refund.complete"),
+  async (req, res) => {
+    try {
+      const bookingId = asSingleString(req.params.id);
+      if (!bookingId || !mongoose.Types.ObjectId.isValid(bookingId)) {
+        return fail(res, 400, "INVALID_ID", "Invalid booking id", null, { requestId: req.requestId });
+      }
+
+      const referenceId = String(req.body.referenceId || "").trim().slice(0, 100);
+      if (!referenceId) {
+        return fail(
+          res,
+          400,
+          "VALIDATION_ERROR",
+          "Enter the Razorpay refund ID of the refund you issued",
+          null,
+          { requestId: req.requestId }
+        );
+      }
+
+      const settled = await settleRefund({ bookingId, referenceId, adminId: req.adminUser.id });
+      if (!settled) {
+        const exists = await Booking.exists({ _id: bookingId });
+        return exists
+          ? fail(res, 400, "ALREADY_PROCESSED", "This booking has no pending refund", null, { requestId: req.requestId })
+          : fail(res, 404, "NOT_FOUND", "Booking not found", null, { requestId: req.requestId });
+      }
+
+      return success(res, settled, { requestId: req.requestId });
+    } catch (error) {
+      return fail(res, 500, "REFUND_COMPLETE_FAILED", "Unable to mark the refund as paid", error.message, {
+        requestId: req.requestId,
+      });
+    }
+  }
+);
 
 router.post(
   "/payouts",

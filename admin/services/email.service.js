@@ -35,4 +35,30 @@ async function sendAdminTwoFaCode(toEmail, code, expiresMinutes = 5) {
   });
 }
 
-module.exports = { sendAdminTwoFaCode };
+const escapeHtml = (value) =>
+  String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+
+// Team alert (partner not seen / late / paused …). `lines` are plain text —
+// escaped here, since they carry partner/customer-entered values.
+async function sendOpsAlertEmail(toList, subject, lines = []) {
+  await resend.emails.send({
+    from: FROM,
+    to: toList,
+    subject: `[QuickQare Ops] ${subject}`,
+    html: `
+      <div style="font-family:sans-serif;max-width:560px;margin:0 auto;padding:24px;">
+        <h2 style="margin:0 0 12px;font-size:17px;color:#111827;">${escapeHtml(subject)}</h2>
+        ${lines
+          .map((line) => `<p style="margin:0 0 8px;color:#374151;font-size:14px;">${escapeHtml(line)}</p>`)
+          .join("")}
+        <p style="margin-top:20px;color:#9ca3af;font-size:12px;">Sent automatically by QuickQare. The booking's Timeline in the admin panel has the same entry.</p>
+      </div>
+    `,
+  });
+}
+
+module.exports = { sendAdminTwoFaCode, sendOpsAlertEmail };

@@ -1,6 +1,23 @@
 const Address = require("../models/Address");
+const { parseReceiverContact } = require("../utils/receiverContact");
 
 const VALID_LABELS = ["Home", "Work", "Hotel", "Other"];
+
+// The receiver ("who will receive the service") the app sends with an address.
+// A request that doesn't mention it at all (an older app build, the Home screen's
+// quick save) leaves whatever is stored; one that sends it blank clears it.
+const readReceiver = (body) => {
+  if (body.receiverName === undefined && body.receiverPhone === undefined) return { fields: {} };
+
+  const parsed = parseReceiverContact(body.receiverName, body.receiverPhone);
+  if (parsed.error) return { error: parsed.error };
+
+  return {
+    fields: parsed.provided
+      ? { receiverName: parsed.name, receiverPhone: parsed.phone }
+      : { receiverName: null, receiverPhone: null },
+  };
+};
 
 exports.getAddresses = async (req, res) => {
   try {
@@ -32,6 +49,11 @@ exports.saveAddress = async (req, res) => {
       return res.status(400).json({ success: false, message: "address, pincode, latitude and longitude are required" });
     }
 
+    const receiver = readReceiver(req.body);
+    if (receiver.error) {
+      return res.status(400).json({ success: false, message: receiver.error });
+    }
+
     const normalizedLabel = VALID_LABELS.includes(label) ? label : "Home";
     const lat = Number(latitude);
     const lng = Number(longitude);
@@ -57,6 +79,7 @@ exports.saveAddress = async (req, res) => {
           area:         area         ? String(area).trim()         : null,
           houseDetails: houseDetails ? String(houseDetails).trim() : null,
           landmark:     landmark     ? String(landmark).trim()     : null,
+          ...receiver.fields,
         },
         { new: true }
       );
@@ -78,6 +101,7 @@ exports.saveAddress = async (req, res) => {
       area:         area         ? String(area).trim()         : null,
       houseDetails: houseDetails ? String(houseDetails).trim() : null,
       landmark:     landmark     ? String(landmark).trim()     : null,
+      ...receiver.fields,
       isDefault,
     });
 
@@ -98,7 +122,12 @@ exports.updateAddress = async (req, res) => {
       return res.status(400).json({ success: false, message: "address, pincode, latitude and longitude are required" });
     }
 
-    const normalizedLabel = ["Home", "Work", "Hotel", "Other"].includes(label) ? label : "Home";
+    const receiver = readReceiver(req.body);
+    if (receiver.error) {
+      return res.status(400).json({ success: false, message: receiver.error });
+    }
+
+    const normalizedLabel = VALID_LABELS.includes(label) ? label : "Home";
 
     const updated = await Address.findOneAndUpdate(
       { _id: req.params.id, user: req.user._id },
@@ -112,6 +141,7 @@ exports.updateAddress = async (req, res) => {
         area:         area         ? String(area).trim()         : null,
         houseDetails: houseDetails ? String(houseDetails).trim() : null,
         landmark:     landmark     ? String(landmark).trim()     : null,
+        ...receiver.fields,
       },
       { new: true }
     );
