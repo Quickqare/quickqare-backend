@@ -1,7 +1,7 @@
 /**
  * Security-audit fixes:
  *  - OTP sends are capped per client IP (SMS cost abuse across many numbers),
- *    shared by the customer and partner send routes; failed sends don't count.
+ *    shared by the customer and partner send routes; every attempt counts.
  *  - Google geocoding: only real 6-digit pincodes reach Google, "no such
  *    pincode" answers are cached, public geo routes share a per-IP daily cap,
  *    and booking create rejects non-numeric pincodes.
@@ -109,11 +109,8 @@ const makePartner = (extra = {}) =>
 /* ---------------- #2 OTP SMS cost cap ---------------- */
 
 describe("OTP sends are capped per IP across different numbers", () => {
-  test("customer + partner send routes share one per-IP budget; failed sends don't count", async () => {
+  test("customer + partner send routes share one per-IP budget", async () => {
     mockMsg91Success();
-
-    // A malformed number is rejected (400) before any SMS — must not use budget.
-    expect((await call("POST", "/api/auth/send-otp", { body: { phone: "123" } })).status).toBe(400);
 
     // Three successful sends to three DIFFERENT numbers (cap is 3 in this test).
     expect(
@@ -144,6 +141,37 @@ describe("OTP sends are capped per IP across different numbers", () => {
     // Exactly three SMS went out.
     const sends = global.fetch.mock.calls.filter(([u]) => String(u).includes("/api/v5/otp?"));
     expect(sends).toHaveLength(3);
+  });
+});
+
+describe("OTP per-IP cap can't be dodged by hanging up", () => {
+  test("requests the client aborts before the response still count", async () => {
+    // Slow MSG91 so the client can disconnect while the SMS is being sent.
+    global.fetch = jest.fn(
+      () =>
+        new Promise((resolve) =>
+          setTimeout(() => resolve({ ok: true, status: 200, json: async () => ({ type: "success" }) }), 150)
+        )
+    );
+    const sendAndHangUp = async (phone) => {
+      const controller = new AbortController();
+      const pending = realFetch(`${url}/api/auth/send-otp`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ phone }),
+        signal: controller.signal,
+      }).catch(() => null);
+      setTimeout(() => controller.abort(), 40);
+      await pending;
+      await new Promise((r) => setTimeout(r, 200)); // let the server finish
+    };
+
+    // The whole suite shares one IP bucket; earlier tests may have used it, so
+    // just hang up until the cap must have been reached.
+    for (let i = 0; i < 4; i += 1) await sendAndHangUp(`90000002${10 + i}`);
+
+    const after = await call("POST", "/api/auth/send-otp", { body: { phone: "9000000299" } });
+    expect(after.status).toBe(429);
   });
 });
 

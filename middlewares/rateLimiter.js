@@ -459,9 +459,11 @@ exports.adminLoginDailyLimiter = rateLimit({
    nothing against one client sending a single OTP to each of thousands of
    DIFFERENT numbers — and authLimiter, the only IP-keyed limiter on the send
    routes, skips successful requests, so every SMS that actually went out was
-   free. These count exactly the requests that sent an SMS (a 2xx answer;
-   rejected/invalid requests are skipped) per client IP, and are shared by the
-   customer and partner send routes so both apps draw on one budget.
+   free. These count EVERY send attempt per client IP (shared by the customer
+   and partner send routes, so both apps draw on one budget). They deliberately
+   do not use skipFailedRequests: express-rate-limit refunds a request whose
+   client hangs up before the response, so a caller could send each SMS and
+   disconnect to never be counted.
    Defaults leave room for several people behind one carrier NAT address;
    tune with OTP_SEND_IP_HOURLY_MAX / OTP_SEND_IP_DAILY_MAX.
 ===================================================== */
@@ -476,8 +478,6 @@ exports.otpSendIpHourlyLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
 
-  skipFailedRequests: true, // only SMS that were actually sent count
-
   keyGenerator: (req) => `otp-send-ip:${ipKeyGenerator(req.ip)}`,
 
   handler: otpSendIpLimited("Too many OTP requests from this network. Please try again later."),
@@ -489,8 +489,6 @@ exports.otpSendIpDailyLimiter = rateLimit({
 
   standardHeaders: true,
   legacyHeaders: false,
-
-  skipFailedRequests: true,
 
   keyGenerator: (req) => `otp-send-ip-daily:${ipKeyGenerator(req.ip)}`,
 
