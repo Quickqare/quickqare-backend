@@ -573,6 +573,13 @@ const bookingSchema = new mongoose.Schema(
       default: null,
     },
 
+    // Automatic Razorpay refund bookkeeping (services/autoRefund.service.js):
+    // a short lease while a refund is being sent, how many automatic tries were
+    // made, and the last error — so a stuck refund is visible, not silent.
+    refundProcessingAt: { type: Date, default: null },
+    refundAttempts: { type: Number, default: 0 },
+    refundLastError: { type: String, default: null },
+
     /* ======================
        ARRIVAL TRACKING
     ====================== */

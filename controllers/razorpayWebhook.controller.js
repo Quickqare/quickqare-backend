@@ -2,6 +2,7 @@ const crypto = require("crypto");
 const Booking = require("../models/Booking");
 const { finalizePaidBooking } = require("../services/paymentFinalize.service");
 const logger = require("../utils/logger");
+const { handleRefundWebhook } = require("../services/autoRefund.service");
 
 /**
  * =====================================================
@@ -19,7 +20,7 @@ const logger = require("../utils/logger");
  * Configure in Razorpay Dashboard → Webhooks:
  *   URL:    https://api.quickqare.in/api/payment/webhook
  *   Secret: RAZORPAY_WEBHOOK_SECRET (env)
- *   Events: payment.captured, payment.failed
+ *   Events: payment.captured, payment.failed, refund.processed, refund.failed
  */
 exports.handleRazorpayWebhook = async (req, res) => {
   try {
@@ -69,6 +70,8 @@ exports.handleRazorpayWebhook = async (req, res) => {
       await handlePaymentCaptured(paymentEntity);
     } else if (eventType === "payment.failed" && paymentEntity) {
       await handlePaymentFailed(paymentEntity);
+    } else if ((eventType === "refund.processed" || eventType === "refund.failed") && event?.payload?.refund?.entity) {
+      await handleRefundWebhook(eventType, event.payload.refund.entity);
     }
     // Other events are acknowledged and ignored.
   } catch (error) {

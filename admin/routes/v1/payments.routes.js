@@ -101,7 +101,7 @@ router.get("/refunds", authorize(PERMISSIONS.PAYMENTS_REFUND), async (req, res) 
         .select(
           "user status totalAmount refundAmount refundedAmount refundStatus refundProcessedAt cancelledBy cancelledAt cancelReason " +
             "payment.razorpay_payment_id payment.razorpay_refund_id " +
-            "estimatePayment.status estimatePayment.razorpay_payment_id"
+            "estimatePayment.status estimatePayment.razorpay_payment_id refundAttempts refundLastError payment.status"
         )
         .populate("user", "name phone")
         // Still owed: longest-waiting first. Already paid back: newest first.
@@ -144,6 +144,14 @@ router.get("/refunds", authorize(PERMISSIONS.PAYMENTS_REFUND), async (req, res) 
         // auto-refund went out but its status write was lost: check the
         // dashboard before refunding again. With an earlier refund on record
         // it is only that refund's id, not this one's.
+        // Whether the system can pay this through Razorpay itself, and why an
+        // automatic try did not go through (shown next to the Send button).
+        canAutoRefund:
+          row.payment?.status === "PAID" &&
+          !!row.payment?.razorpay_payment_id &&
+          row.estimatePayment?.status !== "PAID",
+        autoRefundError: row.refundLastError || null,
+        autoRefundAttempts: Number(row.refundAttempts || 0),
         refundReference: stillOwed && alreadyRefunded > 0 ? null : row.payment?.razorpay_refund_id || null,
       };
     });
@@ -177,11 +185,19 @@ router.post(
 
       const referenceId = String(req.body.referenceId || "").trim().slice(0, 100);
       if (!referenceId) {
+        // No refund ID typed = "send it for me": pay it through Razorpay now.
+        const { issueAutoRefund } = require("../../../services/autoRefund.service");
+        const auto = await issueAutoRefund(bookingId, { adminId: req.adminUser.id });
+        if (auto.status === "processed") {
+          return success(res, { bookingId, refundStatus: "PROCESSED", referenceId: auto.refundId, auto: true }, { requestId: req.requestId });
+        }
         return fail(
           res,
           400,
-          "VALIDATION_ERROR",
-          "Enter the Razorpay refund ID of the refund you issued",
+          "AUTO_REFUND_UNAVAILABLE",
+          auto.status === "failed"
+            ? `Razorpay refused the refund: ${auto.error}`
+            : "This refund can't be sent automatically (no captured payment, an on-site estimate payment, or nothing pending). Issue it in the Razorpay dashboard and enter its refund ID.",
           null,
           { requestId: req.requestId }
         );

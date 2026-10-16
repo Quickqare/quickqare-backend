@@ -47,6 +47,7 @@ const PAYOUT_RETRY_AFTER_MS = 5 * 60 * 1000; // 5 minutes
 // payout "failed" for manual admin intervention. creditWallet is idempotent,
 // so re-running a partially-credited booking is safe.
 const PAYOUT_MAX_RETRIES = 5;
+const REFUND_SWEEP_INTERVAL_MS = 5 * 60 * 1000; // every 5 minutes
 const SLOT_LOCK_CHECK_INTERVAL_MS = 5 * 60 * 1000; // every 5 minutes
 
 // QUEUED bookings (paid 24h+ ahead) are dispatched the evening before — from
@@ -1190,6 +1191,8 @@ function initCronJobs() {
     { name: "enforceAdvanceAckDeadlines", fn: enforceAdvanceAckDeadlines, interval: REMINDER_INTERVAL_MS },
     { name: "sendHelperInviteReminders", fn: sendHelperInviteReminders, interval: REMINDER_INTERVAL_MS },
     { name: "retryPendingPayouts", fn: retryPendingPayouts, interval: PAYOUT_RETRY_INTERVAL_MS },
+    // Pays owed customer refunds through Razorpay (services/autoRefund.service).
+    { name: "sweepPendingRefunds", fn: () => require("./autoRefund.service").sweepPendingRefunds(), interval: REFUND_SWEEP_INTERVAL_MS },
     { name: "detectNoShowPartners", fn: detectNoShowPartners, interval: CHECK_INTERVAL_MS },
     // Partner duty (partnerDuty.service): summaries, day-of checks, pauses.
     { name: "sendEveningSummaries", fn: sendEveningSummaries, interval: REMINDER_INTERVAL_MS },

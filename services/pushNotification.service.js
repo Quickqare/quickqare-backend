@@ -168,6 +168,17 @@ const CUSTOMER_STATUS_MESSAGES = {
         ? `Your booking was cancelled. A refund of ₹${Math.round(Number(refundAmount))} is being processed.`
         : "Your booking was cancelled. Open the app for details.",
   },
+  // Automatic Razorpay refund: sent, then confirmed by Razorpay's webhook.
+  REFUND_INITIATED: {
+    title: "Refund initiated",
+    body: ({ refundAmount } = {}) =>
+      `Your refund of ₹${Math.round(Number(refundAmount) || 0)} has been initiated. It usually reaches your account in 5–7 working days.`,
+  },
+  REFUND_PROCESSED: {
+    title: "Refund processed",
+    body: ({ refundAmount } = {}) =>
+      `Your refund of ₹${Math.round(Number(refundAmount) || 0)} has been processed. It should show in your account within a few working days.`,
+  },
   // The technician sent a parts / extra-work estimate that waits for the
   // customer's approval and payment. No amount in the text: what the customer
   // pays includes taxes the estimate doesn't, and the app shows the real figure.

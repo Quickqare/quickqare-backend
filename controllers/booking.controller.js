@@ -2370,48 +2370,16 @@ exports.cancelBookingByUser = async (req, res) => {
       });
     }
 
-    // Instant refund for the grace-period free-cancel window (100% refund)
-    // — the customer shouldn't have to wait for manual back-office processing
-    // when they're getting their money back in full. Any other tier/percent
-    // still goes through the existing manual PENDING → back-office flow.
-    // Falls back to PENDING on any Razorpay error; the cancellation itself
-    // has already succeeded above regardless.
-    if (
-      refund.amount > 0 &&
-      refund.percent === 100 &&
-      graceApplied &&
-      booking.payment?.razorpay_payment_id &&
-      process.env.RAZORPAY_KEY_ID &&
-      process.env.RAZORPAY_KEY_SECRET
-    ) {
+    // Pay the refund back through Razorpay right away (services/autoRefund.service).
+    // Any failure leaves it PENDING; the 5-minute sweep retries, and after the
+    // retry limit it shows in admin Payments → Customer Refunds for a person.
+    if (refund.amount > 0) {
       try {
-        const Razorpay = require("razorpay");
-        const razorpay = new Razorpay({
-          key_id: process.env.RAZORPAY_KEY_ID,
-          key_secret: process.env.RAZORPAY_KEY_SECRET,
-        });
-        const razorpayRefund = await razorpay.payments.refund(
-          booking.payment.razorpay_payment_id,
-          { amount: Math.round(refund.amount * 100) }
-        );
-        // Persist the refund id BEFORE flipping to PROCESSED: if this write
-        // is lost, back office retries a PENDING refund against Razorpay,
-        // which rejects the duplicate — the stored id makes reconciling that
-        // case a dashboard lookup instead of a support ticket.
-        await Booking.updateOne(
-          { _id: booking._id },
-          {
-            $set: {
-              refundStatus: "PROCESSED",
-              refundProcessedAt: new Date(),
-              "payment.razorpay_refund_id": razorpayRefund?.id || null,
-            },
-          }
-        );
-        updatedBooking.refundStatus = "PROCESSED";
+        const { issueAutoRefund } = require("../services/autoRefund.service");
+        const auto = await issueAutoRefund(booking._id);
+        if (auto.status === "processed") updatedBooking.refundStatus = "PROCESSED";
       } catch (refundErr) {
         console.error(`[refund] Auto-refund failed for booking ${booking._id}:`, refundErr.message);
-        // Leave refundStatus as PENDING (already set above) for manual processing.
       }
     }
 
