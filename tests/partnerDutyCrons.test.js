@@ -269,16 +269,6 @@ describe("inactivity pause", () => {
 });
 
 describe("urgent-jobs switch and suspensions", () => {
-  test("the night reset switches urgent jobs off; a daytime run leaves them on", async () => {
-    const partner = await makePartner({ isOnline: true });
-
-    expect(await duty.resetUrgentAvailabilityAtNight(at(0, 14))).toBe(0);
-    expect((await Partner.findById(partner._id).lean()).isOnline).toBe(true);
-
-    expect(await duty.resetUrgentAvailabilityAtNight(at(0, 22, 30))).toBe(1);
-    expect((await Partner.findById(partner._id).lean()).isOnline).toBe(false);
-  });
-
   test("an expired strike suspension lifts by itself", async () => {
     const due = await makePartner({ isAvailable: false, suspendedUntil: at(-1, 10) });
     const running = await makePartner({ isAvailable: false, suspendedUntil: at(2, 10) });

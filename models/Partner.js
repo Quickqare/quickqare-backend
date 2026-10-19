@@ -137,6 +137,14 @@ const partnerSchema = new mongoose.Schema(
       default: 1,
     },
 
+    // What the partner claimed in the app. Never grants anything — only an
+    // admin sets skillTier — but lets the approval review see "claims technician".
+    requestedSkillTier: {
+      type: Number,
+      enum: [1, 2],
+      default: 1,
+    },
+
     /* =====================
        MEHENDI SPECIALIZATIONS
        Subcategory names the partner can perform.

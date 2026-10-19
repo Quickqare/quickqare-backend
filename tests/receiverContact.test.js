@@ -368,6 +368,11 @@ describe("what the partner apps show as 'the customer'", () => {
     await Booking.updateOne({ _id: live._id }, { $set: { "helpers.0.partnerId": helper._id } });
     const done = await makeBooking({ ...forSomeoneElse, status: "COMPLETED", helpers: [{ partnerId: helper._id }] });
     const noReceiver = await makeBooking({ helpers: [{ partnerId: helper._id }] });
+    await require("../models/TechnicianHelper").create({
+      technician: tech._id,
+      helper: helper._id,
+      status: "ACTIVE",
+    });
 
     const res = await call(listHelperJobs, { partner: helper });
     const byId = new Map(res.body.jobs.map((j) => [j.bookingId, j]));

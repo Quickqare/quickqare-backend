@@ -14,7 +14,6 @@ const {
 // Every partner lookup/create keys on the canonical number (utils/phone) — the
 // same one MSG91 verifies — so reformatting a phone can't open a second account.
 const { toNationalPhone, INVALID_PHONE_MESSAGE } = require("../utils/phone");
-const { isQuietHours } = require("../utils/partnerHours");
 const { partnerWithSignedSelfie } = require("../utils/sensitiveFileUrl");
 
 const PARTNER_TOKEN_TTL = String(process.env.PARTNER_JWT_TTL || "90d");
@@ -186,9 +185,11 @@ exports.registerPartner = async (req, res) => {
       resolvedCategories = [serviceCategory];
     }
 
-    // AC skill tier — only "2" (Technician) is meaningful; everything else
-    // (Non-Technician, Mehendi, missing) stays at tier 1.
-    const resolvedSkillTier = Number(skillTier) === 2 ? 2 : 1;
+    // AC skill tier — a new partner always starts at tier 1. A "Technician"
+    // claim is only recorded (requestedSkillTier) for the admin to vet; the
+    // admin promotes via partners → skill tier.
+    const resolvedSkillTier = 1;
+    const requestedSkillTier = Number(skillTier) === 2 ? 2 : 1;
 
     const resolvedMehendiSpecializations =
       Array.isArray(mehendiSpecializations) && mehendiSpecializations.length > 0
@@ -207,6 +208,7 @@ exports.registerPartner = async (req, res) => {
       serviceCategories: resolvedCategories,
       services: resolvedServices, // Save specific skills to DB
       skillTier: resolvedSkillTier,
+      requestedSkillTier,
       mehendiSpecializations: resolvedMehendiSpecializations,
 
       // backward compatibility
@@ -279,9 +281,8 @@ exports.loginPartner = async (req, res) => {
       });
     }
 
-    // Login switches urgent jobs on — except at night (quiet hours), when the
-    // switch stays off until the partner turns it on in the morning.
-    partner.isOnline = !isQuietHours();
+    // Login switches urgent jobs on; the partner can switch it off themselves.
+    partner.isOnline = true;
     partner.lastOnlineAt = new Date();
     await partner.save();
 
@@ -391,9 +392,8 @@ exports.verifyPartnerOtp = async (req, res) => {
       });
     }
 
-    // Login switches urgent jobs on — except at night (quiet hours), when the
-    // switch stays off until the partner turns it on in the morning.
-    partner.isOnline = !isQuietHours();
+    // Login switches urgent jobs on; the partner can switch it off themselves.
+    partner.isOnline = true;
     partner.lastOnlineAt = new Date();
     await partner.save();
 
@@ -495,9 +495,8 @@ exports.exchangePartnerMsg91AccessToken = async (req, res) => {
       });
     }
 
-    // Login switches urgent jobs on — except at night (quiet hours), when the
-    // switch stays off until the partner turns it on in the morning.
-    partner.isOnline = !isQuietHours();
+    // Login switches urgent jobs on; the partner can switch it off themselves.
+    partner.isOnline = true;
     partner.lastOnlineAt = new Date();
     await partner.save();
 
@@ -638,21 +637,15 @@ exports.setPartnerStatus = async (req, res) => {
       });
     }
 
-    // isOnline is the "Available for urgent jobs" switch (it only gates jobs
-    // starting within 30 minutes). Urgent jobs pause at night: during quiet
-    // hours it can't be switched on — the night reset would undo it anyway.
-    const quietHours = isQuietHours();
-    req.partner.isOnline = isOnline && !quietHours;
+    // isOnline is the partner-controlled "Available for urgent jobs" switch (it
+    // only gates jobs starting within 30 minutes).
+    req.partner.isOnline = isOnline;
     await req.partner.save();
 
     res.json({
       success: true,
-      message:
-        isOnline && quietHours
-          ? "Urgent jobs are paused at night (10 PM–7 AM). Switch them on again in the morning."
-          : `Urgent jobs ${req.partner.isOnline ? "on" : "off"}`,
+      message: `Urgent jobs ${req.partner.isOnline ? "on" : "off"}`,
       isOnline: req.partner.isOnline,
-      quietHours,
     });
   } catch (error) {
     console.error("setPartnerStatus error:", error);

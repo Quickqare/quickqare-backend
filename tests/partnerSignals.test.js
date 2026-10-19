@@ -224,16 +224,15 @@ describe("what the app is told", () => {
     expect(new Date(res.body.bookings[0].scheduledStartAt).getTime()).toBe(start.getTime());
   });
 
-  test("the urgent-jobs switch can't be switched on at night", async () => {
+  test("the urgent-jobs switch is partner-controlled, day or night", async () => {
     const partner = await makePartner({ isOnline: false });
 
     setClock(new Date(2026, 9, 12, 23, 0));
     const night = await call(setPartnerStatus, { partner, body: { isOnline: true } });
-    expect(night.body).toMatchObject({ success: true, isOnline: false, quietHours: true });
+    expect(night.body).toMatchObject({ success: true, isOnline: true });
 
-    setClock(new Date(2026, 9, 13, 9, 0));
-    const morning = await call(setPartnerStatus, { partner, body: { isOnline: true } });
-    expect(morning.body).toMatchObject({ success: true, isOnline: true, quietHours: false });
+    const off = await call(setPartnerStatus, { partner, body: { isOnline: false } });
+    expect(off.body).toMatchObject({ success: true, isOnline: false });
   });
 });
 

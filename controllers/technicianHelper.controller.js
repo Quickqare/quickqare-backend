@@ -58,7 +58,7 @@ exports.inviteHelper = async (req, res) => {
     }
 
     const helper = await Partner.findOne({ phone }).select(
-      "_id name phone isBlocked fcmToken"
+      "_id name phone isBlocked approvalStatus fcmToken"
     );
     if (!helper) {
       return res.status(404).json({
@@ -79,6 +79,15 @@ exports.inviteHelper = async (req, res) => {
       return res.status(400).json({
         success: false,
         message: "This partner account is blocked",
+      });
+    }
+
+    // A helper sees customer addresses and phones, so they must be vetted first.
+    if (helper.approvalStatus !== "APPROVED") {
+      return res.status(400).json({
+        success: false,
+        message:
+          "This partner is not approved yet. They can be invited once the QuickQare team approves their account.",
       });
     }
 
@@ -273,7 +282,15 @@ exports.respondToInvitation = async (req, res) => {
       return res.json({ success: true, message: "Invitation declined" });
     }
 
-    // ACCEPT — a helper can only have one active technician.
+    // ACCEPT — only an approved partner can work as a helper.
+    if (req.partner.approvalStatus !== "APPROVED") {
+      return res.status(403).json({
+        success: false,
+        message: "Your account must be approved before you can work as a helper.",
+      });
+    }
+
+    // a helper can only have one active technician.
     const otherActive = await TechnicianHelper.findOne({
       helper: helperId,
       status: "ACTIVE",
@@ -399,6 +416,27 @@ exports.setBookingHelpers = async (req, res) => {
     booking.helpers = snapshots;
     await booking.save();
 
+    // Tell helpers who were taken off this job so they don't turn up.
+    const keptIds = new Set(uniqueIds);
+    const removedIds = [...previousIds].filter((id) => !keptIds.has(id));
+    if (removedIds.length > 0) {
+      const removedHelpers = await Partner.find({ _id: { $in: removedIds } }).select("fcmToken");
+      for (const h of removedHelpers) {
+        if (h.fcmToken) {
+          sendPushNotification(
+            h.fcmToken,
+            "Removed from a Job",
+            `${req.partner.name} removed you from a job on ${
+              booking.scheduledDate
+                ? new Date(booking.scheduledDate).toLocaleDateString()
+                : "an upcoming date"
+            }.`,
+            { type: "HELPER_JOB_REMOVED", bookingId: String(booking._id) }
+          );
+        }
+      }
+    }
+
     // Notify only helpers newly added to this job.
     for (const h of newlyAdded) {
       if (h.fcmToken) {
@@ -432,9 +470,19 @@ exports.setBookingHelpers = async (req, res) => {
 ===================================================== */
 exports.listHelperJobs = async (req, res) => {
   try {
+    // Upcoming/active jobs only while the helper is still linked to that
+    // technician; finished jobs stay visible as history.
+    const link =
+      req.partner.approvalStatus === "APPROVED"
+        ? await TechnicianHelper.findOne({ helper: req.partner._id, status: "ACTIVE" }).lean()
+        : null;
+    const liveStatuses = HELPER_JOB_STATUSES.filter((s) => s !== "COMPLETED");
+    const visible = [{ status: "COMPLETED" }];
+    if (link) visible.push({ partner: link.technician, status: { $in: liveStatuses } });
+
     const bookings = await Booking.find({
       "helpers.partnerId": req.partner._id,
-      status: { $in: HELPER_JOB_STATUSES },
+      $or: visible,
     })
       .populate("user", "name phone")
       .populate("partner", "name phone")

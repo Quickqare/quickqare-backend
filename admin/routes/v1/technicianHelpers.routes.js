@@ -10,6 +10,7 @@ const { asSingleString, getPagination } = require("../../utils/common");
 const { success, fail } = require("../../utils/response");
 const { sendPushNotification } = require("../../../services/pushNotification.service");
 const { isACCategory } = require("../../../services/scheduling_service");
+const { removeHelperFromUpcomingBookings } = require("../../../services/technicianHelper.service");
 
 const router = express.Router();
 
@@ -105,6 +106,8 @@ router.post("/:id/remove", audit("admin.technicianHelpers.remove"), async (req, 
     row.removedBy = req.adminUser?.id || null;
     await row.save();
 
+    if (row.helper?._id) await removeHelperFromUpcomingBookings(row.helper._id);
+
     if (row.helper?.fcmToken) {
       sendPushNotification(
         row.helper.fcmToken,
@@ -157,12 +160,17 @@ router.post("/reassign", audit("admin.technicianHelpers.reassign"), async (req, 
     }
 
     const [helper, technician] = await Promise.all([
-      Partner.findById(helperId).select("_id name fcmToken isBlocked").lean(),
+      Partner.findById(helperId).select("_id name fcmToken isBlocked approvalStatus").lean(),
       Partner.findById(newTechnicianId).select("_id name skillTier serviceCategories isBlocked fcmToken").lean(),
     ]);
 
     if (!helper) {
       return fail(res, 404, "NOT_FOUND", "Helper partner not found", null, { requestId: req.requestId });
+    }
+    if (helper.approvalStatus !== "APPROVED") {
+      return fail(res, 400, "VALIDATION_ERROR", "Helper partner is not approved", null, {
+        requestId: req.requestId,
+      });
     }
     if (!technician) {
       return fail(res, 404, "NOT_FOUND", "Technician partner not found", null, { requestId: req.requestId });
@@ -195,6 +203,7 @@ router.post("/reassign", audit("admin.technicianHelpers.reassign"), async (req, 
       { helper: helperId, status: "ACTIVE" },
       { $set: { status: "REMOVED", removedAt: new Date(), removedBy: req.adminUser?.id || null } }
     );
+    await removeHelperFromUpcomingBookings(helperId);
 
     // Activate (or create) the link to the new technician.
     let row = await TechnicianHelper.findOne({ technician: newTechnicianId, helper: helperId });

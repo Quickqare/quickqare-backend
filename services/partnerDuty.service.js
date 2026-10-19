@@ -15,8 +15,8 @@
  *                    team. (T+2h no-show → reschedule lives in cron.service.)
  *   Inactivity pause no app use for INACTIVITY_PAUSE_DAYS (or app removed) →
  *                    no new jobs until they next open the app.
- *   Urgent switch    isOnline ("Available for urgent jobs") is switched off
- *                    every night; it only gates jobs starting within 30 min.
+ *   Urgent switch    isOnline ("Available for urgent jobs") is partner-controlled;
+ *                    it only gates jobs starting within 30 min.
  *   Suspensions      strike suspensions lift by themselves.
  *
  * Every cron function takes `now` so tests can drive the clock.
@@ -504,20 +504,6 @@ async function pauseInactivePartners(now = new Date()) {
    URGENT-JOBS SWITCH + SUSPENSIONS
 ===================================================== */
 
-/**
- * isOnline is the partner's "Available for urgent jobs" switch — it only gates
- * bookings starting within 30 minutes. It is switched off every night so a
- * partner never stays "available" while asleep; they switch it on in the
- * morning. Runs through quiet hours, so a night-time login is reset too.
- */
-async function resetUrgentAvailabilityAtNight(now = new Date()) {
-  if (!isQuietHours(now)) return 0;
-  const result = await Partner.updateMany({ isOnline: true }, { $set: { isOnline: false } });
-  const count = result?.modifiedCount || 0;
-  if (count) console.log(`[duty] Night reset: urgent-jobs switch turned off for ${count} partner(s)`);
-  return count;
-}
-
 /** End strike suspensions whose date has passed (new jobs resume). */
 async function liftExpiredSuspensions(now = new Date()) {
   const due = await Partner.find({
@@ -584,7 +570,6 @@ module.exports = {
   runDayOfChecks,
   alertOpsAboutPausedPartner,
   pauseInactivePartners,
-  resetUrgentAvailabilityAtNight,
   liftExpiredSuspensions,
   computePartnerStanding,
 };

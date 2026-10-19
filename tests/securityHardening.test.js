@@ -228,11 +228,13 @@ describe("services update by an approved partner", () => {
     expect((await Partner.findById(partner._id)).approvalStatus).toBe("PENDING");
   });
 
-  test("a partner not yet approved can choose freely during onboarding", async () => {
+  test("a partner not yet approved can choose services, but Technician is only a claim for the admin", async () => {
     const fresh = await makePartner();
     const res = await update(fresh, { serviceIds: [String(acService._id)], skillTier: 2 });
     expect(res.statusCode).toBe(200);
-    expect((await Partner.findById(fresh._id)).skillTier).toBe(2);
+    const saved = await Partner.findById(fresh._id);
+    expect(saved.skillTier).toBe(1);
+    expect(saved.requestedSkillTier).toBe(2);
     // unrelated category stays selectable before approval too
     expect(mehendiService).toBeTruthy();
   });

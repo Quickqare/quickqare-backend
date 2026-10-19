@@ -65,7 +65,6 @@ const {
   sendMorningSummaries,
   runDayOfChecks,
   pauseInactivePartners,
-  resetUrgentAvailabilityAtNight,
   liftExpiredSuspensions,
 } = require("./partnerDuty.service");
 
@@ -1199,7 +1198,6 @@ function initCronJobs() {
     { name: "sendMorningSummaries", fn: sendMorningSummaries, interval: REMINDER_INTERVAL_MS },
     { name: "runDayOfChecks", fn: runDayOfChecks, interval: REMINDER_INTERVAL_MS },
     { name: "pauseInactivePartners", fn: pauseInactivePartners, interval: CHECK_INTERVAL_MS },
-    { name: "resetUrgentAvailabilityAtNight", fn: resetUrgentAvailabilityAtNight, interval: CHECK_INTERVAL_MS },
     { name: "liftExpiredSuspensions", fn: liftExpiredSuspensions, interval: CHECK_INTERVAL_MS },
     { name: "purgeOldPartnerJobHistory", fn: purgeOldPartnerJobHistory, interval: HISTORY_CLEANUP_INTERVAL_MS },
     // Learning loop (fixes 3/4/5) — nightly, log-only for the shadow report.

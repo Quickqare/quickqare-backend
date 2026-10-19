@@ -26,6 +26,16 @@ const RESTORE_AVAILABILITY = Object.freeze({
   dailyCancelCount: 0,
 });
 
+// Salon for Women / Hair Studio for Women / Makeup, Saree & Styling are one
+// professional group; show it as a single label in the partners list.
+const BEAUTY_WOMEN_KEYS = ["salon for women", "hair studio for women", "makeup saree styling"];
+const displayServiceCategory = (cats) => {
+  const list = (Array.isArray(cats) ? cats : []).filter(Boolean);
+  if (list.length <= 1) return list[0] || "";
+  const keys = list.map((c) => String(c).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim());
+  return keys.every((k) => BEAUTY_WOMEN_KEYS.includes(k)) ? "Beauty for Women" : list[0];
+};
+
 const router = express.Router();
 
 router.use(authenticateAdmin, authorize(PERMISSIONS.PARTNERS_APPROVE));
@@ -84,8 +94,9 @@ router.get("/", async (req, res) => {
       name: partner.name,
       phone: partner.phone,
       gender: partner.gender || "",
-      serviceCategory: partner.serviceCategories?.[0] || "",
+      serviceCategory: displayServiceCategory(partner.serviceCategories),
       skillTier: partner.skillTier || 1,
+      requestedSkillTier: partner.requestedSkillTier || 1,
       pincode: partner.currentPincode || "",
       status: partner.isBlocked ? "BLOCKED" : partner.approvalStatus || "PENDING",
       rating: partner.rating || 0,
@@ -408,7 +419,7 @@ router.patch("/:id/approval", audit("admin.partners.approval"), async (req, res)
           approvalStatus: status,
           verificationStatus: status === "APPROVED" ? "VERIFIED" : "REJECTED",
           isBlocked: false,
-          ...(status === "APPROVED" ? RESTORE_AVAILABILITY : {}),
+          ...(status === "APPROVED" ? { ...RESTORE_AVAILABILITY, isOnline: true } : {}),
         },
       },
       { new: true }

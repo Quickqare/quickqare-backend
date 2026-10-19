@@ -342,6 +342,32 @@ router.patch(
         );
       }
 
+      const AdminSetting = require("../../models/AdminSetting");
+      const settings = await AdminSetting.findOne().select("payoutsFreezed emergencyLockdown").lean();
+      if (settings?.emergencyLockdown || settings?.payoutsFreezed) {
+        return fail(res, 423, "PAYOUTS_FROZEN", "Payouts are frozen in Settings. Unfreeze before marking paid.", null, {
+          requestId: req.requestId,
+        });
+      }
+
+      // The destination must still be an admin-verified account. A rejected or
+      // re-submitted (pending) account means the details need a fresh look —
+      // reject this request (the amount returns to the wallet) or wait.
+      const pending = await Withdrawal.findOne({ _id: id, status: "PENDING" }).select("partnerId").lean();
+      if (pending) {
+        const account = await PartnerPayoutAccount.findOne({ partnerId: pending.partnerId }).select("status").lean();
+        if (!account || account.status !== "VERIFIED") {
+          return fail(
+            res,
+            409,
+            "ACCOUNT_NOT_VERIFIED",
+            "This partner's payout account is no longer verified. Verify it again, or reject this request.",
+            null,
+            { requestId: req.requestId }
+          );
+        }
+      }
+
       const withdrawal = await Withdrawal.findOneAndUpdate(
         { _id: id, status: "PENDING" },
         {

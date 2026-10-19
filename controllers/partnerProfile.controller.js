@@ -11,8 +11,24 @@ const { partnerWithSignedSelfie } = require("../utils/sensitiveFileUrl");
    + SERVICE AREAS (PINCODE)
    PRODUCTION READY
 ============================= */
+// Salon for Women, Hair Studio for Women and Makeup, Saree & Styling are one
+// professional group ("Beauty for Women"): one partner can hold services from
+// all three, so they are exempt from the single-category rule as a set.
+const BEAUTY_WOMEN_CATEGORIES = ["salon for women", "hair studio for women", "makeup saree styling"];
+const normBeautyName = (v) => String(v || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+const isBeautyWomenName = (v) => BEAUTY_WOMEN_CATEGORIES.includes(normBeautyName(v));
+
 exports.updatePartnerServices = async (req, res) => {
   try {
+    // Services are set once during onboarding; after that only admin can
+    // change them (partners see them read-only under My Services).
+    if (Array.isArray(req.partner?.services) && req.partner.services.length > 0) {
+      return res.status(403).json({
+        success: false,
+        message: "Your services can only be changed by QuickQare support. Please contact support.",
+      });
+    }
+
     const { serviceIds, serviceAreas, skillTier, mehendiSpecializations } = req.body;
 
     /* =============================
@@ -64,27 +80,44 @@ exports.updatePartnerServices = async (req, res) => {
       .filter(Boolean);
 
     let serviceCategoryName = "Other";
+    let serviceCategoryNames = null;
 
     if (categoryIds.length > 0) {
       const uniqueCategoryIds = [...new Set(categoryIds)];
-      if (uniqueCategoryIds.length !== 1 || categoryIds.length !== validServices.length) {
+      let beautyCats = null;
+      if (uniqueCategoryIds.length > 1 && categoryIds.length === validServices.length) {
+        const cats = await Category.find({ _id: { $in: uniqueCategoryIds } }).lean();
+        if (cats.length === uniqueCategoryIds.length && cats.every((c) => isBeautyWomenName(c.name))) {
+          beautyCats = cats;
+        }
+      }
+      if (beautyCats) {
+        serviceCategoryNames = beautyCats.map((c) => c.name);
+        serviceCategoryName = serviceCategoryNames[0];
+      } else if (uniqueCategoryIds.length !== 1 || categoryIds.length !== validServices.length) {
         return res.status(400).json({
           success: false,
           message: "Only one service category is allowed",
         });
       }
 
-      const category = await Category.findById(uniqueCategoryIds[0]).lean();
-      if (!category) {
-        return res.status(400).json({
-          success: false,
-          message: "Invalid service category",
-        });
+      if (!beautyCats) {
+        const category = await Category.findById(uniqueCategoryIds[0]).lean();
+        if (!category) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid service category",
+          });
+        }
+        serviceCategoryName = category.name;
       }
-      serviceCategoryName = category.name;
     } else {
       const uniqueLegacy = [...new Set(legacyCategories)];
-      if (uniqueLegacy.length !== 1 || legacyCategories.length !== validServices.length) {
+      if (uniqueLegacy.length > 1 && legacyCategories.length === validServices.length && uniqueLegacy.every(isBeautyWomenName)) {
+        // Beauty for Women group on legacy-category services.
+        serviceCategoryNames = uniqueLegacy;
+        serviceCategoryName = uniqueLegacy[0];
+      } else if (uniqueLegacy.length !== 1 || legacyCategories.length !== validServices.length) {
         return res.status(400).json({
           success: false,
           message: "Only one service category is allowed",
@@ -117,9 +150,12 @@ exports.updatePartnerServices = async (req, res) => {
          into gas/PCB technician jobs.
     ============================= */
     const isApproved = req.partner?.approvalStatus === "APPROVED";
-    const currentCategory = String(req.partner?.serviceCategories?.[0] || "").trim().toLowerCase();
+    const currentCats = (req.partner?.serviceCategories || []).map((c) => String(c || "").trim().toLowerCase()).filter(Boolean);
+    const newCats = (serviceCategoryNames || [serviceCategoryName]).map((c) => c.trim().toLowerCase());
+    // Moving within the beauty group is not a switch; leaving it (or entering it) is.
+    const sameGroup = currentCats.length > 0 && currentCats.every(isBeautyWomenName) && newCats.every(isBeautyWomenName);
     const switchesCategory =
-      isApproved && currentCategory !== "" && currentCategory !== serviceCategoryName.trim().toLowerCase();
+      isApproved && currentCats.length > 0 && !sameGroup && !newCats.some((c) => currentCats.includes(c));
     const approvalUpdate = switchesCategory ? { approvalStatus: "PENDING" } : {};
 
     /* =============================
@@ -143,7 +179,11 @@ exports.updatePartnerServices = async (req, res) => {
           message: "Moving up to Technician needs a skills check by the QuickQare team. Please contact support.",
         });
       }
-      skillTierUpdate.skillTier = tier;
+      // Tier 2 is admin-granted only. Keep it if the partner already holds it
+      // in the same category; otherwise record the claim for admin review.
+      const currentTier = Number(req.partner?.skillTier || 1);
+      skillTierUpdate.skillTier = tier === 2 && currentTier === 2 && !switchesCategory ? 2 : 1;
+      skillTierUpdate.requestedSkillTier = tier;
     }
 
     /* =============================
@@ -192,7 +232,7 @@ exports.updatePartnerServices = async (req, res) => {
         services,
         serviceAreas,
         h3ServiceCells: [...new Set(h3ServiceCells)],
-        serviceCategories: [serviceCategoryName],
+        serviceCategories: serviceCategoryNames || [serviceCategoryName],
         ...skillTierUpdate,
         ...mehendiUpdate,
         ...approvalUpdate,

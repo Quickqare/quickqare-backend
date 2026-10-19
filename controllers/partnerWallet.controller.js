@@ -199,6 +199,15 @@ exports.requestWithdrawal = async (req, res) => {
       return res.status(400).json({ success: false, message: "Maximum withdrawal amount is ₹10,000 per request" });
     }
 
+    const AdminSetting = require("../admin/models/AdminSetting");
+    const settings = await AdminSetting.findOne().select("payoutsFreezed emergencyLockdown").lean();
+    if (settings?.emergencyLockdown || settings?.payoutsFreezed) {
+      return res.status(503).json({
+        success: false,
+        message: "Withdrawals are temporarily paused. Please try again later.",
+      });
+    }
+
     await releasePendingEarnings(partnerId);
 
     // Normalize first so withdrawableBalance is populated (migrates any legacy
