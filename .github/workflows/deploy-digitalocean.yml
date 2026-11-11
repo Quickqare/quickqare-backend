@@ -16,7 +16,14 @@ jobs:
         with:
           node-version: "20"
           cache: "npm"
-      - run: npm ci
+      # --include=optional: .npmrc sets omit=optional (keeps firebase-admin's
+      # vulnerable optional chain out of the production image), but Jest 30's
+      # module resolver ships its native binary as an optional dependency.
+      # Without it every `npm test` dies with "Module <rootDir>/tests/setup.js
+      # ... was not found" — which failed this job (and so skipped every
+      # deploy) on each push since at least Aug 2026. Test job only; the
+      # Dockerfile still installs with --omit=optional.
+      - run: npm ci --include=optional
       - run: npm run lint
       - run: npm test
         env:

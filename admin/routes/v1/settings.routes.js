@@ -93,6 +93,12 @@ router.patch("/settings", manageSettings, audit("admin.settings.update"), async 
       if (c.arrivedCancelPenaltyInr !== undefined) {
         settings.cancellation.arrivedCancelPenaltyInr = Math.max(0, Number(c.arrivedCancelPenaltyInr) || 0);
       }
+      if (c.freeCancelLimit !== undefined) {
+        settings.cancellation.freeCancelLimit = Math.max(0, Math.min(100, Math.round(Number(c.freeCancelLimit) || 0)));
+      }
+      if (c.freeCancelLimitDays !== undefined) {
+        settings.cancellation.freeCancelLimitDays = Math.max(1, Math.min(365, Math.round(Number(c.freeCancelLimitDays) || 30)));
+      }
     }
 
     // Mehendi hand-package pricing. Per rule: tierPrices replaces the whole

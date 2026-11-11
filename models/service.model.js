@@ -157,17 +157,19 @@ const serviceSchema = new mongoose.Schema(
       default: [],
     },
 
-    // Grace-period override for last-minute orders. An order
-    // PLACED with less than appliesBelowLeadHours of notice before its
-    // scheduled start lands inside a low/zero refund tier the moment it's
-    // booked; this gives the customer windowMinutes from booking creation to
-    // cancel for a 100% refund before the normal tiers take over.
-    // windowMinutes = 0 disables the grace entirely.
-    // appliesBelowLeadHours = 0 (with windowMinutes > 0) applies the grace to
-    // every order regardless of notice.
+    // Free-cancel ("grace") window — 100% refund for a short time after
+    // booking, ahead of the refund tiers (services/cancellationGrace.service.js).
+    // allBookingsWindowMinutes: window every booking gets (0 = off).
+    // windowMinutes: longer window for an order PLACED with less than
+    // appliesBelowLeadHours of notice (it lands in a low/zero tier the moment
+    // it's booked). windowMinutes = 0 disables it; appliesBelowLeadHours = 0
+    // (with windowMinutes > 0) applies it to every order regardless of notice.
+    // endsWhenPartnerOnTheWay: the window closes once the professional sets off.
     cancellationGrace: {
-      windowMinutes:         { type: Number, default: 0, min: 0 },
-      appliesBelowLeadHours: { type: Number, default: 0, min: 0 },
+      allBookingsWindowMinutes: { type: Number, default: 0, min: 0 },
+      windowMinutes:            { type: Number, default: 0, min: 0 },
+      appliesBelowLeadHours:    { type: Number, default: 0, min: 0 },
+      endsWhenPartnerOnTheWay:  { type: Boolean, default: true },
     },
 
     // Ordered photo gallery shown to the customer (Cloudinary URLs) — kept as

@@ -155,6 +155,8 @@ exports.createBookingValidator = [
     .notEmpty()
     .withMessage("pincode is required")
     .isLength({ min: 6, max: 6 })
+    .withMessage("pincode must be 6 digits")
+    .matches(/^\d{6}$/)
     .withMessage("pincode must be 6 digits"),
 
   body("address")

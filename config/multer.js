@@ -1,7 +1,7 @@
 const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
-const { extFromMime } = require("../utils/imageExt");
+const { randomUploadName } = require("../utils/imageExt");
 const { verifiedImageContentType } = require("../utils/imageContentType");
 
 // General image uploads (services, cakes, banners, customer reference photos,
@@ -40,8 +40,7 @@ function buildStorage() {
       filename: (_req, file, cb) => {
         // Extension is forced from the verified MIME type, never the client
         // filename — a ".html"/".svg" upload can't be served as active content.
-        const ext = extFromMime(file.mimetype);
-        cb(null, `${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`);
+        cb(null, randomUploadName(file.mimetype));
       },
     });
   }
@@ -66,14 +65,14 @@ function buildStorage() {
           : "public, max-age=31536000, immutable"
       ),
     key: (req, file, cb) => {
-      // Extension from the verified MIME type, not the client filename.
-      const ext = extFromMime(file.mimetype);
+      // Name = timestamp + CSPRNG suffix; extension from the verified MIME
+      // type, never the client filename (utils/imageExt randomUploadName).
       // Folder priority: route-resolved req.uploadFolder (see routes/uploadRoutes.js),
       // then "selfie" fieldname → job-selfies (booking start-selfie route),
       // then the catch-all media/.
       const folder =
         req.uploadFolder || (file.fieldname === "selfie" ? "job-selfies" : "media");
-      const filename = `${folder}/${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
+      const filename = `${folder}/${randomUploadName(file.mimetype)}`;
       cb(null, filename);
     },
   });

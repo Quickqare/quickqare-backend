@@ -7,9 +7,10 @@ const mongoose = require("mongoose");
 
 const mockRefund = jest.fn();
 const mockFetchRefunds = jest.fn();
+const mockFetchPayment = jest.fn();
 jest.mock("razorpay", () =>
   jest.fn().mockImplementation(() => ({
-    payments: { refund: mockRefund, fetchMultipleRefund: mockFetchRefunds },
+    payments: { refund: mockRefund, fetchMultipleRefund: mockFetchRefunds, fetch: mockFetchPayment },
   }))
 );
 jest.mock("../services/pushNotification.service", () => ({
@@ -21,7 +22,7 @@ process.env.RAZORPAY_KEY_SECRET = "secret";
 
 const Booking = require("../models/Booking");
 const Refund = require("../admin/models/Refund");
-const { issueAutoRefund, sweepPendingRefunds, handleRefundWebhook } = require("../services/autoRefund.service");
+const { issueAutoRefund, sweepPendingRefunds, handleRefundWebhook, canAutoRefund } = require("../services/autoRefund.service");
 const { notifyCustomerOfBookingStatus } = require("../services/pushNotification.service");
 
 async function makeBooking(overrides = {}) {
@@ -45,6 +46,7 @@ beforeEach(() => {
   jest.clearAllMocks();
   mockFetchRefunds.mockResolvedValue({ items: [] });
   mockRefund.mockResolvedValue({ id: "rfnd_1" });
+  mockFetchPayment.mockResolvedValue({ id: "pay_1", status: "captured" });
 });
 
 describe("issueAutoRefund", () => {
@@ -146,9 +148,89 @@ describe("issueAutoRefund", () => {
     }
   });
 
-  test("an unpaid booking is never refunded", async () => {
-    const b = await makeBooking({ payment: { status: "PENDING", razorpay_payment_id: "pay_1" } });
+  test("a live unpaid booking is never refunded", async () => {
+    const b = await makeBooking({ status: "PENDING_PAYMENT", payment: { status: "PENDING", razorpay_payment_id: "pay_1" } });
     expect((await issueAutoRefund(b._id)).status).toBe("skipped");
+    expect(mockRefund).not.toHaveBeenCalled();
+  });
+});
+
+// The verify and webhook paths flag a payment captured for a dead booking as a
+// full PENDING refund and store the payment id, but never mark it PAID.
+describe("a payment captured after the booking was cancelled", () => {
+  const late = (overrides = {}) =>
+    makeBooking({
+      payment: { status: "PENDING", razorpay_payment_id: "pay_1", razorpay_order_id: "order_1" },
+      refundAmount: 500,
+      ...overrides,
+    });
+
+  test("is refunded in full once Razorpay confirms it was captured", async () => {
+    const b = await late();
+    const out = await issueAutoRefund(b._id);
+    expect(out.status).toBe("processed");
+    expect(mockFetchPayment).toHaveBeenCalledWith("pay_1");
+    expect(mockRefund).toHaveBeenCalledWith("pay_1", expect.objectContaining({ amount: 50000 }));
+    const after = await Booking.findById(b._id).lean();
+    expect(after.refundStatus).toBe("PROCESSED");
+    expect(after.refundedAmount).toBe(500);
+    expect(after.payment.razorpay_refund_id).toBe("rfnd_1");
+  });
+
+  test("is not refunded while Razorpay says it is not captured, and is retried", async () => {
+    const b = await late();
+    mockFetchPayment.mockResolvedValue({ id: "pay_1", status: "authorized" });
+    const out = await issueAutoRefund(b._id);
+    expect(out.status).toBe("failed");
+    expect(mockRefund).not.toHaveBeenCalled();
+    const after = await Booking.findById(b._id).lean();
+    expect(after.refundStatus).toBe("PENDING");
+    expect(after.refundLastError).toMatch(/authorized, not captured/);
+    mockFetchPayment.mockResolvedValue({ id: "pay_1", status: "captured" });
+    expect((await issueAutoRefund(b._id)).status).toBe("processed");
+  });
+
+  test("adopts a refund Razorpay already made instead of sending again", async () => {
+    const b = await late();
+    mockFetchPayment.mockResolvedValue({ id: "pay_1", status: "refunded" });
+    mockFetchRefunds.mockResolvedValue({ items: [{ id: "rfnd_old", amount: 50000, status: "processed" }] });
+    expect((await issueAutoRefund(b._id)).status).toBe("processed");
+    expect(mockRefund).not.toHaveBeenCalled();
+    expect((await Booking.findById(b._id).lean()).payment.razorpay_refund_id).toBe("rfnd_old");
+  });
+
+  test("the sweep picks it up", async () => {
+    const b = await late();
+    await sweepPendingRefunds();
+    expect(mockRefund).toHaveBeenCalledTimes(1);
+    expect((await Booking.findById(b._id).lean()).refundStatus).toBe("PROCESSED");
+  });
+
+  test("a completed booking with a late capture is left to a person", async () => {
+    const b = await late({ status: "COMPLETED" });
+    expect((await issueAutoRefund(b._id)).reason).toBe("not_eligible");
+    await sweepPendingRefunds();
+    expect(mockRefund).not.toHaveBeenCalled();
+    expect(mockFetchPayment).not.toHaveBeenCalled();
+    expect((await Booking.findById(b._id).lean()).refundStatus).toBe("PENDING");
+  });
+
+  test("a paid on-site estimate still sends it to a person", async () => {
+    const b = await late({ estimatePayment: { status: "PAID", totalAmount: 100 } });
+    expect((await issueAutoRefund(b._id)).reason).toBe("not_eligible");
+  });
+});
+
+describe("canAutoRefund (what the admin refunds list offers)", () => {
+  const row = (over) => ({ status: "CANCELLED", payment: { status: "PAID", razorpay_payment_id: "pay_1" }, ...over });
+
+  test("matches what issueAutoRefund will take", () => {
+    expect(canAutoRefund(row())).toBe(true);
+    expect(canAutoRefund(row({ status: "COMPLETED" }))).toBe(true); // PAID
+    expect(canAutoRefund(row({ payment: { status: "PENDING", razorpay_payment_id: "pay_1" } }))).toBe(true); // late capture
+    expect(canAutoRefund(row({ status: "COMPLETED", payment: { status: "PENDING", razorpay_payment_id: "pay_1" } }))).toBe(false);
+    expect(canAutoRefund(row({ payment: { status: "PAID" } }))).toBe(false); // no payment id
+    expect(canAutoRefund(row({ estimatePayment: { status: "PAID" } }))).toBe(false);
   });
 });
 

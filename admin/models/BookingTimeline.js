@@ -33,6 +33,11 @@ const bookingTimelineSchema = new mongoose.Schema(
         "PARTNER_NO_SHOW",
         "PARTNER_PAUSED",
         "START_CODE_RESET",
+        // Security-audit alerts: a booking's start code locked after repeated
+        // wrong codes, and a partner closing a booking as the customer's fault
+        // (no refund) — both raised to ops for review.
+        "START_CODE_LOCKED",
+        "CUSTOMER_FAULT_CLOSED",
       ],
       required: true,
       index: true,

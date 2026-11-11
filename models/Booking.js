@@ -424,6 +424,15 @@ const bookingSchema = new mongoose.Schema(
       default: null,
     },
 
+    // How many times this booking has been start-code locked. Only the first
+    // lock lifts by itself; later ones wait for support, so an assigned
+    // partner can't keep guessing 5 codes every 30 minutes for as long as the
+    // job lasts (startService, START_CODE_SELF_UNLOCKS).
+    startCodeLockCount: {
+      type: Number,
+      default: 0,
+    },
+
     /* ======================
        JOB-SPOT SELFIE (admin-gated via jobSelfieVerificationEnabled)
        Live selfie the partner uploads at the customer's location before
@@ -542,6 +551,24 @@ const bookingSchema = new mongoose.Schema(
     freeCancelUntil: {
       type: Date,
       default: null,
+    },
+    // The free-cancel window closes early once the professional sets off
+    // (ON_THE_WAY), even if freeCancelUntil hasn't passed.
+    freeCancelEndsOnPartnerDeparture: {
+      type: Boolean,
+      default: false,
+    },
+    // No window was given because the customer had used up their free
+    // cancels (AdminSetting.cancellation.freeCancelLimit).
+    freeCancelBlockedByLimit: {
+      type: Boolean,
+      default: false,
+    },
+    // The customer cancelled inside the free-cancel window (100% refund) —
+    // counted against freeCancelLimit.
+    cancelledInFreeWindow: {
+      type: Boolean,
+      default: false,
     },
 
     /* ======================

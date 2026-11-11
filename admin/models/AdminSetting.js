@@ -60,6 +60,11 @@ const adminSettingSchema = new mongoose.Schema(
     ============================================= */
     cancellation: {
       arrivedCancelPenaltyInr: { type: Number, default: 100 },
+      // Free-cancel abuse limit: a customer who cancelled inside the
+      // free-cancel window freeCancelLimit times in freeCancelLimitDays gets
+      // no window on new bookings. 0 = no limit.
+      freeCancelLimit:     { type: Number, default: 3, min: 0 },
+      freeCancelLimitDays: { type: Number, default: 30, min: 1 },
     },
 
     /* =============================================

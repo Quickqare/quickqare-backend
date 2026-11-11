@@ -1737,9 +1737,21 @@ async function findEligiblePartnersForBooking(booking, pincodes = [], opts = {})
   if (booking?.scheduledDate) {
     const scheduledKey = normalizeDateKey(booking.scheduledDate);
     const beforeCount = partners.length;
+    const _now = new Date();
     partners = partners.filter((p) => {
       const blocked = Array.isArray(p.unavailableDates) ? p.unavailableDates : [];
-      return !blocked.some((d) => normalizeDateKey(d) === scheduledKey);
+      if (blocked.some((d) => normalizeDateKey(d) === scheduledKey)) return false;
+      // Admin-set window: minLeadDays and/or availableFrom (calendar-day compare,
+      // YYYY-MM-DD keys sort lexicographically).
+      const lead = Number(p.minLeadDays) || 0;
+      if (lead > 0) {
+        const earliest = normalizeDateKey(
+          new Date(_now.getFullYear(), _now.getMonth(), _now.getDate() + lead)
+        );
+        if (scheduledKey < earliest) return false;
+      }
+      if (p.availableFrom && scheduledKey < normalizeDateKey(p.availableFrom)) return false;
+      return true;
     });
     if (!partners.length && beforeCount > 0) {
       console.warn(

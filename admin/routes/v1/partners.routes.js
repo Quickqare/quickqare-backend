@@ -12,7 +12,7 @@ const audit = require("../../middleware/audit");
 const { PERMISSIONS } = require("../../constants/permissions");
 const { asSingleString, getPagination, escapeRegex } = require("../../utils/common");
 const { success, fail } = require("../../utils/response");
-const { getSensitiveFileUrl } = require("../../../utils/sensitiveFileUrl");
+const { getSensitiveFileUrl, signStartSelfies } = require("../../../utils/sensitiveFileUrl");
 const { trackApiCall } = require("../../../services/apiCallTracker.service");
 
 // Approving / unblocking a partner restores them fully: an auto-suspension
@@ -336,6 +336,11 @@ router.get("/:id", async (req, res) => {
       return fail(res, 404, "NOT_FOUND", "Partner not found", null, { requestId: req.requestId });
     }
 
+    // Partner selfie + job-spot selfies are private uploads: hand out signed
+    // links (no-op unless R2_PRIVATE_UPLOADS is on), like GET /:id/stats does.
+    if (partner.selfieUrl) partner.selfieUrl = await getSensitiveFileUrl(partner.selfieUrl);
+    await signStartSelfies(recentBookings);
+
     return success(
       res,
       {
@@ -593,6 +598,56 @@ router.patch("/:id/skill-tier", audit("admin.partners.skillTier"), async (req, r
     return success(res, updated, { requestId: req.requestId });
   } catch (error) {
     return fail(res, 500, "PARTNER_SKILL_TIER_FAILED", "Unable to update partner skill tier", error.message, {
+      requestId: req.requestId,
+    });
+  }
+});
+
+// Booking window: minLeadDays (0 = same day ok) and/or availableFrom (YYYY-MM-DD
+// or null). Enforced by the slot engine / assignment.
+router.patch("/:id/booking-window", audit("admin.partners.bookingWindow"), async (req, res) => {
+  try {
+    const partnerId = asSingleString(req.params.id);
+    if (!partnerId || !mongoose.Types.ObjectId.isValid(partnerId)) {
+      return fail(res, 400, "INVALID_ID", "Invalid partner id", null, { requestId: req.requestId });
+    }
+    const set = {};
+    if (req.body.minLeadDays !== undefined) {
+      const n = Number(req.body.minLeadDays);
+      if (!Number.isInteger(n) || n < 0 || n > 60) {
+        return fail(res, 400, "VALIDATION_ERROR", "minLeadDays must be a whole number from 0 to 60", null, {
+          requestId: req.requestId,
+        });
+      }
+      set.minLeadDays = n;
+    }
+    if (req.body.availableFrom !== undefined) {
+      const raw = req.body.availableFrom;
+      if (raw === null || raw === "") {
+        set.availableFrom = null;
+      } else {
+        const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(raw));
+        const d = m ? new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 12)) : null;
+        if (!d || isNaN(d.getTime())) {
+          return fail(res, 400, "VALIDATION_ERROR", "availableFrom must be YYYY-MM-DD or empty", null, {
+            requestId: req.requestId,
+          });
+        }
+        set.availableFrom = d; // midday UTC: same calendar day in UTC and IST
+      }
+    }
+    if (!Object.keys(set).length) {
+      return fail(res, 400, "VALIDATION_ERROR", "Nothing to update", null, { requestId: req.requestId });
+    }
+    const updated = await Partner.findByIdAndUpdate(partnerId, { $set: set }, { new: true })
+      .select("_id name minLeadDays availableFrom")
+      .lean();
+    if (!updated) {
+      return fail(res, 404, "NOT_FOUND", "Partner not found", null, { requestId: req.requestId });
+    }
+    return success(res, updated, { requestId: req.requestId });
+  } catch (error) {
+    return fail(res, 500, "PARTNER_BOOKING_WINDOW_FAILED", "Unable to update booking window", error.message, {
       requestId: req.requestId,
     });
   }

@@ -1,7 +1,7 @@
 const multer = require("multer");
 const multerS3 = require("multer-s3");
 const r2Client = require("./r2");
-const { extFromMime } = require("../utils/imageExt");
+const { randomUploadName } = require("../utils/imageExt");
 const { verifiedImageContentType } = require("../utils/imageContentType");
 
 const ALLOWED_MIME_TYPES = ["image/jpeg", "image/png", "image/webp"];
@@ -25,10 +25,10 @@ const r2Upload = multer({
     // only through short-lived signed links (utils/sensitiveFileUrl).
     cacheControl: "private, max-age=3600",
     key: (_req, file, cb) => {
-      // Extension from the verified MIME type, not the client filename.
-      const ext = extFromMime(file.mimetype);
+      // Name = timestamp + CSPRNG suffix; extension from the verified MIME
+      // type, never the client filename (utils/imageExt randomUploadName).
       const folder = file.fieldname === "selfie" ? "selfies" : "kyc";
-      const filename = `${folder}/${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
+      const filename = `${folder}/${randomUploadName(file.mimetype)}`;
       cb(null, filename);
     },
   }),

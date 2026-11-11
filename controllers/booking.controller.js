@@ -35,6 +35,11 @@ const {
 } = require("../utils/pricing");
 const { validateCouponForAmount } = require("../services/coupon.service");
 const {
+  createGraceCollector,
+  computeFreeCancelFields,
+  isFreeCancelActive,
+} = require("../services/cancellationGrace.service");
+const {
   SLOT_LOCK_MINUTES,
   commitSlotReservation,
   markSlotLockPaid,
@@ -111,6 +116,7 @@ const roundAmount = (value) =>
 // Commission / partner-share maths lives in partnerSettlement.service so the
 // wallet credit here and the earnings shown in the partner app share one source.
 const { calculatePartnerSettlement } = require("../services/partnerSettlement.service");
+const { alertOps } = require("../services/opsAlert.service");
 
 /* =======================
    USER CREATES BOOKING
@@ -295,21 +301,11 @@ exports.createBooking = async (req, res) => {
     let finalPrimaryService = primaryService;
     const categorySlugCache = new Map();
     const allServiceCancellationTiers = [];
-    // Most lenient grace-period config across booked services.
-    // graceLeadThresholdHours is Infinity when a service applies its grace to
-    // every order (appliesBelowLeadHours = 0).
-    let graceWindowMinutes = 0;
-    let graceLeadThresholdHours = 0;
-    const collectCancellationGrace = (service) => {
-      const windowMinutes = Number(service?.cancellationGrace?.windowMinutes) || 0;
-      if (windowMinutes <= 0) return;
-      const threshold = Number(service?.cancellationGrace?.appliesBelowLeadHours) || 0;
-      graceWindowMinutes = Math.max(graceWindowMinutes, windowMinutes);
-      graceLeadThresholdHours = Math.max(
-        graceLeadThresholdHours,
-        threshold > 0 ? threshold : Infinity
-      );
-    };
+    // Most lenient free-cancel (grace) config across booked services.
+    const {
+      collect: collectCancellationGrace,
+      merged: mergedCancellationGrace,
+    } = createGraceCollector();
     // Add-ons that can't be booked on their own — they need a Mehendi hand
     // design in the same booking. "Mehendi for guests" isn't a feet option but
     // shares the same restriction (a guest add-on with no main design is not a
@@ -693,18 +689,14 @@ exports.createBooking = async (req, res) => {
     // across all booked services. Falls back to [] (global defaults apply at cancel time).
     const cancellationTiersSnapshot = mergeCancellationTiers(allServiceCancellationTiers);
 
-    // Grace-period free-cancel deadline: an order placed with less notice than
-    // graceLeadThresholdHours starts inside a low/zero refund tier through no
-    // fault of the customer — give them graceWindowMinutes from NOW to cancel
-    // at 100% (checked ahead of the tiers in cancelBookingByUser).
-    let freeCancelUntil = null;
-    if (graceWindowMinutes > 0) {
-      const leadHoursAtBooking =
-        (scheduledStartAt.getTime() - Date.now()) / (1000 * 60 * 60);
-      if (leadHoursAtBooking < graceLeadThresholdHours) {
-        freeCancelUntil = new Date(Date.now() + graceWindowMinutes * 60 * 1000);
-      }
-    }
+    // Free-cancel window from NOW (every-booking window, longer for
+    // last-minute orders, none past the customer's free-cancel limit) —
+    // checked ahead of the tiers in cancelBookingByUser.
+    const freeCancelFields = await computeFreeCancelFields({
+      merged: mergedCancellationGrace,
+      scheduledStartAt,
+      userId: req.user._id,
+    });
 
     const bookingPayload = {
       user: req.user._id,
@@ -751,7 +743,7 @@ exports.createBooking = async (req, res) => {
       status: "PENDING_PAYMENT",
       cancellationTiersSnapshot,
       cancellationPolicyTypeSnapshot: "BEFORE_SERVICE",
-      freeCancelUntil,
+      ...freeCancelFields,
     };
 
     // PHASE A — expensive per-window eligibility reads + fast availability
@@ -1430,9 +1422,14 @@ exports.uploadStartSelfie = async (req, res) => {
    code from their booking screen to the partner. No SMS involved.
    5 wrong codes lock the booking for START_CODE_LOCK_MINUTES (admin can
    reset sooner); routes add a per-partner rate limit (startCodeLimiter).
+   Only the first START_CODE_SELF_UNLOCKS lock(s) lift by themselves — after
+   that support must reset it — so unsupervised guessing is capped at
+   10 of the 9,000 codes per booking instead of 5 every 30 minutes. Every
+   lock is raised to ops (timeline + alert).
 ======================= */
 const MAX_START_CODE_ATTEMPTS = 5;
 const START_CODE_LOCK_MINUTES = 30;
+const START_CODE_SELF_UNLOCKS = 1;
 exports.startService = async (req, res) => {
   try {
     const { bookingId } = req.params;
@@ -1484,12 +1481,19 @@ exports.startService = async (req, res) => {
         });
       }
 
-      // A lock lifts by itself START_CODE_LOCK_MINUTES after it was set.
+      // A lock lifts by itself START_CODE_LOCK_MINUTES after it was set —
+      // but only the first START_CODE_SELF_UNLOCKS of them (bookings locked
+      // before startCodeLockCount existed count as their first lock).
       await Booking.updateOne(
         {
           _id: booking._id,
           startCodeAttempts: { $gte: MAX_START_CODE_ATTEMPTS },
           startCodeLockedAt: { $ne: null, $lte: new Date(Date.now() - START_CODE_LOCK_MINUTES * 60 * 1000) },
+          $or: [
+            { startCodeLockCount: { $lte: START_CODE_SELF_UNLOCKS } },
+            { startCodeLockCount: { $exists: false } },
+            { startCodeLockCount: null },
+          ],
         },
         { $set: { startCodeAttempts: 0, startCodeLockedAt: null } }
       );
@@ -1509,22 +1513,51 @@ exports.startService = async (req, res) => {
         { new: true }
       ).select("startCodeAttempts");
       if (!reserved) {
+        const supportOnly = Number(booking.startCodeLockCount || 0) > START_CODE_SELF_UNLOCKS;
         return res.status(429).json({
           code: "START_CODE_LOCKED",
-          message: `Too many wrong codes. Try again in ${START_CODE_LOCK_MINUTES} minutes, or ask support to reset it.`,
+          message: supportOnly
+            ? "Too many wrong codes. Ask support to reset the start code."
+            : `Too many wrong codes. Try again in ${START_CODE_LOCK_MINUTES} minutes, or ask support to reset it.`,
         });
       }
 
       if (submitted !== booking.serviceStartCode) {
         const used = Number(reserved.startCodeAttempts || 0);
+        let lockCount = null;
         if (used >= MAX_START_CODE_ATTEMPTS) {
-          await Booking.updateOne({ _id: booking._id }, { $set: { startCodeLockedAt: new Date() } });
+          // Stamp (and count) the lock once — the startCodeLockedAt: null guard
+          // keeps concurrent wrong attempts from counting it twice.
+          const locked = await Booking.findOneAndUpdate(
+            { _id: booking._id, startCodeLockedAt: null },
+            { $set: { startCodeLockedAt: new Date() }, $inc: { startCodeLockCount: 1 } },
+            { new: true }
+          ).select("startCodeLockCount");
+          if (locked) {
+            lockCount = Number(locked.startCodeLockCount || 0);
+            alertOps({
+              event: "start_code_locked",
+              timelineEvent: "START_CODE_LOCKED",
+              bookingIds: [booking._id],
+              subject: `Start code locked on booking ${booking._id}`,
+              lines: [
+                `Booking ${booking._id}: ${MAX_START_CODE_ATTEMPTS} wrong start codes from partner ${pid}.`,
+                lockCount > START_CODE_SELF_UNLOCKS
+                  ? `Lock #${lockCount} — stays locked until support resets it. Check with the customer before resetting.`
+                  : `Lock #${lockCount} — lifts by itself in ${START_CODE_LOCK_MINUTES} minutes.`,
+              ],
+              data: { bookingId: String(booking._id), partnerId: pid, lockCount },
+            }).catch(() => {});
+          }
         }
         const remaining = Math.max(MAX_START_CODE_ATTEMPTS - used, 0);
+        const supportOnly = lockCount !== null && lockCount > START_CODE_SELF_UNLOCKS;
         return res.status(400).json({
           code: "START_CODE_INVALID",
           message: remaining
             ? `Incorrect code. ${remaining} attempt${remaining === 1 ? "" : "s"} left.`
+            : supportOnly
+            ? "Incorrect code. Locked — ask support to reset the start code."
             : `Incorrect code. Locked for ${START_CODE_LOCK_MINUTES} minutes — or ask support to reset it.`,
         });
       }
@@ -1982,8 +2015,16 @@ exports.cancelBooking = async (req, res) => {
        actually transitions, so a lost race never penalises the partner for a
        cancellation that didn't happen.
     ===================== */
-    const hasCustomerFaultReport = (booking.partnerReports || []).some((r) =>
-      ARRIVED_CUSTOMER_FAULT_REPORTS.includes(r.issueType)
+    // Only a report THIS partner filed at the door during THIS arrival counts —
+    // not a teammate's, and not one from an earlier visit/reassignment.
+    const arrivedAtMs = booking.arrivedAt ? new Date(booking.arrivedAt).getTime() : null;
+    const hasCustomerFaultReport = (booking.partnerReports || []).some(
+      (r) =>
+        ARRIVED_CUSTOMER_FAULT_REPORTS.includes(r.issueType) &&
+        String(r.partner) === String(partner._id) &&
+        r.statusAtReport === "ARRIVED" &&
+        arrivedAtMs !== null &&
+        new Date(r.createdAt).getTime() >= arrivedAtMs
     );
     // The no-refund close needs proof the partner really waited at the door:
     // a location-verified arrival AND CUSTOMER_FAULT_MIN_WAIT_MINUTES since it
@@ -2066,6 +2107,32 @@ exports.cancelBooking = async (req, res) => {
       await releaseSlotCapacityByBookingId(booking._id, { releaseReason: "partner_arrived_cancel" });
       await syncPartnerOperationalState(partner._id);
       clearSlotCache(booking.pincode, booking.scheduledDate);
+
+      // The customer forfeits the whole payment on the partner's word: the
+      // arrival location comes from the partner's own device, so it can be
+      // faked. Every such close goes to ops (booking timeline + alert) so a
+      // disputed one can be checked and refunded from the admin panel.
+      alertOps({
+        event: "customer_fault_closed",
+        timelineEvent: "CUSTOMER_FAULT_CLOSED",
+        bookingIds: [booking._id],
+        subject: `Booking ${booking._id} closed as customer's fault — no refund`,
+        lines: [
+          `Partner ${partner._id} closed booking ${booking._id} at the door ("${reason}").`,
+          `Paid ₹${Number(booking.totalAmount || 0)}, refunded ₹0. Arrival check: ${
+            booking.arrivedDistanceMeters != null ? `${booking.arrivedDistanceMeters} m from the address` : "no distance"
+          }, arrived ${booking.arrivedAt ? new Date(booking.arrivedAt).toISOString() : "unknown"}.`,
+          "Review if the customer disputes it.",
+        ],
+        data: {
+          bookingId: String(booking._id),
+          partnerId: String(partner._id),
+          reason,
+          totalAmount: Number(booking.totalAmount || 0),
+          arrivedDistanceMeters: booking.arrivedDistanceMeters ?? null,
+          customerFaultReport: hasCustomerFaultReport,
+        },
+      }).catch(() => {});
 
       // Notify customer — booking closed, no refund
       if (global.io) {
@@ -2326,15 +2393,10 @@ exports.cancelBookingByUser = async (req, res) => {
         // of rescheduling, they get a FULL refund with no late-cancellation penalty,
         // even though the original slot time has already passed (hoursToService < 0).
         refund = { percent: 100, amount: Number(booking.totalAmount || 0) };
-      } else if (
-        booking.freeCancelUntil &&
-        Date.now() <= new Date(booking.freeCancelUntil).getTime()
-      ) {
-        // Grace-period free cancel: the order was placed with little notice
-        // (freeCancelUntil is only set at creation when the lead time was
-        // under the service's grace threshold) and would otherwise start
-        // inside a low/zero refund tier the moment it was booked. Within the
-        // grace window the customer gets 100% back regardless of tier.
+      } else if (isFreeCancelActive(booking)) {
+        // Free-cancel window (fixed at creation; closes early once the
+        // professional sets off when freeCancelEndsOnPartnerDeparture).
+        // Inside it the customer gets 100% back regardless of tier.
         refund = { percent: 100, amount: Number(booking.totalAmount || 0) };
         graceApplied = true;
       } else {
@@ -2358,6 +2420,7 @@ exports.cancelBookingByUser = async (req, res) => {
           cancelReason: String(reason).trim().slice(0, 300),
           refundAmount: refund.amount,
           refundStatus: refund.amount > 0 ? "PENDING" : "NONE",
+          cancelledInFreeWindow: graceApplied,
         }
       },
       { new: true }

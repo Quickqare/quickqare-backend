@@ -11,6 +11,7 @@ const audit = require("../../middleware/audit");
 const Refund = require("../../models/Refund");
 const PayoutBatch = require("../../models/PayoutBatch");
 const { settleRefund, round2 } = require("../../services/refund.service");
+const { canAutoRefund } = require("../../../services/autoRefund.service");
 const { PERMISSIONS } = require("../../constants/permissions");
 const { getPagination, asSingleString } = require("../../utils/common");
 const { success, fail } = require("../../utils/response");
@@ -146,10 +147,7 @@ router.get("/refunds", authorize(PERMISSIONS.PAYMENTS_REFUND), async (req, res) 
         // it is only that refund's id, not this one's.
         // Whether the system can pay this through Razorpay itself, and why an
         // automatic try did not go through (shown next to the Send button).
-        canAutoRefund:
-          row.payment?.status === "PAID" &&
-          !!row.payment?.razorpay_payment_id &&
-          row.estimatePayment?.status !== "PAID",
+        canAutoRefund: canAutoRefund(row),
         autoRefundError: row.refundLastError || null,
         autoRefundAttempts: Number(row.refundAttempts || 0),
         refundReference: stillOwed && alreadyRefunded > 0 ? null : row.payment?.razorpay_refund_id || null,

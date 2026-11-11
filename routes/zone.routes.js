@@ -8,6 +8,7 @@ const zoneController = require("../controllers/zone.controller");
 const adminAuth = require("../admin/middleware/authenticateAdmin");
 const authorize = require("../admin/middleware/authorize");
 const { PERMISSIONS } = require("../admin/constants/permissions");
+const { mapsLimiter, geoDailyLimiter } = require("../middlewares/rateLimiter");
 
 /* =====================================================
    ZONE ROUTES (PRODUCTION READY)
@@ -29,7 +30,8 @@ const { PERMISSIONS } = require("../admin/constants/permissions");
    it falls back to geocoding the pincode centroid + a lenient ring gate, which
    is coarser. Mirrors the gate used in booking.controller.createBooking.
 */
-router.get("/check", async (req, res) => {
+// Public and can geocode the pincode via Google (billed) — per-IP limits.
+router.get("/check", mapsLimiter, geoDailyLimiter, async (req, res) => {
   try {
     const { resolveZoneForPincode, resolveHubForLocation } = require("../services/zone.service");
     const { getUseH3Flag } = require("../services/assignmentEngine");

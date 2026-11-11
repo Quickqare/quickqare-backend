@@ -8,6 +8,7 @@ const audit = require("../../middleware/audit");
 const { PERMISSIONS } = require("../../constants/permissions");
 const { asSingleString, getPagination, escapeRegex } = require("../../utils/common");
 const { success, fail } = require("../../utils/response");
+const { signStartSelfies } = require("../../../utils/sensitiveFileUrl");
 
 const router = express.Router();
 
@@ -78,6 +79,9 @@ router.get("/:id", async (req, res) => {
     if (!customer) {
       return fail(res, 404, "NOT_FOUND", "Customer not found", null, { requestId: req.requestId });
     }
+
+    // Job-spot selfies are private uploads — signed links only.
+    await signStartSelfies(bookings);
 
     return success(
       res,

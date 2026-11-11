@@ -1,5 +1,6 @@
 const jwt = require("jsonwebtoken");
 const Partner = require("../models/Partner");
+const { isTokenRevoked } = require("../utils/tokenRevocation");
 
 // lastActiveAt is written at most this often per partner (any authenticated
 // request counts), so app activity costs ~one small write per few minutes.
@@ -102,9 +103,24 @@ module.exports = async (req, res, next) => {
     }
 
     /* =====================
+       SIGNED OUT (LOGOUT)
+       A token handed back at POST /api/partner/auth/logout stays dead even
+       though its signature and expiry are still valid.
+    ===================== */
+    if (await isTokenRevoked(token)) {
+      return res.status(401).json({
+        success: false,
+        message: "Your session has ended. Please log in again.",
+      });
+    }
+
+    /* =====================
        ATTACH PARTNER CONTEXT
+       partnerTokenIssuedAt lets sensitive actions (password change) require
+       a recent sign-in.
     ===================== */
     req.partner = partner;
+    req.partnerTokenIssuedAt = Number(decoded.iat) || 0;
 
     next();
   } catch (error) {

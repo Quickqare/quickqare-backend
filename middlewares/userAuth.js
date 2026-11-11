@@ -1,6 +1,7 @@
 const jwt = require("jsonwebtoken");
 const User = require("../models/User");
 const { readCookie, USER_TOKEN_COOKIE } = require("../utils/authCookie");
+const { isTokenRevoked } = require("../utils/tokenRevocation");
 
 /* =====================================================
    RESOLVE THE REQUEST'S CUSTOMER
@@ -63,6 +64,16 @@ async function resolveUser(req) {
   }
 
   /* =====================
+     SIGNED OUT (LOGOUT)
+     POST /api/auth/logout records the token, so a copied or leaked token
+     stops working when the customer signs out instead of living out its
+     90-day expiry.
+  ===================== */
+  if (await isTokenRevoked(token)) {
+    return { status: 401, message: "Your session has ended. Please log in again." };
+  }
+
+  /* =====================
      FIND USER
   ===================== */
   const user = await User.findById(userId).select("-password");
@@ -82,6 +93,12 @@ async function resolveUser(req) {
       status: 403,
       message: "Your account has been blocked. Please contact support.",
     };
+  }
+
+  // A deleted (anonymised) account never comes back, even if its status is
+  // later flipped to ACTIVE — its old tokens must stay dead.
+  if (user.isDeleted) {
+    return { status: 401, message: "This account has been deleted." };
   }
 
   return { user };

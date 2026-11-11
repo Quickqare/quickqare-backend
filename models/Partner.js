@@ -422,6 +422,20 @@ const partnerSchema = new mongoose.Schema(
       default: [],
     },
 
+    // Admin-set booking window. minLeadDays: 0 = same day allowed, 1 = from
+    // tomorrow, etc. availableFrom: no bookings before this calendar day.
+    // Both apply; the later cutoff wins.
+    minLeadDays: {
+      type: Number,
+      default: 0,
+      min: 0,
+      max: 60,
+    },
+    availableFrom: {
+      type: Date,
+      default: null,
+    },
+
     /* =====================
        LOCATION (GEO MATCHING)
     ===================== */

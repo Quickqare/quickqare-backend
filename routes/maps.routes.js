@@ -4,7 +4,7 @@ const {
   reverseGeocode,
   searchAddress,
 } = require("../controllers/maps.controller");
-const { mapsLimiter } = require("../middlewares/rateLimiter");
+const { mapsLimiter, geoDailyLimiter } = require("../middlewares/rateLimiter");
 
 /* ======================
    MAPS ROUTES
@@ -12,8 +12,8 @@ const { mapsLimiter } = require("../middlewares/rateLimiter");
    Rate-limited per IP — these are unauthenticated proxies to a billed
    Google Maps key, so cap request volume to prevent cost abuse.
 ====================== */
-router.get("/reverse", mapsLimiter, reverseGeocode);
-router.get("/search", mapsLimiter, searchAddress);
+router.get("/reverse", mapsLimiter, geoDailyLimiter, reverseGeocode);
+router.get("/search", mapsLimiter, geoDailyLimiter, searchAddress);
 
 module.exports = router;
 

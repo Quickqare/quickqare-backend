@@ -81,4 +81,22 @@ async function partnerWithSignedSelfie(partner) {
   return plain;
 }
 
-module.exports = { getSensitiveFileUrl, partnerWithSignedSelfie };
+/**
+ * Sign the job-spot selfie (photo of the partner at the customer's door) on a
+ * list of plain booking objects, in place — for admin responses that return
+ * raw bookings. Without it those screens hand out the stored public URL and
+ * show a broken image once R2_PRIVATE_UPLOADS is switched on.
+ */
+async function signStartSelfies(bookings) {
+  if (!Array.isArray(bookings)) return bookings;
+  await Promise.all(
+    bookings.map(async (booking) => {
+      if (booking?.startSelfieUrl) {
+        booking.startSelfieUrl = await getSensitiveFileUrl(booking.startSelfieUrl);
+      }
+    })
+  );
+  return bookings;
+}
+
+module.exports = { getSensitiveFileUrl, partnerWithSignedSelfie, signStartSelfies };

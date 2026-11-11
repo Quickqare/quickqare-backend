@@ -20,7 +20,12 @@ const partnerAuth = require("../middlewares/partnerAuth");
 
 const validate = require("../middlewares/validate");
 const { createBookingValidator } = require("../middlewares/validators");
-const { bookingCreateLimiter, slotsLimiter, startCodeLimiter } = require("../middlewares/rateLimiter");
+const {
+  bookingCreateLimiter,
+  slotsLimiter,
+  startCodeLimiter,
+  geoDailyLimiter,
+} = require("../middlewares/rateLimiter");
 const upload = require("../config/multer");
 
 /* =========================
@@ -68,11 +73,13 @@ router.get(
 router.get(
   "/available-slots",
   slotsLimiter,
+  geoDailyLimiter,
   bookingController.getAvailableSlots
 );
 router.post(
   "/available-slots",
   slotsLimiter,
+  geoDailyLimiter,
   bookingController.getAvailableSlots
 );
 

@@ -10,6 +10,8 @@ const router = express.Router();
 
 const TIMEZONE = "Asia/Kolkata";
 
+const round2 = (value) => Math.round(Number(value || 0) * 100) / 100;
+
 const parseDateOnly = (value, endOfDay = false) => {
   if (!value) return null;
   const suffix = endOfDay ? "T23:59:59.999Z" : "T00:00:00.000Z";
@@ -45,21 +47,63 @@ router.get("/gst", async (req, res) => {
       createdAt: { $gte: startDate, $lte: endDate },
     };
 
+    // A refund on record (owed or already paid back) is money the booking no
+    // longer keeps, so the tax inside it is not collected either. The tax share
+    // of a refund is its share of the total the customer paid, and a refund is
+    // never counted past that total (an on-site estimate paid on top of the
+    // booking is not part of these figures).
+    const addRefundFields = {
+      $addFields: {
+        refundedAmount: {
+          $min: [
+            {
+              $cond: [
+                { $in: [{ $ifNull: ["$refundStatus", "NONE"] }, ["PENDING", "PROCESSED"]] },
+                { $ifNull: ["$refundAmount", 0] },
+                0,
+              ],
+            },
+            { $ifNull: ["$totalAmount", 0] },
+          ],
+        },
+      },
+    };
+    const addRefundedGst = {
+      $addFields: {
+        refundedGstAmount: {
+          $cond: [
+            { $gt: [{ $ifNull: ["$totalAmount", 0] }, 0] },
+            {
+              $multiply: [
+                { $ifNull: ["$gstAmount", 0] },
+                { $divide: ["$refundedAmount", "$totalAmount"] },
+              ],
+            },
+            0,
+          ],
+        },
+      },
+    };
+    const sums = {
+      bookingCount: { $sum: 1 },
+      baseAmount: { $sum: "$baseAmount" },
+      gstAmount: { $sum: "$gstAmount" },
+      totalAmount: { $sum: "$totalAmount" },
+      refundedAmount: { $sum: "$refundedAmount" },
+      refundedGstAmount: { $sum: "$refundedGstAmount" },
+    };
+
     const [summaryRows, dailyRows] = await Promise.all([
       Booking.aggregate([
         { $match: match },
-        {
-          $group: {
-            _id: null,
-            bookingCount: { $sum: 1 },
-            baseAmount: { $sum: "$baseAmount" },
-            gstAmount: { $sum: "$gstAmount" },
-            totalAmount: { $sum: "$totalAmount" },
-          },
-        },
+        addRefundFields,
+        addRefundedGst,
+        { $group: { _id: null, ...sums } },
       ]),
       Booking.aggregate([
         { $match: match },
+        addRefundFields,
+        addRefundedGst,
         {
           $group: {
             _id: {
@@ -69,21 +113,29 @@ router.get("/gst", async (req, res) => {
                 timezone: TIMEZONE,
               },
             },
-            bookingCount: { $sum: 1 },
-            baseAmount: { $sum: "$baseAmount" },
-            gstAmount: { $sum: "$gstAmount" },
-            totalAmount: { $sum: "$totalAmount" },
+            ...sums,
           },
         },
         { $sort: { _id: 1 } },
       ]),
     ]);
 
-    const summary = summaryRows[0] || {
-      bookingCount: 0,
-      baseAmount: 0,
-      gstAmount: 0,
-      totalAmount: 0,
+    // gstAmount / totalAmount stay as collected; the net figures take refunds off.
+    const shape = (row) => {
+      const gstAmount = round2(row.gstAmount);
+      const totalAmount = round2(row.totalAmount);
+      const refundedAmount = round2(row.refundedAmount);
+      const refundedGstAmount = round2(row.refundedGstAmount);
+      return {
+        bookingCount: row.bookingCount || 0,
+        baseAmount: round2(row.baseAmount),
+        gstAmount,
+        totalAmount,
+        refundedAmount,
+        refundedGstAmount,
+        netGstAmount: round2(gstAmount - refundedGstAmount),
+        netTotalAmount: round2(totalAmount - refundedAmount),
+      };
     };
 
     return success(
@@ -92,14 +144,8 @@ router.get("/gst", async (req, res) => {
         startDate: startRaw,
         endDate: endRaw,
         timezone: TIMEZONE,
-        summary,
-        rows: dailyRows.map((row) => ({
-          date: row._id,
-          bookingCount: row.bookingCount || 0,
-          baseAmount: row.baseAmount || 0,
-          gstAmount: row.gstAmount || 0,
-          totalAmount: row.totalAmount || 0,
-        })),
+        summary: shape(summaryRows[0] || {}),
+        rows: dailyRows.map((row) => ({ date: row._id, ...shape(row) })),
       },
       { requestId: req.requestId }
     );

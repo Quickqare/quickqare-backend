@@ -15,6 +15,7 @@ const {
 // same one MSG91 verifies — so reformatting a phone can't open a second account.
 const { toNationalPhone, INVALID_PHONE_MESSAGE } = require("../utils/phone");
 const { partnerWithSignedSelfie } = require("../utils/sensitiveFileUrl");
+const { revokeIfValid, disconnectSocketsUsingToken } = require("../utils/tokenRevocation");
 
 const PARTNER_TOKEN_TTL = String(process.env.PARTNER_JWT_TTL || "90d");
 const IS_PRODUCTION = String(process.env.NODE_ENV || "").toLowerCase() === "production";
@@ -590,6 +591,55 @@ exports.resetPartnerPasswordWithMsg91 = async (req, res) => {
   }
 };
 
+// POST /reset-password (behind partnerAuth). A bearer token alone is not enough
+// to change the password: tokens live 90 days, and a copied/stolen one used to
+// be able to set a new password — which, via passwordChangedAt, also signs the
+// real partner out everywhere (account takeover). The caller must prove they
+// are the partner NOW by one of:
+//   - a fresh sign-in (token issued within RECENT_SIGN_IN_WINDOW_MS — e.g. the
+//     "forgot password → log in with OTP → set new password" flow),
+//   - currentPassword, or
+//   - accessToken: a phone-OTP proof (/verify-phone) for the account's phone.
+const RECENT_SIGN_IN_WINDOW_MS = 15 * 60 * 1000;
+
+async function confirmPartnerIdentity(req) {
+  const { currentPassword, accessToken } = req.body || {};
+  const issuedAtMs = Number(req.partnerTokenIssuedAt || 0) * 1000;
+  if (issuedAtMs > 0 && Date.now() - issuedAtMs <= RECENT_SIGN_IN_WINDOW_MS) {
+    return { ok: true };
+  }
+
+  if (currentPassword) {
+    const withHash = await Partner.findById(req.partner._id).select("+password");
+    const matches = await bcrypt.compare(String(currentPassword), String(withHash?.password || ""));
+    return matches
+      ? { ok: true }
+      : { ok: false, status: 400, code: "CURRENT_PASSWORD_INVALID", message: "Current password is incorrect" };
+  }
+
+  if (accessToken) {
+    const verification = await verifyMsg91AccessToken(accessToken);
+    if (isPhoneBindingMismatch(verification, req.partner.phone)) {
+      return {
+        ok: false,
+        status: 401,
+        code: "PHONE_VERIFICATION_MISMATCH",
+        message: "Phone number does not match the verified OTP",
+      };
+    }
+    return { ok: true };
+  }
+
+  // 428, not 403: partnerAuth answers 403 for a blocked account, and an app
+  // that signs out on 403 must not do so here. Clients branch on `code`.
+  return {
+    ok: false,
+    status: 428,
+    code: "REAUTH_REQUIRED",
+    message: "For your security, enter your current password or verify your phone with OTP to change your password.",
+  };
+}
+
 exports.resetPartnerPassword = async (req, res) => {
   try {
     const { newPassword } = req.body;
@@ -609,6 +659,15 @@ exports.resetPartnerPassword = async (req, res) => {
       });
     }
 
+    const identity = await confirmPartnerIdentity(req);
+    if (!identity.ok) {
+      return res.status(identity.status).json({
+        success: false,
+        code: identity.code,
+        message: identity.message,
+      });
+    }
+
     req.partner.password = String(newPassword);
     await req.partner.save();
 
@@ -617,10 +676,35 @@ exports.resetPartnerPassword = async (req, res) => {
       message: "Password updated successfully",
     });
   } catch (error) {
-    return res.status(500).json({
+    // e.g. an invalid/expired phone-OTP proof from verifyMsg91AccessToken (4xx).
+    const clientError = error.statusCode && error.statusCode < 500;
+    return res.status(clientError ? error.statusCode : 500).json({
       success: false,
-      message: error.statusCode && error.statusCode < 500 ? error.message : "Unable to reset password",
+      message: clientError ? error.message : "Unable to reset password",
     });
+  }
+};
+
+/* =====================================================
+   LOGOUT
+   POST /api/partner/auth/logout — revokes the presented token server-side
+   (it would otherwise stay valid for the rest of its 90-day life) and closes
+   live sockets that used it. Works with an already-invalid token too: there
+   is simply nothing left to revoke.
+===================================================== */
+exports.logoutPartner = async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization;
+    const token =
+      authHeader && authHeader.startsWith("Bearer ") ? authHeader.split(" ")[1] : null;
+    if (token) {
+      await revokeIfValid(token);
+      disconnectSocketsUsingToken(token);
+    }
+    return res.json({ success: true });
+  } catch (error) {
+    console.error("logoutPartner error:", error.message);
+    return res.status(500).json({ success: false, message: "Logout failed. Please try again." });
   }
 };
 

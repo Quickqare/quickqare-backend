@@ -247,7 +247,14 @@ describe("day-of checks", () => {
 describe("inactivity pause", () => {
   test("3+ days without opening the app → paused, told, and the team hears about their jobs", async () => {
     const now = at(0, 11);
-    const idle = await makePartner({ lastActiveAt: at(-5, 10), lastOnlineAt: at(-5, 10) });
+    // createdAt is set explicitly: the service skips accounts younger than the
+    // inactivity window, and a default createdAt is the real "now", which a
+    // test pinned to a fixed date can end up before.
+    const idle = await makePartner({
+      createdAt: at(-30, 10),
+      lastActiveAt: at(-5, 10),
+      lastOnlineAt: at(-5, 10),
+    });
     const active = await makePartner({ lastActiveAt: at(-1, 10) });
     const job = await makeBooking(idle, at(1, 10));
 

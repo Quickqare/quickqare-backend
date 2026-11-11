@@ -8,12 +8,23 @@
 // (socket.io client must set withCredentials: true for the browser to send it).
 const jwt = require("jsonwebtoken");
 const { readCookie, USER_TOKEN_COOKIE } = require("../utils/authCookie");
+const { isTokenRevoked } = require("../utils/tokenRevocation");
 
 function handshakeAuth(socket, next) {
-  const token =
-    socket.handshake.auth?.token ||
-    readCookie(socket.handshake.headers?.cookie, USER_TOKEN_COOKIE);
-  if (!token) return next();
+  let token = socket.handshake.auth?.token;
+  if (!token) {
+    try {
+      token = readCookie(socket.handshake.headers?.cookie, USER_TOKEN_COOKIE);
+    } catch {
+      // Malformed cookie (bad %-encoding) — treat as no token rather than
+      // throwing out of the middleware.
+      token = null;
+    }
+  }
+  if (!token || typeof token !== "string") return next();
+  // Kept for the room-join checks below (a token revoked at logout must not
+  // keep receiving live events on an already-open socket).
+  socket.authToken = token;
   try {
     // Partner and user tokens are BOTH signed with JWT_SECRET (see partnerAuth /
     // userAuth and their controllers). No separate PARTNER_JWT_SECRET is used
@@ -58,7 +69,20 @@ async function partnerSocketAllowed(socket) {
   ) {
     return false;
   }
+  if (await isTokenRevoked(socket.authToken)) return false;
   return true;
 }
 
-module.exports = { handshakeAuth, partnerSocketAllowed };
+// Same idea for customers: the handshake proved the signature only. Before the
+// socket joins user_<id> (live booking updates, partner location) the account
+// must still exist and not be blocked/deleted, and the token must not have been
+// signed out — the rules userAuth applies to HTTP requests.
+async function userSocketAllowed(socket) {
+  const User = require("../models/User");
+  const user = await User.findById(socket.verifiedUserId).select("status isDeleted").lean();
+  if (!user || user.status === "BLOCKED" || user.isDeleted) return false;
+  if (await isTokenRevoked(socket.authToken)) return false;
+  return true;
+}
+
+module.exports = { handshakeAuth, partnerSocketAllowed, userSocketAllowed };

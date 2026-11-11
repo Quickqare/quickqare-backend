@@ -259,7 +259,7 @@ setSocketIO(io);
 // Optional JWT auth on handshake — clients that send a token get
 // socket.verifiedPartnerId / socket.verifiedUserId attached.
 // Clients without a token still connect (backward compat).
-const { handshakeAuth, partnerSocketAllowed } = require("./socket/handshakeAuth");
+const { handshakeAuth, partnerSocketAllowed, userSocketAllowed } = require("./socket/handshakeAuth");
 io.use(handshakeAuth);
 
 // Short-lived dedup sets: prevent double-fire of acceptJob / rejectJob on flaky
@@ -274,9 +274,17 @@ io.on("connection", (socket) => {
      Require a verified token — unauthenticated clients cannot join user rooms,
      which prevents leaking live partner-location events to unknown listeners.
   ====================== */
-  socket.on("joinUserRoom", (userId) => {
+  socket.on("joinUserRoom", async (userId) => {
     if (!socket.verifiedUserId) return;
     if (socket.verifiedUserId !== String(userId)) return;
+    try {
+      // Blocked / deleted accounts and signed-out tokens get no user room —
+      // the same rules userAuth applies to HTTP requests.
+      if (!(await userSocketAllowed(socket))) return;
+    } catch (err) {
+      logger.error("joinUserRoom check failed", { error: err.message });
+      return;
+    }
     socket.join(`user_${userId}`);
   });
 

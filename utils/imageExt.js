@@ -1,3 +1,5 @@
+const crypto = require("crypto");
+
 // Map a validated image MIME type to a safe file extension.
 //
 // The stored extension must come from the server-verified MIME type, NOT from
@@ -17,4 +19,14 @@ function extFromMime(mimetype) {
   return MIME_TO_EXT[String(mimetype || "").toLowerCase()] || "jpg";
 }
 
-module.exports = { extFromMime, MIME_TO_EXT };
+// Stored file name: timestamp + 128 bits from the CSPRNG. Uploads (partner
+// selfies, job-spot photos, KYC) live at public, unauthenticated URLs unless
+// R2_PRIVATE_UPLOADS is on, so the name is the only thing protecting a file.
+// It used to be Math.random(), whose V8 generator state can be recovered from
+// a few observed outputs (e.g. the names of one's own uploads), making other
+// people's file names predictable.
+function randomUploadName(mimetype) {
+  return `${Date.now()}_${crypto.randomBytes(16).toString("hex")}.${extFromMime(mimetype)}`;
+}
+
+module.exports = { extFromMime, randomUploadName, MIME_TO_EXT };

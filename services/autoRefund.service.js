@@ -24,6 +24,13 @@ const logger = require("../utils/logger");
  *  - Bookings with an on-site estimate payment, with no payment id, or with a
  *    refund an admin has requested but not approved are left for a person.
  *  - AUTO_REFUND_DISABLED=true switches the whole thing off.
+ *
+ * Which payments count: a PAID booking, or a CANCELLED one whose payment was
+ * captured after it died (slot lock expired, cancelled while checkout was open).
+ * The capture paths store the payment id and flag the full refund but never mark
+ * that payment PAID, so for those the payment is confirmed captured on Razorpay
+ * before anything is sent. A COMPLETED booking with a late capture is left for
+ * a person — the service was delivered, so whether to refund is a judgement call.
  */
 
 const MAX_ATTEMPTS = 5;
@@ -32,6 +39,18 @@ const SWEEP_BATCH = 25;
 
 const round2 = (v) => Math.round(Number(v || 0) * 100) / 100;
 const toPaise = (inr) => Math.round(Number(inr || 0) * 100);
+
+const PAYMENT_ON_HAND = { $or: [{ "payment.status": "PAID" }, { status: "CANCELLED" }] };
+
+// Same rule as PAYMENT_ON_HAND (plus a payment id and no paid estimate), for a
+// booking already loaded — the admin refunds list uses it to offer "Send".
+function canAutoRefund(booking) {
+  return (
+    !!booking?.payment?.razorpay_payment_id &&
+    booking.estimatePayment?.status !== "PAID" &&
+    (booking.payment?.status === "PAID" || booking.status === "CANCELLED")
+  );
+}
 
 function isDisabled() {
   return String(process.env.AUTO_REFUND_DISABLED || "").toLowerCase() === "true";
@@ -81,19 +100,21 @@ async function issueAutoRefund(bookingId, { adminId = null } = {}) {
     {
       _id: bookingId,
       refundStatus: "PENDING",
-      "payment.status": "PAID",
       "payment.razorpay_payment_id": { $nin: [null, ""] },
       "estimatePayment.status": { $ne: "PAID" },
       // An admin pressing Approve may retry past the automatic attempt limit.
       ...(adminId ? {} : { refundAttempts: { $not: { $gte: MAX_ATTEMPTS } } }),
-      $or: [{ refundProcessingAt: null }, { refundProcessingAt: { $lt: new Date(now.getTime() - LEASE_MS) } }],
+      $and: [
+        PAYMENT_ON_HAND,
+        { $or: [{ refundProcessingAt: null }, { refundProcessingAt: { $lt: new Date(now.getTime() - LEASE_MS) } }] },
+      ],
     },
     adminId
       ? { $set: { refundProcessingAt: now, refundAttempts: 1 } }
       : { $set: { refundProcessingAt: now }, $inc: { refundAttempts: 1 } },
     { new: true }
   )
-    .select("user payment.razorpay_payment_id totalAmount refundAmount refundedAmount refundAttempts")
+    .select("user payment.status payment.razorpay_payment_id totalAmount refundAmount refundedAmount refundAttempts")
     .lean();
   if (!claimed) return { status: "skipped", reason: "not_eligible" };
 
@@ -105,6 +126,18 @@ async function issueAutoRefund(bookingId, { adminId = null } = {}) {
       await releaseClaim(bookingId, "Refund amount does not fit the booking payment");
       await Booking.updateOne({ _id: bookingId }, { $set: { refundAttempts: MAX_ATTEMPTS } });
       return { status: "skipped", reason: "amount_mismatch" };
+    }
+
+    // A payment our records never marked PAID (captured after the booking
+    // died) is only refunded once Razorpay itself says the money is in. A
+    // payment still "authorized" or "created" fails here and is retried.
+    if (claimed.payment.status !== "PAID") {
+      const captured = await razorpay.payments.fetch(paymentId);
+      // "refunded" = already refunded in full on Razorpay; the refund total
+      // fetched below then adopts it instead of sending again.
+      if (!["captured", "refunded"].includes(captured?.status)) {
+        throw new Error(`Razorpay payment ${paymentId} is ${captured?.status || "unknown"}, not captured`);
+      }
     }
 
     // What Razorpay already refunded on this payment (failed ones don't count).
@@ -182,12 +215,14 @@ async function sweepPendingRefunds() {
   const waiting = await Refund.distinct("bookingId", { status: "REQUESTED" });
   const rows = await Booking.find({
     refundStatus: "PENDING",
-    "payment.status": "PAID",
     "payment.razorpay_payment_id": { $nin: [null, ""] },
     "estimatePayment.status": { $ne: "PAID" },
     refundAttempts: { $not: { $gte: MAX_ATTEMPTS } },
     _id: { $nin: waiting },
-    $or: [{ refundProcessingAt: null }, { refundProcessingAt: { $lt: new Date(Date.now() - LEASE_MS) } }],
+    $and: [
+      PAYMENT_ON_HAND,
+      { $or: [{ refundProcessingAt: null }, { refundProcessingAt: { $lt: new Date(Date.now() - LEASE_MS) } }] },
+    ],
   })
     .select("_id")
     .sort({ updatedAt: 1 })
@@ -260,4 +295,4 @@ async function handleRefundWebhook(eventType, refund) {
   }
 }
 
-module.exports = { issueAutoRefund, sweepPendingRefunds, handleRefundWebhook, MAX_ATTEMPTS };
+module.exports = { issueAutoRefund, sweepPendingRefunds, handleRefundWebhook, canAutoRefund, MAX_ATTEMPTS };

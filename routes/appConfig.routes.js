@@ -55,6 +55,12 @@ router.get("/", async (_req, res) => {
       // Mehendi hand-package tables in force (code defaults + the admin's
       // overrides), so the app prices a cart the way the server will charge it.
       mehendiHandsPricing: resolveEffectiveMehendiHandsPricing(settings?.mehendiHandsPricing),
+      // Free-cancel abuse limit, so checkout can say when the window won't
+      // apply (services/cancellationGrace.service.js). freeCancelLimit 0 = none.
+      cancellation: {
+        freeCancelLimit:     Number(settings?.cancellation?.freeCancelLimit ?? 3),
+        freeCancelLimitDays: Number(settings?.cancellation?.freeCancelLimitDays ?? 30),
+      },
       referral: {
         isEnabled:             Boolean(referralSettings?.isEnabled ?? true),
         referrerRewardAmount:  Number(referralSettings?.referrerRewardAmount  ?? 50),

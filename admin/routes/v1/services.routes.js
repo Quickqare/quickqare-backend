@@ -590,15 +590,23 @@ router.patch("/:id/status", audit("admin.services.status"), async (req, res) => 
 // Optional: policyType ("BEFORE_SERVICE" | "SINCE_BOOKING") and
 // sinceBookingTiers: [{ maxHoursAfterBooking, refundPercent }, ...] — legacy
 // (discontinued cake orders); new bookings no longer apply SINCE_BOOKING.
-// Optional: grace: { windowMinutes, appliesBelowLeadHours } — free-cancel
-// window for orders placed with under appliesBelowLeadHours of notice
-// (windowMinutes 0 disables; appliesBelowLeadHours 0 = applies to all).
-// Send grace: null to disable. Send tiers: [] to reset to global defaults.
+// Optional: grace: { allBookingsWindowMinutes, windowMinutes,
+// appliesBelowLeadHours, endsWhenPartnerOnTheWay } — free-cancel window every
+// booking gets (allBookingsWindowMinutes), a longer one for orders placed with
+// under appliesBelowLeadHours of notice (windowMinutes; 0 disables,
+// appliesBelowLeadHours 0 = applies to all), and whether it closes once the
+// professional sets off (default true). Send grace: null to disable. Send tiers: [] to reset to global defaults.
 router.patch("/:id/cancellation-policy", audit("admin.services.cancellation"), async (req, res) => {
   try {
     const serviceId = asSingleString(req.params.id);
     if (!serviceId || !mongoose.Types.ObjectId.isValid(serviceId)) {
       return fail(res, 400, "INVALID_ID", "Invalid service id", null, { requestId: req.requestId });
+    }
+    // applyTo: "service" (default) | "category" (all services in :id's category)
+    // | "all" (every service).
+    const applyTo = req.body.applyTo === undefined ? "service" : String(req.body.applyTo);
+    if (!["service", "category", "all"].includes(applyTo)) {
+      return fail(res, 400, "INVALID_SCOPE", "applyTo must be service, category or all", null, { requestId: req.requestId });
     }
 
     const tiers = req.body.tiers;
@@ -652,17 +660,29 @@ router.patch("/:id/cancellation-policy", audit("admin.services.cancellation"), a
     if (req.body.grace !== undefined) {
       const grace = req.body.grace;
       if (grace === null) {
-        set.cancellationGrace = { windowMinutes: 0, appliesBelowLeadHours: 0 };
+        set.cancellationGrace = {
+          allBookingsWindowMinutes: 0,
+          windowMinutes: 0,
+          appliesBelowLeadHours: 0,
+          endsWhenPartnerOnTheWay: true,
+        };
       } else if (grace && typeof grace === "object") {
-        const windowMinutes = Number(grace.windowMinutes);
-        const appliesBelowLeadHours = Number(grace.appliesBelowLeadHours);
+        const allBookingsWindowMinutes = Number(grace.allBookingsWindowMinutes ?? 0);
+        const windowMinutes = Number(grace.windowMinutes ?? 0);
+        const appliesBelowLeadHours = Number(grace.appliesBelowLeadHours ?? 0);
         if (
+          !Number.isFinite(allBookingsWindowMinutes) || allBookingsWindowMinutes < 0 ||
           !Number.isFinite(windowMinutes) || windowMinutes < 0 ||
           !Number.isFinite(appliesBelowLeadHours) || appliesBelowLeadHours < 0
         ) {
-          return fail(res, 400, "INVALID_GRACE", "grace.windowMinutes and grace.appliesBelowLeadHours must be numbers >= 0", null, { requestId: req.requestId });
+          return fail(res, 400, "INVALID_GRACE", "grace.allBookingsWindowMinutes, grace.windowMinutes and grace.appliesBelowLeadHours must be numbers >= 0", null, { requestId: req.requestId });
         }
-        set.cancellationGrace = { windowMinutes, appliesBelowLeadHours };
+        set.cancellationGrace = {
+          allBookingsWindowMinutes,
+          windowMinutes,
+          appliesBelowLeadHours,
+          endsWhenPartnerOnTheWay: grace.endsWhenPartnerOnTheWay !== false,
+        };
       } else {
         return fail(res, 400, "INVALID_GRACE", "grace must be an object or null", null, { requestId: req.requestId });
       }
@@ -674,6 +694,16 @@ router.patch("/:id/cancellation-policy", audit("admin.services.cancellation"), a
       return fail(res, 404, "NOT_FOUND", "Service not found", null, { requestId: req.requestId });
     }
 
+    let appliedCount = 1;
+    if (applyTo === "all") {
+      appliedCount = (await Service.updateMany({}, { $set: set })).matchedCount;
+    } else if (applyTo === "category") {
+      if (!row.category) {
+        return fail(res, 400, "NO_CATEGORY", "This service has no category", null, { requestId: req.requestId });
+      }
+      appliedCount = (await Service.updateMany({ category: row.category }, { $set: set })).matchedCount;
+    }
+
     return success(
       res,
       {
@@ -681,6 +711,7 @@ router.patch("/:id/cancellation-policy", audit("admin.services.cancellation"), a
         cancellationPolicyType: row.cancellationPolicyType,
         sinceBookingTiers: row.sinceBookingTiers,
         cancellationGrace: row.cancellationGrace,
+        appliedCount,
       },
       { requestId: req.requestId }
     );
